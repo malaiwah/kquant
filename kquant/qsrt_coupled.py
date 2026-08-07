@@ -2,7 +2,7 @@
 
 The transform interleaves gate and up rows before a normalized block-Hadamard
 rotation. The decoder joins the two stored projections, cancels that rotation,
-evaluates the coordinatewise SiTU activation, and rotates the resulting hidden
+evaluates the configured coordinatewise activation, and rotates the resulting hidden
 coordinates into the matching down-projection basis. Residual-side transforms
 are layer-shared; the intermediate draw is expert-static.
 """
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from kquant.tp_simulator import situ
+from kquant.expert_activation import ExpertActivation, expert_middle
 
 
 Tensor = torch.Tensor
@@ -251,7 +251,14 @@ class CoupledHadamardExecution:
             dim=1,
         )
 
-    def decode_middle(self, rows: Tensor, w1: Tensor, w3: Tensor) -> Tensor:
+    def decode_middle(
+        self,
+        rows: Tensor,
+        w1: Tensor,
+        w3: Tensor,
+        *,
+        activation: ExpertActivation = "situ",
+    ) -> Tensor:
         transformed = torch.cat((F.linear(rows, w1), F.linear(rows, w3)), dim=1)
         recovered = signed_block_hadamard(
             transformed,
@@ -260,7 +267,11 @@ class CoupledHadamardExecution:
             dim=1,
             inverse=True,
         )
-        middle = situ(recovered[:, 0::2], recovered[:, 1::2])
+        middle = expert_middle(
+            recovered[:, 0::2],
+            recovered[:, 1::2],
+            activation,
+        )
         return signed_block_hadamard(
             middle,
             block_size=self.spec.postactivation_block_size,
