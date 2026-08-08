@@ -30,6 +30,7 @@ from kquant.fruit_source import (
 from kquant.sqg_quantizer import install_sqg_quantizer
 from scripts.build_fruit_qsrt_model import (
     BASE_MANIFEST_SHA256,
+    _validate_source_evidence,
     current_encoder_provenance,
 )
 
@@ -286,7 +287,8 @@ def main() -> None:
     calibration_store = FruitCalibrationStore(args.calibration)
     quantizer_module = load_qsrt_encoder(args.exllamav3_root)
     install_sqg_quantizer(quantizer_module)
-    source_sha256 = store.evidence.get("source_sha256")
+    source_evidence = _validate_source_evidence(store.evidence)
+    source_sha256 = source_evidence.get("source_sha256")
     if not isinstance(source_sha256, str):
         raise TypeError("Fruit source evidence has no authenticated source digest")
     encoder = current_encoder_provenance(
@@ -370,7 +372,7 @@ def main() -> None:
         "artifact_schema": FRUIT_QSRT_SCHEMA,
         "profile_id": FRUIT_QSRT_PROFILE_ID,
         "codebook": FRUIT_QSRT_CODEBOOK,
-        "source": store.evidence,
+        "source": source_evidence,
         "encoder": encoder,
         "selection": selection,
         "shard": {

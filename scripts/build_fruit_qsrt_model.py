@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import errno
 import hashlib
 import json
 import math
@@ -146,7 +145,7 @@ payloads, not parameter-count estimates.
 | Artifact | Revision | Repository bytes | Safetensors bytes |
 |---|---|---:|---:|
 | [Fruit QSRT (pre-adjacent-rate-evidence publication)](https://huggingface.co/malaiwah/GLM-5.2-QSRT-Fruit/tree/c1a0c62d220602fdd8b7940dcba716671fb0033c) | `c1a0c62d` | 2,963,027,998 | 2,909,352,104 |
-| [Fruit BF16](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit-bf16/tree/ff1178d233fd6c644dc053c72c3d58839eb921334) | `ff1178d2` | 10,102,776,679 | 10,081,800,232 |
+| [Fruit BF16](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit-bf16/tree/ff1178d233fddc644dc053c723d58839eb921334) | `ff1178d2` | 10,102,776,679 | 10,081,800,232 |
 | [Fruit prior mixed SIQ](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit/tree/c1798e3676fa16b4a874381171adab1e3033fbd5) | `c1798e36` | 3,125,527,019 | 3,102,116,152 |
 | [Full GLM-5.2 BF16](https://huggingface.co/zai-org/GLM-5.2/tree/b4734de4facf877f85769a911abafc5283eab3d9) | `b4734de4` | 1,506,693,036,946 | 1,506,667,387,408 |
 | [Full GLM-5.2 FP8](https://huggingface.co/zai-org/GLM-5.2-FP8/tree/ba978f7d347eaf65d22f1a86833408afdb953541) | `ba978f7d` | 755,663,676,164 | 755,632,050,320 |
@@ -1181,7 +1180,9 @@ def _validate_source_evidence(value: object) -> dict[str, object]:
                 f"sealed Fruit source evidence {name!r} mismatch: "
                 f"{value.get(name)!r} != {expected_value!r}"
             )
-    return value
+    normalized = dict(value)
+    normalized.pop("path", None)
+    return normalized
 
 
 def _write_source_evidence_seal(
@@ -1567,7 +1568,10 @@ def _authenticate_base_model(base_model: Path) -> dict[str, object]:
                 f"{actual_sha256} != {expected_sha256}"
             )
     index = json.loads(
-        (base_model / "model.safetensors.index.json").read_text(encoding="utf-8")
+        _authenticated_bytes(
+            base_model / "model.safetensors.index.json",
+            entries["model.safetensors.index.json"],
+        ).decode("utf-8")
     )
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict):
@@ -1575,7 +1579,12 @@ def _authenticate_base_model(base_model: Path) -> dict[str, object]:
     shard_names = set(weight_map.values())
     if not shard_names.issubset(entries):
         raise ValueError("Fruit BF16 base manifest omits indexed weight shards")
-    config = json.loads((base_model / "config.json").read_text(encoding="utf-8"))
+    config = json.loads(
+        _authenticated_bytes(
+            base_model / "config.json",
+            entries["config.json"],
+        ).decode("utf-8")
+    )
     expected_config = {
         "architectures": ["GlmMoeDsaForCausalLM"],
         "dtype": "bfloat16",
@@ -1598,23 +1607,61 @@ def _authenticate_base_model(base_model: Path) -> dict[str, object]:
     }
 
 
-def _link_or_copy(source: Path, target: Path) -> None:
+def _authenticated_bytes(path: Path, expected_sha256: str) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"authenticated Fruit source file is not regular: {path}")
+    content = path.read_bytes()
+    actual_sha256 = hashlib.sha256(content).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"Fruit BF16 base hash mismatch for {path.name}: "
+            f"{actual_sha256} != {expected_sha256}"
+        )
+    return content
+
+
+def _assert_authenticated_file(path: Path, expected_sha256: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"authenticated Fruit source file is not regular: {path}")
+    actual_sha256 = _sha256(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"Fruit BF16 base hash mismatch for {path.name}: "
+            f"{actual_sha256} != {expected_sha256}"
+        )
+
+
+def _copy_authenticated(
+    source: Path,
+    target: Path,
+    expected_sha256: str,
+) -> None:
+    _assert_authenticated_file(source, expected_sha256)
+    if target.is_symlink():
+        raise ValueError(f"Fruit package target must not be symbolic: {target}")
     if target.exists():
-        if target.samefile(source):
+        if not target.is_file():
+            raise ValueError(f"Fruit package target must be regular: {target}")
+        if not target.samefile(source):
+            if _sha256(target) != expected_sha256:
+                raise ValueError(
+                    f"existing static model file differs from source: {target}"
+                )
+            _assert_authenticated_file(source, expected_sha256)
             return
-        if target.stat().st_size != source.stat().st_size or _sha256(target) != _sha256(
-            source
-        ):
-            raise ValueError(
-                f"existing static model file differs from source: {target}"
-            )
-        return
+    temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
     try:
-        os.link(source, target)
-    except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise
-        shutil.copy2(source, target)
+        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=8 << 20)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        if _sha256(temporary) != expected_sha256:
+            raise ValueError(f"copied Fruit model file changed: {target}")
+        _assert_authenticated_file(source, expected_sha256)
+        os.replace(temporary, target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _tensor_nbytes(handle, name: str) -> int:
@@ -1630,7 +1677,12 @@ def _tensor_nbytes(handle, name: str) -> int:
     return elements * itemsize
 
 
-def _strip_routed_experts(source: Path, target: Path) -> tuple[set[str], int]:
+def _strip_routed_experts(
+    source: Path,
+    target: Path,
+    expected_sha256: str,
+) -> tuple[set[str], int]:
+    _assert_authenticated_file(source, expected_sha256)
     with safe_open(source, framework="pt", device="cpu") as handle:
         metadata = handle.metadata()
         names = handle.keys()
@@ -1644,19 +1696,39 @@ def _strip_routed_experts(source: Path, target: Path) -> tuple[set[str], int]:
         kept = {
             name: handle.get_tensor(name) for name in names if name not in expert_names
         }
+    _assert_authenticated_file(source, expected_sha256)
     _atomic_safetensors(target, kept, metadata)
     return expert_names, removed_bytes
 
 
-def _materialize_base_model(base_model: Path, output: Path) -> None:
+def _materialize_base_model(
+    base_model: Path,
+    output: Path,
+    base_provenance: dict[str, object],
+) -> None:
+    files = base_provenance.get("files")
+    if not isinstance(files, dict) or any(
+        not isinstance(name, str) or not isinstance(digest, str)
+        for name, digest in files.items()
+    ):
+        raise TypeError("Fruit BF16 base provenance has no authenticated file map")
     index_path = base_model / "model.safetensors.index.json"
-    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index = json.loads(
+        _authenticated_bytes(
+            index_path,
+            files["model.safetensors.index.json"],
+        ).decode("utf-8")
+    )
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict):
         raise TypeError("base model safetensors index has no weight_map")
     removed_names: set[str] = set()
     removed_bytes = 0
     source_files = sorted(set(weight_map.values()))
+    if any(not isinstance(filename, str) for filename in source_files):
+        raise TypeError("base model safetensors index has invalid shard filenames")
+    if not set(source_files).issubset(files):
+        raise ValueError("Fruit BF16 base provenance omits indexed weight shards")
     for filename in source_files:
         source = base_model / filename
         target = output / filename
@@ -1673,11 +1745,15 @@ def _materialize_base_model(base_model: Path, output: Path) -> None:
         else:
             layer = -1
         if layer in LAYERS:
-            names, byte_count = _strip_routed_experts(source, target)
+            names, byte_count = _strip_routed_experts(
+                source,
+                target,
+                files[filename],
+            )
             removed_names.update(names)
             removed_bytes += byte_count
         else:
-            _link_or_copy(source, target)
+            _copy_authenticated(source, target, files[filename])
     expected_removed = 3 * EXPERTS * len(LAYERS)
     if len(removed_names) != expected_removed:
         raise ValueError(
@@ -1706,7 +1782,11 @@ def _materialize_base_model(base_model: Path, output: Path) -> None:
         "tokenizer.json",
         "tokenizer_config.json",
     ):
-        _link_or_copy(base_model / filename, output / filename)
+        _copy_authenticated(
+            base_model / filename,
+            output / filename,
+            files[filename],
+        )
 
 
 def _write_config(
@@ -1714,8 +1794,17 @@ def _write_config(
     output: Path,
     producer: dict[str, object],
     source_evidence: dict[str, object],
+    base_provenance: dict[str, object],
 ) -> None:
-    config = json.loads((base_model / "config.json").read_text(encoding="utf-8"))
+    files = base_provenance.get("files")
+    if not isinstance(files, dict) or not isinstance(files.get("config.json"), str):
+        raise TypeError("Fruit BF16 base provenance has no config digest")
+    config = json.loads(
+        _authenticated_bytes(
+            base_model / "config.json",
+            files["config.json"],
+        ).decode("utf-8")
+    )
     config["quantization_config"] = {
         "quant_method": "modelopt",
         "quant_algo": "NVFP4",
@@ -2129,6 +2218,10 @@ def main() -> None:
             expected_manifest_sha256=BASE_MANIFEST_SHA256,
         )
     source_evidence = _validate_source_evidence(store.evidence)
+    if source_evidence.get("source_kind") != "safetensors_manifest":
+        raise ValueError(
+            "Fruit QSRT publication requires the authenticated BF16 safetensors source"
+        )
     source_sha256 = source_evidence.get("source_sha256")
     if not isinstance(source_sha256, str):
         raise TypeError("Fruit source evidence has no authenticated source digest")
@@ -2174,11 +2267,17 @@ def main() -> None:
         source_sha256=source_sha256,
         encoder_fingerprint=encoder_fingerprint,
     )
-    _remove_part_cache(args.output)
-    _materialize_base_model(args.base_model, args.output)
-    _write_config(args.base_model, args.output, producer, source_evidence)
+    _materialize_base_model(args.base_model, args.output, base_provenance)
+    _write_config(
+        args.base_model,
+        args.output,
+        producer,
+        source_evidence,
+        base_provenance,
+    )
     _write_source_evidence_seal(args.output, source_evidence, producer)
     _write_calibration_evidence(args.output, calibration, producer)
+    _remove_part_cache(args.output)
     _write_package_manifests(
         args.output,
         source_evidence=source_evidence,

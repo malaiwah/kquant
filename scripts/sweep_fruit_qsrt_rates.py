@@ -22,6 +22,7 @@ from kquant.fruit_source import (
 from kquant.sqg_quantizer import install_sqg_quantizer
 from scripts.build_fruit_qsrt_model import (
     BASE_MANIFEST_SHA256,
+    _validate_source_evidence,
     current_encoder_provenance,
 )
 from scripts.encode_fruit_qsrt import SAMPLED_ASSIGNMENTS, _assignment
@@ -106,7 +107,7 @@ def main() -> None:
     install_sqg_quantizer(quantizer_module)
     signature = {
         "schema": _SCHEMA,
-        "source": store.evidence,
+        "source": _validate_source_evidence(store.evidence),
         "calibration": {
             "capture_id": calibration_store.capture_id,
             "fingerprint": calibration_store.fingerprint,
