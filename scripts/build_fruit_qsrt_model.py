@@ -772,6 +772,13 @@ def _atomic_safetensors(
     os.replace(temporary, path)
 
 
+def _is_encoder_temporary(path: Path) -> bool:
+    name = path.name
+    return name.startswith(".tmp") or (
+        name.startswith((".expert-", ".run-")) and ".tmp-" in name
+    )
+
+
 def _validate_part_cache_root(
     root: Path,
     *,
@@ -792,12 +799,11 @@ def _validate_part_cache_root(
             raise ValueError(f"unexpected Fruit QSRT cache path: {directory}")
         if allow_run_manifests and directory.name == "run-manifests":
             for path in directory.iterdir():
-                if (
-                    path.is_symlink()
-                    or not path.is_file()
-                    or path.stat().st_nlink != 1
-                    or path.suffix != ".json"
-                ):
+                if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+                    raise ValueError(f"unexpected Fruit QSRT run manifest: {path}")
+                if _is_encoder_temporary(path):
+                    continue
+                if path.suffix != ".json":
                     raise ValueError(f"unexpected Fruit QSRT run manifest: {path}")
             continue
         if directory.name not in expected_layers:
@@ -805,6 +811,8 @@ def _validate_part_cache_root(
         for path in directory.iterdir():
             if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
                 raise ValueError(f"unexpected Fruit QSRT part path: {path}")
+            if allow_run_manifests and _is_encoder_temporary(path):
+                continue
             stem, suffix = path.name.rsplit(".", 1)
             expert_text = stem.removeprefix("expert-")
             if (
