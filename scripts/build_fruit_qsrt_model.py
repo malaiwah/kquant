@@ -9,6 +9,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import time
 from collections import Counter, defaultdict
@@ -774,9 +775,16 @@ def _atomic_safetensors(
 
 def _is_encoder_temporary(path: Path) -> bool:
     name = path.name
-    return name.startswith(".tmp") or (
-        name.startswith((".expert-", ".run-")) and ".tmp-" in name
-    )
+    if not (
+        name.startswith(".tmp")
+        or (name.startswith((".expert-", ".run-")) and ".tmp-" in name)
+    ):
+        return False
+    try:
+        identity = path.lstat()
+    except FileNotFoundError:
+        return True
+    return stat.S_ISREG(identity.st_mode) and identity.st_nlink == 1
 
 
 def _validate_part_cache_root(
@@ -799,20 +807,20 @@ def _validate_part_cache_root(
             raise ValueError(f"unexpected Fruit QSRT cache path: {directory}")
         if allow_run_manifests and directory.name == "run-manifests":
             for path in directory.iterdir():
-                if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
-                    raise ValueError(f"unexpected Fruit QSRT run manifest: {path}")
                 if _is_encoder_temporary(path):
                     continue
+                if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+                    raise ValueError(f"unexpected Fruit QSRT run manifest: {path}")
                 if path.suffix != ".json":
                     raise ValueError(f"unexpected Fruit QSRT run manifest: {path}")
             continue
         if directory.name not in expected_layers:
             raise ValueError(f"unexpected Fruit QSRT cache directory: {directory}")
         for path in directory.iterdir():
-            if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
-                raise ValueError(f"unexpected Fruit QSRT part path: {path}")
             if allow_run_manifests and _is_encoder_temporary(path):
                 continue
+            if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+                raise ValueError(f"unexpected Fruit QSRT part path: {path}")
             stem, suffix = path.name.rsplit(".", 1)
             expert_text = stem.removeprefix("expert-")
             if (

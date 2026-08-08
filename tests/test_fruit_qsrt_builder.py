@@ -345,6 +345,7 @@ def test_encoder_cache_allows_only_private_active_temporaries(
     run_manifests = cache / "run-manifests"
     layer.mkdir(parents=True)
     run_manifests.mkdir()
+    assert builder._is_encoder_temporary(layer / ".tmp-disappeared")
     safetensors_temporary = layer / ".tmpXWW6j5"
     safetensors_temporary.write_bytes(b"active")
     (layer / ".expert-000.json.tmp-123").write_bytes(b"active")
