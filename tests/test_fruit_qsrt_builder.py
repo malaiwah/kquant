@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -260,6 +261,18 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
         == payload
     )
 
+    mixed = json.loads(builder._canonical_json(payload))
+    mixed["signature"]["encoder"]["kquant_revision"] = "mixed"
+    path.write_text(builder._canonical_json(mixed), encoding="utf-8")
+    with pytest.raises(ValueError, match="provenance"):
+        builder._validate_rate_sweep(
+            path,
+            source_evidence=source,
+            calibration=calibration,
+            producer=producer,
+        )
+    path.write_text(builder._canonical_json(payload), encoding="utf-8")
+
     producer["encoder"] = {
         "fingerprint_schema": builder._ENCODER_FINGERPRINT_SCHEMA,
         "fingerprint": "d" * 64,
@@ -290,6 +303,64 @@ def test_package_files_reject_resume_cache_before_sealing(tmp_path: Path) -> Non
     assert set(files) == {"config.json", "evaluation/report.json"}
 
 
+def test_validated_package_files_reject_unknown_top_level_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(builder, "LAYERS", ())
+    base_provenance = {"files": {"config.json": "a" * 64}}
+    for relative in builder._expected_package_inventory(base_provenance):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"sealed")
+    (tmp_path / "model.safetensors").write_bytes(b"stale competing model")
+
+    with pytest.raises(ValueError, match="unexpected=.*model.safetensors"):
+        builder._validated_package_files(tmp_path, base_provenance)
+
+
+def test_part_cache_rejects_nested_layer_symlink(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(builder, "LAYERS", (3,))
+    monkeypatch.setattr(builder, "EXPERTS", 1)
+    cache = tmp_path / ".qsrt-parts"
+    cache.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    (cache / "layer-003").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="cache path"):
+        builder._parts_need_encoder(
+            tmp_path,
+            source_sha256="a" * 64,
+            encoder_fingerprint="b" * 64,
+        )
+
+
+def test_prepare_output_root_rejects_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    output = tmp_path / "output"
+    output.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="package root"):
+        builder._prepare_output_root(output)
+
+
+def test_staged_part_cache_restores_resume_state(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(builder, "LAYERS", (3,))
+    monkeypatch.setattr(builder, "EXPERTS", 1)
+    output = tmp_path / "output"
+    part = output / ".qsrt-parts" / "layer-003" / "expert-000.json"
+    part.parent.mkdir(parents=True)
+    part.write_text("{}", encoding="utf-8")
+
+    staged = builder._stage_part_cache(output)
+    assert staged is not None and staged.is_dir()
+    assert not (output / ".qsrt-parts").exists()
+
+    builder._restore_staged_part_cache(output, staged)
+    assert part.read_text(encoding="utf-8") == "{}"
+
+
 def test_remove_part_cache_preserves_package_files(tmp_path: Path) -> None:
     config = tmp_path / "config.json"
     config.write_text("{}", encoding="utf-8")
@@ -314,6 +385,22 @@ def test_copy_authenticated_breaks_source_hardlink(tmp_path: Path) -> None:
     source.write_bytes(b"mutated after copy")
 
     assert not target.samefile(source)
+    assert target.read_bytes() == content
+
+
+def test_copy_authenticated_breaks_third_party_hardlink(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    external = tmp_path / "external.bin"
+    target = tmp_path / "target.bin"
+    content = b"authenticated source"
+    source.write_bytes(content)
+    external.write_bytes(content)
+    target.hardlink_to(external)
+
+    builder._copy_authenticated(source, target, hashlib.sha256(content).hexdigest())
+    external.write_bytes(b"mutated external inode")
+
+    assert not target.samefile(external)
     assert target.read_bytes() == content
 
 
@@ -352,24 +439,29 @@ def test_seed_parts_validate_source_read_only_before_copy(
 
     def validate(tensor_path, manifest_path, **kwargs):
         calls.append((tensor_path, manifest_path, kwargs))
-        return {"status": "valid"}
+        return {
+            "status": "valid",
+            "safetensors_sha256": hashlib.sha256(
+                source_tensor.read_bytes()
+            ).hexdigest(),
+        }
 
     monkeypatch.setattr(builder, "_validate_part", validate)
     output = tmp_path / "output"
 
     assert builder._seed_parts(output, seed, "a" * 64, "b" * 64) == 1
+    target_tensor = output / ".qsrt-parts/layer-003/expert-000.safetensors"
+    target_manifest = output / ".qsrt-parts/layer-003/expert-000.json"
+    expected_kwargs = {
+        "layer": 3,
+        "expert": 0,
+        "source_sha256": "a" * 64,
+        "encoder_fingerprint": "b" * 64,
+        "repair": False,
+    }
     assert calls == [
-        (
-            source_tensor,
-            source_manifest,
-            {
-                "layer": 3,
-                "expert": 0,
-                "source_sha256": "a" * 64,
-                "encoder_fingerprint": "b" * 64,
-                "repair": False,
-            },
-        )
+        (source_tensor, source_manifest, expected_kwargs),
+        (target_tensor, target_manifest, expected_kwargs),
     ]
     assert source_tensor.read_bytes() == b"authenticated tensor"
     assert source_manifest.read_text(encoding="utf-8") == '{"authenticated": true}'

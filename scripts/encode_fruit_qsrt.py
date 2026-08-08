@@ -14,6 +14,10 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
+from scripts.kquant_import_guard import (  # isort: skip
+    KQUANT_IMPORT_IDENTITY as _KQUANT_IMPORT_IDENTITY,
+)
+
 from kquant.exl3_loader import load_qsrt_encoder
 from kquant.fruit_calibration import FruitCalibrationStore
 from kquant.fruit_qsrt import (
@@ -30,6 +34,7 @@ from kquant.fruit_source import (
 from kquant.sqg_quantizer import install_sqg_quantizer
 from scripts.build_fruit_qsrt_model import (
     BASE_MANIFEST_SHA256,
+    _validate_part_cache_root,
     _validate_source_evidence,
     current_encoder_provenance,
 )
@@ -107,6 +112,20 @@ def _artifact_paths(root: Path, layer: int, expert: int) -> tuple[Path, Path]:
     )
 
 
+def _prepare_output_layer(root: Path, layer: int) -> None:
+    _validate_part_cache_root(
+        root,
+        create=True,
+        allow_run_manifests=True,
+    )
+    directory = root / f"layer-{layer:03d}"
+    if directory.is_symlink():
+        raise ValueError(f"Fruit QSRT output layer must not be symbolic: {directory}")
+    if directory.exists() and not directory.is_dir():
+        raise ValueError(f"Fruit QSRT output layer must be a directory: {directory}")
+    directory.mkdir(exist_ok=True)
+
+
 def _run_manifest_path(
     root: Path,
     *,
@@ -138,6 +157,11 @@ def _resume_evidence(
     source_sha256: str,
     encoder_fingerprint: str,
 ) -> dict[str, object] | None:
+    for path in (tensor_path, manifest_path):
+        if path.is_symlink():
+            raise ValueError(f"Fruit QSRT resume path must not be symbolic: {path}")
+        if path.exists() and (not path.is_file() or path.stat().st_nlink != 1):
+            raise ValueError(f"Fruit QSRT resume path must be private: {path}")
     if not tensor_path.exists() and not manifest_path.exists():
         return None
     if not tensor_path.is_file() or not manifest_path.is_file():
@@ -182,7 +206,7 @@ def _write_encoding(
     peak_cuda_bytes: int,
 ) -> dict[str, object]:
     tensor_path, manifest_path = _artifact_paths(root, encoding.layer, encoding.expert)
-    tensor_path.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_output_layer(root, encoding.layer)
     temporary = tensor_path.with_name(f".{tensor_path.name}.tmp-{os.getpid()}")
     save_file(
         encoding.artifact_tensors(),
@@ -271,6 +295,11 @@ def main() -> None:
     assignments = assignments[args.shard_index :: args.shard_count]
     if not assignments:
         raise ValueError("no Fruit assignments selected")
+    _validate_part_cache_root(
+        args.output,
+        create=True,
+        allow_run_manifests=True,
+    )
 
     if args.checkpoint.is_dir():
         store = FruitSafetensorsStore(
@@ -285,18 +314,39 @@ def main() -> None:
             expected_sha256=FRUIT_ANNEALED_SPEC.checkpoint_sha256,
         )
     calibration_store = FruitCalibrationStore(args.calibration)
-    quantizer_module = load_qsrt_encoder(args.exllamav3_root)
-    install_sqg_quantizer(quantizer_module)
-    source_evidence = _validate_source_evidence(store.evidence)
-    source_sha256 = source_evidence.get("source_sha256")
-    if not isinstance(source_sha256, str):
-        raise TypeError("Fruit source evidence has no authenticated source digest")
     encoder = current_encoder_provenance(
         exllamav3_root=args.exllamav3_root,
         calibration=calibration_store,
     )
+    if (
+        _KQUANT_IMPORT_IDENTITY is not None
+        and (
+            encoder["kquant_revision"],
+            encoder["kquant_source_sha256"],
+        )
+        != _KQUANT_IMPORT_IDENTITY
+    ):
+        raise ValueError("KQuant sources changed while importing the encoder")
+    quantizer_module = load_qsrt_encoder(args.exllamav3_root)
+    install_sqg_quantizer(quantizer_module)
+    if (
+        current_encoder_provenance(
+            exllamav3_root=args.exllamav3_root,
+            calibration=calibration_store,
+        )
+        != encoder
+    ):
+        raise ValueError("Fruit encoder sources changed while loading the encoder")
+    source_evidence = _validate_source_evidence(store.evidence)
+    source_sha256 = source_evidence.get("source_sha256")
+    if not isinstance(source_sha256, str):
+        raise TypeError("Fruit source evidence has no authenticated source digest")
     encoder_fingerprint = str(encoder["fingerprint"])
-    args.output.mkdir(parents=True, exist_ok=True)
+    _validate_part_cache_root(
+        args.output,
+        create=True,
+        allow_run_manifests=True,
+    )
     results: list[dict[str, object]] = []
     started = time.perf_counter()
     calibration_layer = None
@@ -356,6 +406,14 @@ def main() -> None:
             f"peak={peak / (1 << 20):.1f} MiB"
         )
 
+    if (
+        current_encoder_provenance(
+            exllamav3_root=args.exllamav3_root,
+            calibration=calibration_store,
+        )
+        != encoder
+    ):
+        raise ValueError("Fruit encoder sources changed during encoding")
     by_layer: dict[int, int] = defaultdict(int)
     for layer, _ in assignments:
         by_layer[layer] += 1
@@ -393,7 +451,12 @@ def main() -> None:
         shard_index=args.shard_index,
         assignments=assignments,
     )
-    run_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_part_cache_root(
+        args.output,
+        create=True,
+        allow_run_manifests=True,
+    )
+    run_manifest_path.parent.mkdir(exist_ok=True)
     _atomic_text(run_manifest_path, _canonical_json(run_manifest))
 
 
