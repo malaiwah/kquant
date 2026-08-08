@@ -234,6 +234,9 @@ def test_instruct_publication_uses_variant_specific_repositories() -> None:
     assert "Fruit Instruct BF16" in publication.fruit_audit_rows
     assert "GLM-5.2-SIQ-Fruit-Instruct/tree/48452ef3" in publication.fruit_audit_rows
     assert "GLM-5.2-QSRT-Fruit/tree/c1a0c62d" not in publication.fruit_audit_rows
+    assert "Not assistant-quality" in publication.quality_limitations
+    assert "instead of `126`" in publication.quality_limitations
+    assert "63.54 tokens/s for QSRT" in publication.quality_limitations
 
 
 def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
