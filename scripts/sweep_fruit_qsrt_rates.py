@@ -11,6 +11,10 @@ from pathlib import Path
 
 import torch
 
+from scripts.kquant_import_guard import (  # isort: skip
+    KQUANT_IMPORT_IDENTITY as _KQUANT_IMPORT_IDENTITY,
+)
+
 from kquant.exl3_loader import load_qsrt_encoder
 from kquant.fruit_calibration import FruitCalibrationStore
 from kquant.fruit_qsrt import measure_fruit_uniform_rates
@@ -89,6 +93,12 @@ def main() -> None:
     )
     if not assignments:
         raise ValueError("no Fruit assignments selected")
+    if args.output.is_symlink():
+        raise ValueError(f"Fruit rate-sweep output must not be symbolic: {args.output}")
+    if args.output.exists() and (
+        not args.output.is_file() or args.output.stat().st_nlink != 1
+    ):
+        raise ValueError(f"Fruit rate-sweep output must be private: {args.output}")
 
     if args.checkpoint.is_dir():
         store = FruitSafetensorsStore(
@@ -103,8 +113,25 @@ def main() -> None:
             expected_sha256=FRUIT_ANNEALED_SPEC.checkpoint_sha256,
         )
     calibration_store = FruitCalibrationStore(args.calibration)
+    encoder = current_encoder_provenance(
+        exllamav3_root=args.exllamav3_root,
+        calibration=calibration_store,
+    )
+    if (
+        encoder["kquant_revision"],
+        encoder["kquant_source_sha256"],
+    ) != _KQUANT_IMPORT_IDENTITY:
+        raise ValueError("KQuant sources changed while importing the rate sweep")
     quantizer_module = load_qsrt_encoder(args.exllamav3_root)
     install_sqg_quantizer(quantizer_module)
+    if (
+        current_encoder_provenance(
+            exllamav3_root=args.exllamav3_root,
+            calibration=calibration_store,
+        )
+        != encoder
+    ):
+        raise ValueError("Fruit encoder sources changed while loading the encoder")
     signature = {
         "schema": _SCHEMA,
         "source": _validate_source_evidence(store.evidence),
@@ -113,10 +140,7 @@ def main() -> None:
             "fingerprint": calibration_store.fingerprint,
             "manifest_sha256": calibration_store.manifest_sha256,
         },
-        "encoder": current_encoder_provenance(
-            exllamav3_root=args.exllamav3_root,
-            calibration=calibration_store,
-        ),
+        "encoder": encoder,
         "rates": list(args.rates),
         "assignments": [list(value) for value in assignments],
     }
@@ -178,6 +202,14 @@ def main() -> None:
                 f"{result['status']}"
             )
             torch.cuda.empty_cache()
+    if (
+        current_encoder_provenance(
+            exllamav3_root=args.exllamav3_root,
+            calibration=calibration_store,
+        )
+        != encoder
+    ):
+        raise ValueError("Fruit encoder sources changed during the rate sweep")
     payload["elapsed_seconds"] = time.perf_counter() - started
     payload["complete"] = True
     _atomic_json(args.output, payload)

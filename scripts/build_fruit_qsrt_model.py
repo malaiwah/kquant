@@ -18,6 +18,10 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from scripts.kquant_import_guard import (  # isort: skip
+    KQUANT_IMPORT_IDENTITY as _KQUANT_IMPORT_IDENTITY,
+)
+
 from kquant.exl3_loader import load_qsrt_encoder
 from kquant.fruit_calibration import FruitCalibrationStore
 from kquant.fruit_qsrt import (
@@ -44,7 +48,6 @@ from kquant.fruit_qsrt import (
 )
 from kquant.fruit_source import (
     FRUIT_ANNEALED_SPEC,
-    FruitCheckpointStore,
     FruitSafetensorsStore,
 )
 from kquant.sqg_quantizer import install_sqg_quantizer
@@ -177,22 +180,19 @@ The runtime is pinned to the reviewed commits below:
 - vLLM loader: [`local-inference-lab/vllm#269`](https://github.com/local-inference-lab/vllm/pull/269),
   tested revision `__VLLM_REVISION__`.
 
-The first Docker build compiles that vLLM commit. The second adds the exact
-B12X checkout and the fail-closed launcher. `MODEL_REVISION` resolves the Hub
-branch once; `hf download` then uses the resulting immutable commit SHA.
+The derived image starts from the content-addressed public base
+`docker.io/voipmonitor/vllm@sha256:3230c25ff95f8678a8eeb52a463f0d3b9f96f6ad550418cc51ea12177a55b41c`
+hard-coded by `Dockerfile.fruit-qsrt`. It installs the exact B12X checkout,
+copies the base's compiled vLLM extensions into the reviewed source tree, and
+seals the exact runtime package bytes. `MODEL_REVISION` resolves the Hub branch
+once; `hf download` then uses the resulting immutable commit SHA.
 
 ```bash
 git clone https://github.com/malaiwah/vllm-voipmonitor.git vllm-fruit
 git -C vllm-fruit checkout --detach __VLLM_REVISION__
 
 docker build \
-  --target vllm-openai \
-  --file vllm-fruit/docker/Dockerfile \
-  --tag fruit-vllm-base:__VLLM_REVISION__ \
-  vllm-fruit
-docker build \
   --file vllm-fruit/Dockerfile.fruit-qsrt \
-  --build-arg VLLM_BASE_IMAGE=fruit-vllm-base:__VLLM_REVISION__ \
   --build-arg VLLM_REVISION=__VLLM_REVISION__ \
   --build-arg B12X_REVISION=__B12X_REVISION__ \
   --tag fruit-qsrt:__VLLM_REVISION__ \
@@ -209,18 +209,28 @@ hf download malaiwah/GLM-5.2-QSRT-Fruit \
   --local-dir "${MODEL_DIR}"
 
 docker run --rm --gpus '"device=0"' --shm-size=16g \
+  --read-only \
+  --tmpfs /tmp:rw,exec,nosuid,size=8g \
+  --tmpfs /cache:rw,exec,nosuid,size=16g \
+  --tmpfs /root/.cache:rw,nosuid,size=1g \
   --publish 8000:8000 \
   --volume "$PWD/${MODEL_DIR}:/model:ro" \
   --env MODEL=/model \
   fruit-qsrt:__VLLM_REVISION__
 ```
 
-The qualified path is SM120 with the CUDA 13.0.2 base pinned by the vLLM
-Dockerfile and `nvidia-cutlass-dsl == 4.6.0` pinned by B12X. The launcher rejects
-extra vLLM arguments and any value other than TP1, `max_num_seqs=1`,
-`max_model_len=4096`, and `max_num_batched_tokens=4096` before importing the GPU
-runtime. The current B12X sparse-prefill backend requires single-request
-prefill chunks.
+The qualified path is SM120 with CUDA 13.2.1 and PyTorch 2.12.0+cu132 in the
+content-addressed base, plus `nvidia-cutlass-dsl == 4.6.0` in the derived image.
+The launcher rejects extra vLLM arguments and any value other than TP1,
+`max_num_seqs=1`, `max_model_len=4096`, and
+`max_num_batched_tokens=4096` before importing the GPU runtime. The current
+B12X sparse-prefill backend requires single-request prefill chunks.
+
+The runtime manifest is an integrity check rooted in the trusted immutable
+image, not an independent signature. The build host and container operator
+remain trusted. Run the container read-only, keep writable tmpfs mounts outside
+`/opt/vllm-fruit`, `/opt/b12x-fruit`, and `/opt/fruit-runtime`, and mount the
+authenticated model read-only as shown above.
 
 W4A16 is used for prefill and any row count above the W4A8 decode ceiling. W4A8
 is selected for decode-sized batches of at most 16 rows. Unsupported shapes,
@@ -386,6 +396,15 @@ def current_encoder_provenance(
         "calibration_manifest_sha256": calibration.manifest_sha256,
         "fingerprint_schema": _ENCODER_FINGERPRINT_SCHEMA,
     }
+    if (
+        _KQUANT_IMPORT_IDENTITY is not None
+        and (
+            encoder["kquant_revision"],
+            encoder["kquant_source_sha256"],
+        )
+        != _KQUANT_IMPORT_IDENTITY
+    ):
+        raise ValueError("KQuant sources changed while importing the builder")
     encoder["fingerprint"] = hashlib.sha256(
         _canonical_json(_encoder_fingerprint_payload(encoder)).encode("utf-8")
     ).hexdigest()
@@ -470,8 +489,7 @@ def _validate_rate_sweep(
         signature.get("schema") != _RATE_SWEEP_SCHEMA
         or signature.get("source") != source_evidence
         or signature.get("calibration") != expected_calibration
-        or measured_encoder.get("fingerprint_schema") != _ENCODER_FINGERPRINT_SCHEMA
-        or measured_encoder.get("fingerprint") != expected_encoder.get("fingerprint")
+        or measured_encoder != expected_encoder
         or signature.get("rates") != [2, 3, 4]
     ):
         raise ValueError("Fruit rate-sweep provenance does not match this build")
@@ -754,6 +772,62 @@ def _atomic_safetensors(
     os.replace(temporary, path)
 
 
+def _validate_part_cache_root(
+    root: Path,
+    *,
+    create: bool,
+    allow_run_manifests: bool = False,
+) -> None:
+    if root.is_symlink():
+        raise ValueError(f"Fruit QSRT part cache must not be symbolic: {root}")
+    if not root.exists():
+        if create:
+            root.mkdir(parents=True)
+        return
+    if not root.is_dir():
+        raise ValueError(f"Fruit QSRT part cache must be a directory: {root}")
+    expected_layers = {f"layer-{layer:03d}" for layer in LAYERS}
+    for directory in root.iterdir():
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError(f"unexpected Fruit QSRT cache path: {directory}")
+        if allow_run_manifests and directory.name == "run-manifests":
+            for path in directory.iterdir():
+                if (
+                    path.is_symlink()
+                    or not path.is_file()
+                    or path.stat().st_nlink != 1
+                    or path.suffix != ".json"
+                ):
+                    raise ValueError(f"unexpected Fruit QSRT run manifest: {path}")
+            continue
+        if directory.name not in expected_layers:
+            raise ValueError(f"unexpected Fruit QSRT cache directory: {directory}")
+        for path in directory.iterdir():
+            if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+                raise ValueError(f"unexpected Fruit QSRT part path: {path}")
+            stem, suffix = path.name.rsplit(".", 1)
+            expert_text = stem.removeprefix("expert-")
+            if (
+                not stem.startswith("expert-")
+                or suffix not in {"json", "safetensors"}
+                or len(expert_text) != 3
+                or not expert_text.isdigit()
+                or not 0 <= int(expert_text) < EXPERTS
+            ):
+                raise ValueError(f"unexpected Fruit QSRT part filename: {path}")
+
+
+def _prepare_part_layer(output: Path, layer: int) -> None:
+    root = output / ".qsrt-parts"
+    _validate_part_cache_root(root, create=True)
+    directory = root / f"layer-{layer:03d}"
+    if directory.is_symlink():
+        raise ValueError(f"Fruit QSRT part layer must not be symbolic: {directory}")
+    if directory.exists() and not directory.is_dir():
+        raise ValueError(f"Fruit QSRT part layer must be a directory: {directory}")
+    directory.mkdir(exist_ok=True)
+
+
 def _part_paths(output: Path, layer: int, expert: int) -> tuple[Path, Path]:
     root = output / ".qsrt-parts" / f"layer-{layer:03d}"
     return root / f"expert-{expert:03d}.safetensors", root / f"expert-{expert:03d}.json"
@@ -956,6 +1030,11 @@ def _validate_part(
     encoder_fingerprint: str,
     repair: bool = True,
 ) -> dict[str, object] | None:
+    for path in (tensor_path, manifest_path):
+        if path.is_symlink():
+            raise ValueError(f"Fruit QSRT part must not be symbolic: {path}")
+        if path.exists() and (not path.is_file() or path.stat().st_nlink != 1):
+            raise ValueError(f"Fruit QSRT part must be a private regular file: {path}")
     if not tensor_path.exists() and not manifest_path.exists():
         return None
     if not tensor_path.is_file() or not manifest_path.is_file():
@@ -1031,7 +1110,7 @@ def _write_part(
     peak_cuda_bytes: int,
 ) -> dict[str, object]:
     tensor_path, manifest_path = _part_paths(output, encoding.layer, encoding.expert)
-    tensor_path.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_part_layer(output, encoding.layer)
     _atomic_safetensors(
         tensor_path,
         encoding.artifact_tensors(),
@@ -1069,6 +1148,14 @@ def _seed_parts(
 ) -> int:
     if seed is None:
         return 0
+    if seed.is_symlink() or not seed.is_dir():
+        raise ValueError(f"Fruit QSRT seed cache must be a real directory: {seed}")
+    _validate_part_cache_root(
+        seed,
+        create=False,
+        allow_run_manifests=True,
+    )
+    _validate_part_cache_root(output / ".qsrt-parts", create=True)
     copied = 0
     for layer in LAYERS:
         for expert in range(EXPERTS):
@@ -1097,18 +1184,34 @@ def _seed_parts(
                 valid = None
             if valid is None:
                 continue
-            target_tensor.parent.mkdir(parents=True, exist_ok=True)
+            _prepare_part_layer(output, layer)
             try:
-                shutil.copy2(source_tensor, target_tensor)
-                shutil.copy2(source_manifest, target_manifest)
-            except OSError as exc:
+                tensor_sha256 = valid.get("safetensors_sha256")
+                if not isinstance(tensor_sha256, str):
+                    raise TypeError("Fruit QSRT part digest must be a string")
+                _copy_authenticated(source_tensor, target_tensor, tensor_sha256)
+                _copy_authenticated(
+                    source_manifest,
+                    target_manifest,
+                    _sha256(source_manifest),
+                )
+                if (
+                    _validate_part(
+                        target_tensor,
+                        target_manifest,
+                        layer=layer,
+                        expert=expert,
+                        source_sha256=source_sha256,
+                        encoder_fingerprint=encoder_fingerprint,
+                        repair=False,
+                    )
+                    is None
+                ):
+                    raise ValueError("copied Fruit QSRT part failed validation")
+            except (OSError, TypeError, ValueError):
                 for target in (target_tensor, target_manifest):
-                    if target.is_file():
+                    if target.is_file() and not target.is_symlink():
                         target.unlink()
-                    elif target.exists():
-                        raise ValueError(
-                            f"unexpected Fruit QSRT part path: {target}"
-                        ) from exc
                 continue
             copied += 1
     return copied
@@ -1120,6 +1223,7 @@ def _parts_need_encoder(
     source_sha256: str,
     encoder_fingerprint: str,
 ) -> bool:
+    _validate_part_cache_root(output / ".qsrt-parts", create=True)
     expected = {
         "source_sha256": source_sha256,
         "encoder_fingerprint": encoder_fingerprint,
@@ -1433,6 +1537,7 @@ def _assemble_layers(
     source_sha256: str,
     encoder_fingerprint: str,
 ) -> dict[str, dict[str, object]]:
+    _validate_part_cache_root(output / ".qsrt-parts", create=False)
     results: dict[str, dict[str, object]] = {}
     for layer in LAYERS:
         tensor_path, manifest_path = _layer_paths(output, layer)
@@ -1642,7 +1747,7 @@ def _copy_authenticated(
     if target.exists():
         if not target.is_file():
             raise ValueError(f"Fruit package target must be regular: {target}")
-        if not target.samefile(source):
+        if not target.samefile(source) and target.stat().st_nlink == 1:
             if _sha256(target) != expected_sha256:
                 raise ValueError(
                     f"existing static model file differs from source: {target}"
@@ -1698,6 +1803,7 @@ def _strip_routed_experts(
         }
     _assert_authenticated_file(source, expected_sha256)
     _atomic_safetensors(target, kept, metadata)
+    _assert_authenticated_file(source, expected_sha256)
     return expert_names, removed_bytes
 
 
@@ -1828,28 +1934,89 @@ def _write_config(
     _atomic_text(output / "config.json", _canonical_json(config))
 
 
+def _prepare_output_root(output: Path) -> None:
+    if output.is_symlink():
+        raise ValueError(f"Fruit package root must not be a symbolic link: {output}")
+    if output.exists():
+        if not output.is_dir():
+            raise ValueError(f"Fruit package root must be a directory: {output}")
+    else:
+        output.mkdir(parents=True)
+    _recover_staged_part_cache(output)
+
+
 def _remove_part_cache(output: Path) -> None:
     parts = output / ".qsrt-parts"
-    if parts.is_symlink():
-        raise ValueError(f"Fruit QSRT part cache must not be a symbolic link: {parts}")
-    if not parts.exists():
+    _validate_part_cache_root(parts, create=False)
+    if parts.exists():
+        shutil.rmtree(parts)
+
+
+def _staged_part_cache_path(output: Path) -> Path:
+    return output.with_name(f".{output.name}.qsrt-parts-finalizing")
+
+
+def _recover_staged_part_cache(output: Path) -> None:
+    staged = _staged_part_cache_path(output)
+    if staged.is_symlink():
+        raise ValueError(f"staged Fruit QSRT cache must not be symbolic: {staged}")
+    if not staged.exists():
         return
-    if not parts.is_dir():
-        raise ValueError(f"Fruit QSRT part cache is not a directory: {parts}")
-    shutil.rmtree(parts)
+    _validate_part_cache_root(staged, create=False)
+    parts = output / ".qsrt-parts"
+    if parts.exists() or parts.is_symlink():
+        raise ValueError("both active and staged Fruit QSRT caches exist")
+    os.replace(staged, parts)
 
 
-def _package_files(output: Path) -> dict[str, Path]:
+def _stage_part_cache(output: Path) -> Path | None:
+    parts = output / ".qsrt-parts"
+    _validate_part_cache_root(parts, create=False)
+    if not parts.exists():
+        return None
+    staged = _staged_part_cache_path(output)
+    if staged.exists() or staged.is_symlink():
+        raise ValueError(f"staged Fruit QSRT cache already exists: {staged}")
+    os.replace(parts, staged)
+    return staged
+
+
+def _restore_staged_part_cache(output: Path, staged: Path | None) -> None:
+    if staged is None:
+        return
+    _validate_part_cache_root(staged, create=False)
+    parts = output / ".qsrt-parts"
+    if parts.exists() or parts.is_symlink():
+        raise ValueError("cannot restore Fruit QSRT cache over an existing path")
+    os.replace(staged, parts)
+
+
+def _discard_staged_part_cache(staged: Path | None) -> None:
+    if staged is None:
+        return
+    _validate_part_cache_root(staged, create=False)
+    shutil.rmtree(staged)
+
+
+def _package_files(
+    output: Path,
+    *,
+    allow_part_cache: bool = False,
+) -> dict[str, Path]:
     files: dict[str, Path] = {}
     for path in output.iterdir():
         if path.is_symlink():
             raise ValueError(f"Fruit package path must not be a symbolic link: {path}")
         if path.is_dir():
+            if allow_part_cache and path.name == ".qsrt-parts":
+                continue
             if path.name != "evaluation":
                 raise ValueError(f"unexpected Fruit package directory: {path}")
             continue
         if not path.is_file():
             raise ValueError(f"unexpected Fruit package path: {path}")
+        if path.stat().st_nlink != 1:
+            raise ValueError(f"Fruit package file must not be hard-linked: {path}")
         if path.name not in {"MANIFEST.sha256", _COMPLETE_MARKER_NAME}:
             files[path.name] = path
     evaluation = output / "evaluation"
@@ -1859,10 +2026,60 @@ def _package_files(output: Path) -> dict[str, Path]:
                 raise ValueError(
                     f"Fruit evaluation path must not be a symbolic link: {path}"
                 )
-            if path.is_file():
-                relative = path.relative_to(output).as_posix()
-                files[relative] = path
+            if path.is_dir():
+                raise ValueError(f"unexpected Fruit evaluation directory: {path}")
+            if not path.is_file():
+                raise ValueError(f"unexpected Fruit evaluation path: {path}")
+            if path.stat().st_nlink != 1:
+                raise ValueError(
+                    f"Fruit evaluation file must not be hard-linked: {path}"
+                )
+            relative = path.relative_to(output).as_posix()
+            files[relative] = path
     return dict(sorted(files.items()))
+
+
+def _expected_package_inventory(
+    base_provenance: dict[str, object],
+) -> set[str]:
+    base_files = base_provenance.get("files")
+    if not isinstance(base_files, dict) or any(
+        not isinstance(name, str) or not isinstance(digest, str)
+        for name, digest in base_files.items()
+    ):
+        raise TypeError("Fruit BF16 base provenance has no authenticated file map")
+    expected = set(base_files)
+    expected.update(
+        {
+            "README.md",
+            "qsrt-manifest.json",
+            _SOURCE_EVIDENCE_NAME,
+            _SOURCE_EVIDENCE_SHA_NAME,
+            _CALIBRATION_EVIDENCE_NAME,
+            _RATE_SWEEP_NAME,
+        }
+    )
+    for layer in LAYERS:
+        expected.add(f"qsrt-layer-{layer:03d}.json")
+        expected.add(f"qsrt-layer-{layer:03d}.safetensors")
+    return expected
+
+
+def _validated_package_files(
+    output: Path,
+    base_provenance: dict[str, object],
+    *,
+    allow_part_cache: bool = False,
+) -> dict[str, Path]:
+    files = _package_files(output, allow_part_cache=allow_part_cache)
+    expected = _expected_package_inventory(base_provenance)
+    if set(files) != expected:
+        raise ValueError(
+            "Fruit package inventory mismatch; "
+            f"missing={sorted(expected - set(files))}, "
+            f"unexpected={sorted(set(files) - expected)}"
+        )
+    return files
 
 
 def _write_package_manifests(
@@ -1937,10 +2154,12 @@ def _write_package_manifests(
             layers=layers,
         ),
     )
-    entries = [
-        f"{_sha256(path)}  {relative}"
-        for relative, path in _package_files(output).items()
-    ]
+    files = _validated_package_files(
+        output,
+        base_provenance,
+        allow_part_cache=True,
+    )
+    entries = [f"{_sha256(path)}  {relative}" for relative, path in files.items()]
     _atomic_text(output / "MANIFEST.sha256", "\n".join(entries) + "\n")
 
 
@@ -1966,7 +2185,12 @@ def _completion_record(
     }
 
 
-def _validate_checksum_manifest(output: Path) -> None:
+def _validate_checksum_manifest(
+    output: Path,
+    base_provenance: dict[str, object],
+    *,
+    allow_part_cache: bool,
+) -> None:
     manifest_path = output / "MANIFEST.sha256"
     entries: dict[str, str] = {}
     for line in manifest_path.read_text(encoding="utf-8").splitlines():
@@ -1984,7 +2208,13 @@ def _validate_checksum_manifest(output: Path) -> None:
         ):
             raise ValueError(f"invalid package checksum line: {line!r}")
         entries[filename] = digest
-    expected_files = set(_package_files(output))
+    expected_files = set(
+        _validated_package_files(
+            output,
+            base_provenance,
+            allow_part_cache=allow_part_cache,
+        )
+    )
     if set(entries) != expected_files:
         raise ValueError("package checksum inventory mismatch")
     for filename, expected_sha256 in entries.items():
@@ -2119,7 +2349,11 @@ def _validate_output_package(
     }
     if manifest.get("layers") != expected_layers:
         raise ValueError("Fruit QSRT package layer ledger mismatch")
-    _validate_checksum_manifest(output)
+    _validate_checksum_manifest(
+        output,
+        base_provenance,
+        allow_part_cache=not require_complete,
+    )
     marker_path = output / _COMPLETE_MARKER_NAME
     if require_complete:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -2156,7 +2390,6 @@ def _write_complete_marker(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkpoint", type=Path)
     parser.add_argument("base_model", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--exllamav3-root", required=True, type=Path)
@@ -2167,6 +2400,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed-cache", type=Path)
     return parser.parse_args()
+
+
+def _assert_producer_unchanged(
+    producer: dict[str, object],
+    *,
+    exllamav3_root: Path,
+    b12x_root: Path,
+    vllm_root: Path,
+    calibration: FruitCalibrationStore,
+) -> None:
+    current = _producer_provenance(
+        exllamav3_root=exllamav3_root,
+        b12x_root=b12x_root,
+        vllm_root=vllm_root,
+        calibration=calibration,
+    )
+    if current != producer:
+        raise ValueError("Fruit QSRT producer sources changed during the build")
 
 
 def main() -> None:
@@ -2200,23 +2451,11 @@ def main() -> None:
         raise TypeError("Fruit QSRT encoder fingerprint must be a string")
     print("authenticating pinned Fruit BF16 base model", flush=True)
     base_provenance = _authenticate_base_model(args.base_model)
-    try:
-        store = FruitCheckpointStore(
-            args.checkpoint,
-            spec=FRUIT_ANNEALED_SPEC,
-            expected_sha256=FRUIT_ANNEALED_SPEC.checkpoint_sha256,
-        )
-    except (FileNotFoundError, ValueError):
-        print(
-            "checkpoint unavailable or changed; authenticating pinned BF16 "
-            "expert source",
-            flush=True,
-        )
-        store = FruitSafetensorsStore(
-            args.base_model,
-            spec=FRUIT_ANNEALED_SPEC,
-            expected_manifest_sha256=BASE_MANIFEST_SHA256,
-        )
+    store = FruitSafetensorsStore(
+        args.base_model,
+        spec=FRUIT_ANNEALED_SPEC,
+        expected_manifest_sha256=BASE_MANIFEST_SHA256,
+    )
     source_evidence = _validate_source_evidence(store.evidence)
     if source_evidence.get("source_kind") != "safetensors_manifest":
         raise ValueError(
@@ -2233,7 +2472,7 @@ def main() -> None:
     )
     torch.cuda.set_device(device)
     torch.empty(0, device=device)
-    args.output.mkdir(parents=True, exist_ok=True)
+    _prepare_output_root(args.output)
     (args.output / _COMPLETE_MARKER_NAME).unlink(missing_ok=True)
     _write_source_evidence_seal(args.output, source_evidence, producer)
     seeded = _seed_parts(
@@ -2277,7 +2516,13 @@ def main() -> None:
     )
     _write_source_evidence_seal(args.output, source_evidence, producer)
     _write_calibration_evidence(args.output, calibration, producer)
-    _remove_part_cache(args.output)
+    _assert_producer_unchanged(
+        producer,
+        exllamav3_root=args.exllamav3_root,
+        b12x_root=args.b12x_root,
+        vllm_root=args.vllm_root,
+        calibration=calibration,
+    )
     _write_package_manifests(
         args.output,
         source_evidence=source_evidence,
@@ -2295,22 +2540,27 @@ def main() -> None:
         rate_sweep=rate_sweep,
         require_complete=False,
     )
-    _write_complete_marker(
-        args.output,
-        source_evidence=source_evidence,
-        base_provenance=base_provenance,
-        producer=producer,
-    )
-    marker = json.loads(
-        (args.output / _COMPLETE_MARKER_NAME).read_text(encoding="utf-8")
-    )
-    if marker != _completion_record(
-        args.output,
-        source_evidence=source_evidence,
-        base_provenance=base_provenance,
-        producer=producer,
-    ):
-        raise ValueError("Fruit QSRT completion marker failed post-write validation")
+    staged_cache = _stage_part_cache(args.output)
+    try:
+        _write_complete_marker(
+            args.output,
+            source_evidence=source_evidence,
+            base_provenance=base_provenance,
+            producer=producer,
+        )
+        _validate_output_package(
+            args.output,
+            source_evidence=source_evidence,
+            base_provenance=base_provenance,
+            producer=producer,
+            rate_sweep=rate_sweep,
+            require_complete=True,
+        )
+    except BaseException:
+        (args.output / _COMPLETE_MARKER_NAME).unlink(missing_ok=True)
+        _restore_staged_part_cache(args.output, staged_cache)
+        raise
+    _discard_staged_part_cache(staged_cache)
     print(f"complete Fruit QSRT model: {args.output}", flush=True)
 
 
