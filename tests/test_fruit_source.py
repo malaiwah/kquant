@@ -10,11 +10,17 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from kquant.fruit_calibration import (
+    FRUIT_INSTRUCT_CALIBRATION_AUTHORITY,
+    fruit_calibration_authority,
+)
 from kquant.fruit_source import (
     FRUIT_ANNEALED_SPEC,
+    FRUIT_INSTRUCT_SPEC,
     FruitCheckpointStore,
     FruitModelSpec,
     FruitSafetensorsStore,
+    fruit_model_spec,
     preflight_fruit_checkpoint,
 )
 
@@ -43,6 +49,55 @@ def test_annealed_bf16_source_identity_is_publicly_pinned() -> None:
         FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256
         == "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
     )
+
+
+def test_instruct_source_and_calibration_authority_are_publicly_pinned() -> None:
+    assert fruit_model_spec("instruct") is FRUIT_INSTRUCT_SPEC
+    assert (
+        FRUIT_INSTRUCT_SPEC.checkpoint_sha256
+        == "32dbf82d40b88a92b8dccd563c593b5971be358cf11895eb150f18644ff93c27"
+    )
+    assert (
+        FRUIT_INSTRUCT_SPEC.safetensors_repository
+        == "malaiwah/GLM-5.2-SIQ-Fruit-Instruct-bf16"
+    )
+    assert (
+        FRUIT_INSTRUCT_SPEC.safetensors_revision
+        == "678954f65e056a0f508e21eeb9251c655bb9463f"
+    )
+    assert (
+        FRUIT_INSTRUCT_SPEC.safetensors_manifest_sha256
+        == "8f23aed5e9b12000ed103a76da772a20730ca53ab7e352d6cb94da2709165245"
+    )
+    authority = fruit_calibration_authority("instruct")
+    assert authority is FRUIT_INSTRUCT_CALIBRATION_AUTHORITY
+    assert authority.spec is FRUIT_INSTRUCT_SPEC
+    assert (
+        authority.reference_sha256
+        == "e838645989a37e651e59f2388bb55d16f9b33b9a76b0352628abf2d4e667f414"
+    )
+    assert authority.source["manifest_sha256"] == (
+        FRUIT_INSTRUCT_SPEC.safetensors_manifest_sha256
+    )
+    assert (
+        authority.capture_id
+        == "24b290abaddb9eff8d7328a2a22f3c33bb7f6f45b77692393b3549ba0fded0a2"
+    )
+    assert (
+        authority.fingerprint
+        == "3ed144b08b089cb96d030ede5e4a3959f43b4f12c8189e8036efb590fc4dc814"
+    )
+    assert (
+        authority.manifest_sha256
+        == "be944c8dfc5b550319d26bc2899f0d2ea3f4ca81275ba53034f0cc8ef7b4e9c5"
+    )
+
+
+def test_unknown_fruit_variant_fails_closed() -> None:
+    with pytest.raises(ValueError, match="unsupported Fruit variant"):
+        fruit_model_spec("unknown")
+    with pytest.raises(ValueError, match="unsupported Fruit calibration variant"):
+        fruit_calibration_authority("unknown")
 
 
 _PROJECTION = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}

@@ -210,6 +210,7 @@ def test_model_card_uses_sealed_calibration_and_layer_evidence(monkeypatch) -> N
         producer=producer,
         rate_sweep=_rate_sweep(),
         layers=layers,
+        publication=builder.fruit_publication_spec("annealed"),
     )
 
     assert "| `R13=0,R2=0` | 1 |" in card
@@ -225,6 +226,14 @@ def test_model_card_uses_sealed_calibration_and_layer_evidence(monkeypatch) -> N
     assert "Adjacent-rate evidence" in card
     assert "1 of 1 predeclared assignments" in card
     assert "__" not in card
+
+
+def test_instruct_publication_uses_variant_specific_repositories() -> None:
+    publication = builder.fruit_publication_spec("instruct")
+    assert publication.repository == "malaiwah/GLM-5.2-QSRT-Fruit-Instruct-exact"
+    assert "Fruit Instruct BF16" in publication.fruit_audit_rows
+    assert "GLM-5.2-SIQ-Fruit-Instruct/tree/48452ef3" in publication.fruit_audit_rows
+    assert "GLM-5.2-QSRT-Fruit/tree/c1a0c62d" not in publication.fruit_audit_rows
 
 
 def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:

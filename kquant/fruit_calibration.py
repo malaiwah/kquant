@@ -6,14 +6,21 @@ import hashlib
 import json
 import math
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
 import torch
 from safetensors import safe_open
 
-from kquant.fruit_source import FRUIT_ANNEALED_SPEC
+from kquant.fruit_source import (
+    FRUIT_ANNEALED_SPEC,
+    FRUIT_INSTRUCT_SPEC,
+    FruitModelSpec,
+    fruit_model_spec,
+)
 
 FRUIT_CALIBRATION_SCHEMA = "kquant_fruit_qsrt_calibration_v2"
 FRUIT_CALIBRATION_VERSION = 2
@@ -65,25 +72,6 @@ FRUIT_CALIBRATION_TOKENIZER_FILES = {
 FRUIT_CALIBRATION_TRAINER_FILES = {
     "train_fruit.py": "520be10eeaaf4bc525ba1f5d0d91b860556d9995e782a4c6ac225244105ffcd8"
 }
-FRUIT_CALIBRATION_REFERENCE_SHA256 = (
-    "1e11e847d745e7015291543620caec65c99ce8d9bb8c72f4db54f8790bb20ddc"
-)
-FRUIT_CALIBRATION_CLOSURE_LIMITS = {
-    "max_abs_logprob": 0.3,
-    "rms_logprob": 0.08,
-    "mean_forward_kl": 2e-4,
-    "max_forward_kl": 6e-4,
-}
-FRUIT_CALIBRATION_SOURCE = {
-    "kind": "authenticated_bf16_export",
-    "manifest_sha256": (
-        "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
-    ),
-    "index_sha256": (
-        "86e6cc1d8548c7bdbbc117e93b85b8ae249f446de9b48d2195e51f358674ba56"
-    ),
-    "file_count": 23,
-}
 FRUIT_CALIBRATION_CONVENTIONS = {
     "serve_conv_v": 2,
     "trained_rope_theta": FRUIT_ANNEALED_SPEC.trained_rope_theta,
@@ -111,6 +99,151 @@ def _is_sha256(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+@dataclass(frozen=True)
+class FruitCalibrationAuthority:
+    """Pinned source, reference, and closure contract for one Fruit variant."""
+
+    variant: str
+    spec: FruitModelSpec
+    source_index_sha256: str
+    source_file_count: int
+    reference_sha256: str
+    capture_id: str
+    fingerprint: str
+    manifest_sha256: str
+    max_abs_logprob: float
+    rms_logprob: float
+    mean_forward_kl: float
+    max_forward_kl: float
+
+    def __post_init__(self) -> None:
+        if fruit_model_spec(self.variant) is not self.spec:
+            raise ValueError("Fruit calibration authority variant/spec mismatch")
+        if self.spec.safetensors_manifest_sha256 is None:
+            raise ValueError("Fruit calibration authority requires a BF16 source")
+        if not _is_sha256(self.source_index_sha256):
+            raise ValueError("Fruit calibration source index SHA-256 is invalid")
+        if type(self.source_file_count) is not int or self.source_file_count <= 0:
+            raise ValueError("Fruit calibration source file count must be positive")
+        for name in ("capture_id", "fingerprint", "manifest_sha256"):
+            if not _is_sha256(getattr(self, name)):
+                raise ValueError(f"Fruit calibration {name} is invalid")
+        if not _is_sha256(self.reference_sha256):
+            raise ValueError("Fruit calibration reference SHA-256 is invalid")
+        for name, value in self.closure_limits.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"Fruit calibration {name} limit must be positive")
+        geometry = (
+            self.spec.layers,
+            self.spec.mtp_layer,
+            self.spec.num_experts,
+            self.spec.hidden_size,
+            self.spec.intermediate_size,
+            self.spec.trained_rope_theta,
+        )
+        canonical_geometry = (
+            FRUIT_ANNEALED_SPEC.layers,
+            FRUIT_ANNEALED_SPEC.mtp_layer,
+            FRUIT_ANNEALED_SPEC.num_experts,
+            FRUIT_ANNEALED_SPEC.hidden_size,
+            FRUIT_ANNEALED_SPEC.intermediate_size,
+            FRUIT_ANNEALED_SPEC.trained_rope_theta,
+        )
+        if geometry != canonical_geometry:
+            raise ValueError("Fruit calibration variant has unsupported geometry")
+
+    @property
+    def source(self) -> dict[str, object]:
+        assert self.spec.safetensors_manifest_sha256 is not None
+        return {
+            "kind": "authenticated_bf16_export",
+            "manifest_sha256": self.spec.safetensors_manifest_sha256,
+            "index_sha256": self.source_index_sha256,
+            "file_count": self.source_file_count,
+        }
+
+    @property
+    def closure_limits(self) -> dict[str, float]:
+        return {
+            "max_abs_logprob": self.max_abs_logprob,
+            "rms_logprob": self.rms_logprob,
+            "mean_forward_kl": self.mean_forward_kl,
+            "max_forward_kl": self.max_forward_kl,
+        }
+
+    @property
+    def conventions(self) -> dict[str, object]:
+        return {
+            **FRUIT_CALIBRATION_CONVENTIONS,
+            "trained_rope_theta": self.spec.trained_rope_theta,
+        }
+
+
+FRUIT_ANNEALED_CALIBRATION_AUTHORITY = FruitCalibrationAuthority(
+    variant="annealed",
+    spec=FRUIT_ANNEALED_SPEC,
+    source_index_sha256=(
+        "86e6cc1d8548c7bdbbc117e93b85b8ae249f446de9b48d2195e51f358674ba56"
+    ),
+    source_file_count=23,
+    reference_sha256=(
+        "1e11e847d745e7015291543620caec65c99ce8d9bb8c72f4db54f8790bb20ddc"
+    ),
+    capture_id="cc686d28f505d62653763cdb746e830374207137d103d3c26ebbcce070059053",
+    fingerprint="fed8cd68311c3347791f81b817c7cc3cce704056792e56881b97c4319e07dd2b",
+    manifest_sha256=(
+        "77fd947235b89e67549fa264a08dc1436d3913ba864d58da558d78e75d892cde"
+    ),
+    max_abs_logprob=0.3,
+    rms_logprob=0.08,
+    mean_forward_kl=2e-4,
+    max_forward_kl=6e-4,
+)
+
+FRUIT_INSTRUCT_CALIBRATION_AUTHORITY = FruitCalibrationAuthority(
+    variant="instruct",
+    spec=FRUIT_INSTRUCT_SPEC,
+    source_index_sha256=(
+        "86e6cc1d8548c7bdbbc117e93b85b8ae249f446de9b48d2195e51f358674ba56"
+    ),
+    source_file_count=23,
+    reference_sha256=(
+        "e838645989a37e651e59f2388bb55d16f9b33b9a76b0352628abf2d4e667f414"
+    ),
+    capture_id="24b290abaddb9eff8d7328a2a22f3c33bb7f6f45b77692393b3549ba0fded0a2",
+    fingerprint="3ed144b08b089cb96d030ede5e4a3959f43b4f12c8189e8036efb590fc4dc814",
+    manifest_sha256=(
+        "be944c8dfc5b550319d26bc2899f0d2ea3f4ca81275ba53034f0cc8ef7b4e9c5"
+    ),
+    max_abs_logprob=1.0,
+    rms_logprob=0.2,
+    mean_forward_kl=1e-3,
+    max_forward_kl=5e-3,
+)
+
+FRUIT_CALIBRATION_AUTHORITIES: Mapping[str, FruitCalibrationAuthority] = (
+    MappingProxyType(
+        {
+            "annealed": FRUIT_ANNEALED_CALIBRATION_AUTHORITY,
+            "instruct": FRUIT_INSTRUCT_CALIBRATION_AUTHORITY,
+        }
+    )
+)
+
+
+def fruit_calibration_authority(variant: str) -> FruitCalibrationAuthority:
+    """Resolve the pinned calibration contract for one Fruit variant."""
+
+    try:
+        return FRUIT_CALIBRATION_AUTHORITIES[variant]
+    except KeyError as exc:
+        supported = ", ".join(FRUIT_CALIBRATION_AUTHORITIES)
+        raise ValueError(
+            f"unsupported Fruit calibration variant {variant!r}; "
+            f"expected one of {supported}"
+        ) from exc
 
 
 def _capture_fingerprint(manifest: dict[str, object]) -> str:
@@ -373,12 +506,21 @@ class FruitCalibrationLayer:
 class FruitCalibrationStore:
     """Fail-closed reader for a complete Fruit calibration capture."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        authority: FruitCalibrationAuthority = FRUIT_ANNEALED_CALIBRATION_AUTHORITY,
+    ) -> None:
         self.root = Path(root)
         manifest_path = self.root / "calibration-manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(manifest_path)
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_bytes = manifest_path.read_bytes()
+        actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        if actual_manifest_sha256 != authority.manifest_sha256:
+            raise ValueError("Fruit calibration manifest SHA-256 mismatch")
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
         if not isinstance(manifest, dict):
             raise TypeError("Fruit calibration manifest must be a JSON object")
         expected_root_keys = {
@@ -409,34 +551,38 @@ class FruitCalibrationStore:
             "version": FRUIT_CALIBRATION_VERSION,
             "kind": "fruit_qsrt_activation_calibration",
             "complete": True,
-            "checkpoint_sha256": FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+            "checkpoint_sha256": authority.spec.checkpoint_sha256,
             "corpus": FRUIT_CALIBRATION_CORPUS,
             "protocol": FRUIT_CALIBRATION_PROTOCOL,
             "token_bounds": FRUIT_CALIBRATION_TOKEN_BOUNDS,
-            "conventions": FRUIT_CALIBRATION_CONVENTIONS,
+            "conventions": authority.conventions,
         }
         for name, value in expected.items():
             if manifest.get(name) != value:
                 raise ValueError(f"Fruit calibration manifest {name!r} mismatch")
         fingerprint = manifest.get("fingerprint")
-        if not _is_sha256(fingerprint) or fingerprint != calibration_fingerprint(
-            manifest
+        if (
+            not _is_sha256(fingerprint)
+            or fingerprint != calibration_fingerprint(manifest)
+            or fingerprint != authority.fingerprint
         ):
             raise ValueError("Fruit calibration manifest fingerprint mismatch")
         capture_id = manifest.get("capture_id")
-        if not _is_sha256(capture_id) or capture_id != _capture_fingerprint(manifest):
+        if (
+            not _is_sha256(capture_id)
+            or capture_id != _capture_fingerprint(manifest)
+            or capture_id != authority.capture_id
+        ):
             raise ValueError("Fruit calibration capture ID is invalid")
 
         source = manifest.get("source")
+        expected_source = authority.source
         if (
             not isinstance(source, dict)
-            or set(source) != {*FRUIT_CALIBRATION_SOURCE, "directory"}
+            or set(source) != {*expected_source, "directory"}
             or not isinstance(source.get("directory"), str)
             or not source["directory"]
-            or any(
-                source.get(name) != value
-                for name, value in FRUIT_CALIBRATION_SOURCE.items()
-            )
+            or any(source.get(name) != value for name, value in expected_source.items())
         ):
             raise ValueError("Fruit calibration source identity mismatch")
         source_closure = manifest.get("source_closure")
@@ -464,7 +610,7 @@ class FruitCalibrationStore:
             "rms_logprob",
         )
         if (
-            source_closure.get("reference_sha256") != FRUIT_CALIBRATION_REFERENCE_SHA256
+            source_closure.get("reference_sha256") != authority.reference_sha256
             or source_closure.get("positions") != 6
             or source_closure.get("vocab_size") != 154880
             or source_closure.get("top1_matches") != 6
@@ -479,7 +625,7 @@ class FruitCalibrationStore:
             )
             or any(
                 float(source_closure[name]) > limit
-                for name, limit in FRUIT_CALIBRATION_CLOSURE_LIMITS.items()
+                for name, limit in authority.closure_limits.items()
             )
         ):
             raise ValueError("Fruit calibration source closure failed")
@@ -500,11 +646,11 @@ class FruitCalibrationStore:
             raise ValueError("Fruit calibration trainer identity mismatch")
 
         expected_geometry = {
-            "hidden_size": FRUIT_ANNEALED_SPEC.hidden_size,
-            "intermediate_size": FRUIT_ANNEALED_SPEC.intermediate_size,
-            "experts": FRUIT_ANNEALED_SPEC.num_experts,
+            "hidden_size": authority.spec.hidden_size,
+            "intermediate_size": authority.spec.intermediate_size,
+            "experts": authority.spec.num_experts,
             "topk": FRUIT_CALIBRATION_TOPK,
-            "layers": list(FRUIT_CALIBRATION_LAYERS),
+            "layers": [*authority.spec.layers, authority.spec.mtp_layer],
         }
         if manifest.get("geometry") != expected_geometry:
             raise ValueError("Fruit calibration geometry mismatch")
@@ -613,6 +759,7 @@ class FruitCalibrationStore:
         self.fingerprint = fingerprint
         self.capture_id = capture_id
         self.routed_scale = float(routed_scale)
+        self.authority = authority
         self._documents = tuple(documents)
         self._layers = layers
 
@@ -666,13 +813,18 @@ class FruitCalibrationStore:
 
 __all__ = [
     "CALIBRATION_SPLITS",
+    "FRUIT_ANNEALED_CALIBRATION_AUTHORITY",
+    "FRUIT_CALIBRATION_AUTHORITIES",
     "FRUIT_CALIBRATION_LAYERS",
     "FRUIT_CALIBRATION_SCHEMA",
     "FRUIT_CALIBRATION_TOPK",
     "FRUIT_CALIBRATION_VERSION",
+    "FRUIT_INSTRUCT_CALIBRATION_AUTHORITY",
+    "FruitCalibrationAuthority",
     "FruitCalibrationLayer",
     "FruitCalibrationRows",
     "FruitCalibrationStore",
     "FruitExpertCalibration",
     "calibration_fingerprint",
+    "fruit_calibration_authority",
 ]

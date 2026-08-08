@@ -13,6 +13,7 @@ import stat
 import subprocess
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -24,7 +25,11 @@ from scripts.kquant_import_guard import (  # isort: skip
 )
 
 from kquant.exl3_loader import load_qsrt_encoder
-from kquant.fruit_calibration import FruitCalibrationStore
+from kquant.fruit_calibration import (
+    FRUIT_CALIBRATION_AUTHORITIES,
+    FruitCalibrationStore,
+    fruit_calibration_authority,
+)
 from kquant.fruit_qsrt import (
     FRUIT_QSRT_ARTIFACT_TENSORS,
     FRUIT_QSRT_ATOM_BUNDLE_BYTES,
@@ -49,6 +54,7 @@ from kquant.fruit_qsrt import (
 )
 from kquant.fruit_source import (
     FRUIT_ANNEALED_SPEC,
+    FruitModelSpec,
     FruitSafetensorsStore,
 )
 from kquant.sqg_quantizer import install_sqg_quantizer
@@ -59,8 +65,100 @@ HIDDEN_SIZE = FRUIT_ANNEALED_SPEC.hidden_size
 INTERMEDIATE_SIZE = FRUIT_ANNEALED_SPEC.intermediate_size
 PAIR_COUNT = FRUIT_QSRT_PAIR_COUNT
 PAIR_WORDS = FRUIT_QSRT_PAIR_WORDS
-assert FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256 is not None
-BASE_MANIFEST_SHA256 = FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256
+
+
+@dataclass(frozen=True)
+class FruitPublicationSpec:
+    """Human-facing publication identity for one Fruit checkpoint variant."""
+
+    repository: str
+    title: str
+    introduction: str
+    quality_limitations: str
+    fruit_audit_rows: str
+
+
+FRUIT_PUBLICATIONS = {
+    "annealed": FruitPublicationSpec(
+        repository="malaiwah/GLM-5.2-QSRT-Fruit-exact",
+        title="GLM-5.2 QSRT Fruit",
+        introduction=(
+            "This is a **5.04B-parameter GLM-5.2 serving proxy**, not the 754B "
+            "GLM-5.2 model. It is the first complete Fruit checkpoint encoded "
+            "in KQuant's canonical QSRT atom format and served without "
+            "reconstructing dense expert weights.\n\n"
+            "The artifact is a codec/storage/runtime integration release. "
+            "Packaging, provenance, exact state decoding, and the canonical "
+            "single-GPU runtime path are implemented. The checkpoint itself "
+            "has no downstream chat-quality qualification; see "
+            "[Known limitations](#known-limitations)."
+        ),
+        quality_limitations=(
+            "- **Not chat-quality.** An informal four-prompt instruction "
+            "battery produced incoherent answers. No representative downstream "
+            "instruction/chat evaluation is sealed by the builder, so no "
+            "task-quality claim is made and this checkpoint must not be "
+            "deployed as a user-facing assistant."
+        ),
+        fruit_audit_rows=(
+            "| [Fruit QSRT (pre-adjacent-rate-evidence publication)]"
+            "(https://huggingface.co/malaiwah/GLM-5.2-QSRT-Fruit/tree/"
+            "c1a0c62d220602fdd8b7940dcba716671fb0033c) | `c1a0c62d` | "
+            "2,963,027,998 | 2,909,352,104 |\n"
+            "| [Fruit BF16](https://huggingface.co/malaiwah/"
+            "GLM-5.2-SIQ-Fruit-bf16/tree/"
+            "ff1178d233fddc644dc053c723d58839eb921334) | `ff1178d2` | "
+            "10,102,776,679 | 10,081,800,232 |\n"
+            "| [Fruit prior mixed SIQ](https://huggingface.co/malaiwah/"
+            "GLM-5.2-SIQ-Fruit/tree/"
+            "c1798e3676fa16b4a874381171adab1e3033fbd5) | `c1798e36` | "
+            "3,125,527,019 | 3,102,116,152 |"
+        ),
+    ),
+    "instruct": FruitPublicationSpec(
+        repository="malaiwah/GLM-5.2-QSRT-Fruit-Instruct-exact",
+        title="GLM-5.2 QSRT Fruit Instruct",
+        introduction=(
+            "This is the assistant-masked SFT form of a **5.04B-parameter "
+            "GLM-5.2 serving proxy**, not the 754B GLM-5.2 model. It is encoded "
+            "in KQuant's canonical QSRT atom format and served without "
+            "reconstructing dense expert weights.\n\n"
+            "The artifact qualifies the codec/storage/runtime integration on "
+            "the instruction-tuned Fruit checkpoint. Packaging, provenance, "
+            "exact state decoding, and the canonical single-GPU runtime path "
+            "are implemented. Only protocol smoke evidence—not broad "
+            "downstream quality—is claimed; see "
+            "[Known limitations](#known-limitations)."
+        ),
+        quality_limitations=(
+            "- **Limited task evidence.** A four-prompt serving protocol "
+            "confirmed exact-string control, simple arithmetic, multilingual "
+            "response behavior, and a short named-system response on the prior "
+            "SIQ export. It is not a representative benchmark. The QSRT "
+            "artifact must be compared against the matched BF16 checkpoint "
+            "before any downstream quality claim."
+        ),
+        fruit_audit_rows=(
+            "| [Fruit Instruct BF16](https://huggingface.co/malaiwah/"
+            "GLM-5.2-SIQ-Fruit-Instruct-bf16/tree/"
+            "678954f65e056a0f508e21eeb9251c655bb9463f) | `678954f6` | "
+            "10,102,017,674 | 10,081,800,232 |\n"
+            "| [Fruit Instruct prior mixed SIQ](https://huggingface.co/"
+            "malaiwah/GLM-5.2-SIQ-Fruit-Instruct/tree/"
+            "48452ef397d8b4a4d6d0c00ea376a2abb3ef6314) | `48452ef3` | "
+            "3,122,333,594 | 3,102,116,152 |"
+        ),
+    ),
+}
+
+
+def fruit_publication_spec(variant: str) -> FruitPublicationSpec:
+    try:
+        return FRUIT_PUBLICATIONS[variant]
+    except KeyError as exc:
+        raise ValueError(f"unsupported Fruit publication variant {variant!r}") from exc
+
+
 EXLLAMAV3_REVISION = "791c83073f7f90c44f765a0ceeab7a05fa15b96b"
 _COMPLETE_MARKER_NAME = "QSRT_COMPLETE.json"
 MODEL_CARD_TEMPLATE = r"""---
@@ -77,16 +175,9 @@ tags:
 - experimental
 ---
 
-# GLM-5.2 QSRT Fruit
+# __MODEL_TITLE__
 
-This is a **5.04B-parameter GLM-5.2 serving proxy**, not the 754B GLM-5.2 model.
-It is the first complete Fruit checkpoint encoded in KQuant's canonical QSRT
-atom format and served without reconstructing dense expert weights.
-
-The artifact is a codec/storage/runtime integration release. Packaging,
-provenance, exact state decoding, and the canonical single-GPU runtime path are
-implemented. The checkpoint itself has no downstream chat-quality
-qualification; see [Known limitations](#known-limitations).
+__MODEL_INTRODUCTION__
 
 ## What is included
 
@@ -148,9 +239,7 @@ payloads, not parameter-count estimates.
 
 | Artifact | Revision | Repository bytes | Safetensors bytes |
 |---|---|---:|---:|
-| [Fruit QSRT (pre-adjacent-rate-evidence publication)](https://huggingface.co/malaiwah/GLM-5.2-QSRT-Fruit/tree/c1a0c62d220602fdd8b7940dcba716671fb0033c) | `c1a0c62d` | 2,963,027,998 | 2,909,352,104 |
-| [Fruit BF16](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit-bf16/tree/ff1178d233fddc644dc053c723d58839eb921334) | `ff1178d2` | 10,102,776,679 | 10,081,800,232 |
-| [Fruit prior mixed SIQ](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit/tree/c1798e3676fa16b4a874381171adab1e3033fbd5) | `c1798e36` | 3,125,527,019 | 3,102,116,152 |
+__FRUIT_AUDIT_ROWS__
 | [Full GLM-5.2 BF16](https://huggingface.co/zai-org/GLM-5.2/tree/b4734de4facf877f85769a911abafc5283eab3d9) | `b4734de4` | 1,506,693,036,946 | 1,506,667,387,408 |
 | [Full GLM-5.2 FP8](https://huggingface.co/zai-org/GLM-5.2-FP8/tree/ba978f7d347eaf65d22f1a86833408afdb953541) | `ba978f7d` | 755,663,676,164 | 755,632,050,320 |
 | [Full GLM-5.2 NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4/tree/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa) | `aec724e8` | 464,874,323,992 | 464,823,042,096 |
@@ -200,12 +289,12 @@ docker build \
   vllm-fruit
 
 MODEL_REVISION="$(
-  curl -fsSL https://huggingface.co/api/models/malaiwah/GLM-5.2-QSRT-Fruit-exact \
+  curl -fsSL https://huggingface.co/api/models/__MODEL_REPOSITORY__ \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
 )"
-MODEL_DIR="GLM-5.2-QSRT-Fruit-exact-${MODEL_REVISION}"
+MODEL_DIR="Fruit-QSRT-${MODEL_REVISION}"
 test ! -e "${MODEL_DIR}"
-hf download malaiwah/GLM-5.2-QSRT-Fruit-exact \
+hf download __MODEL_REPOSITORY__ \
   --revision "${MODEL_REVISION}" \
   --local-dir "${MODEL_DIR}"
 
@@ -258,10 +347,7 @@ activation modes, metadata, or incomplete manifests fail closed.
 
 ## Known limitations
 
-- **Not chat-quality.** An informal four-prompt instruction battery produced
-  incoherent answers. No representative downstream instruction/chat
-  evaluation is sealed by the builder, so no task-quality claim is made and
-  this checkpoint must not be deployed as a user-facing assistant.
+__QUALITY_LIMITATIONS__
 - TP2 atom ownership is unit-tested, but only TP1 physical serving has been
   qualified for this Fruit package.
 - The current sparse-attention prefill backend requires `max_num_seqs=1`.
@@ -673,6 +759,7 @@ def _render_model_card(
     producer: dict[str, object],
     rate_sweep: dict[str, object],
     layers: dict[str, dict[str, object]],
+    publication: FruitPublicationSpec,
 ) -> str:
     format_counts: Counter[str] = Counter()
     elapsed_seconds = 0.0
@@ -725,6 +812,11 @@ def _render_model_card(
     if not isinstance(encoder, dict) or not isinstance(runtime, dict):
         raise TypeError("Fruit producer evidence is malformed")
     replacements = {
+        "__MODEL_TITLE__": publication.title,
+        "__MODEL_INTRODUCTION__": publication.introduction,
+        "__MODEL_REPOSITORY__": publication.repository,
+        "__QUALITY_LIMITATIONS__": publication.quality_limitations,
+        "__FRUIT_AUDIT_ROWS__": publication.fruit_audit_rows,
         "__ALLOCATION_ROWS__": "\n".join(
             f"| `{name}` | {count:,} |" for name, count in sorted(format_counts.items())
         ),
@@ -1261,34 +1353,40 @@ def _parts_need_encoder(
     return False
 
 
-def _validate_source_evidence(value: object) -> dict[str, object]:
+def _validate_source_evidence(
+    value: object,
+    *,
+    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
+) -> dict[str, object]:
     if not isinstance(value, dict):
         raise TypeError("sealed Fruit source evidence must be a JSON object")
     expected: dict[str, object] = {
         "kind": "kquant-fruit-source-preflight",
         "version": 1,
         "status": "pass",
-        "model_id": FRUIT_ANNEALED_SPEC.model_id,
+        "model_id": spec.model_id,
     }
     if value.get("source_container") == "hf_bf16_safetensors":
+        if spec.safetensors_manifest_sha256 is None:
+            raise ValueError("Fruit model spec has no Safetensors source identity")
         expected.update(
             {
-                "checkpoint_sha256": BASE_MANIFEST_SHA256,
+                "checkpoint_sha256": spec.safetensors_manifest_sha256,
                 "checkpoint_sha256_provenance": ("safetensors_manifest_authenticated"),
-                "source_sha256": BASE_MANIFEST_SHA256,
+                "source_sha256": spec.safetensors_manifest_sha256,
                 "source_kind": "safetensors_manifest",
-                "expected_checkpoint_sha256": (FRUIT_ANNEALED_SPEC.checkpoint_sha256),
-                "safetensors_manifest_sha256": BASE_MANIFEST_SHA256,
-                "source_repository": FRUIT_ANNEALED_SPEC.safetensors_repository,
-                "source_revision": FRUIT_ANNEALED_SPEC.safetensors_revision,
+                "expected_checkpoint_sha256": spec.checkpoint_sha256,
+                "safetensors_manifest_sha256": spec.safetensors_manifest_sha256,
+                "source_repository": spec.safetensors_repository,
+                "source_revision": spec.safetensors_revision,
             }
         )
     elif value.get("source_container") in ("model", "state_dict"):
         expected.update(
             {
-                "checkpoint_sha256": FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+                "checkpoint_sha256": spec.checkpoint_sha256,
                 "checkpoint_sha256_provenance": "checkpoint_file_authenticated",
-                "source_sha256": FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+                "source_sha256": spec.checkpoint_sha256,
                 "source_kind": "torch_checkpoint",
             }
         )
@@ -1309,8 +1407,10 @@ def _write_source_evidence_seal(
     root: Path,
     source_evidence: dict[str, object],
     producer: dict[str, object],
+    *,
+    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
 ) -> None:
-    source_evidence = _validate_source_evidence(source_evidence)
+    source_evidence = _validate_source_evidence(source_evidence, spec=spec)
     encoder = producer.get("encoder")
     if not isinstance(encoder, dict) or not isinstance(encoder.get("fingerprint"), str):
         raise TypeError("Fruit QSRT producer has no encoder fingerprint")
@@ -1334,6 +1434,8 @@ def _write_source_evidence_seal(
 def _read_source_evidence_seal(
     root: Path | None,
     producer: dict[str, object],
+    *,
+    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
 ) -> dict[str, object] | None:
     if root is None:
         return None
@@ -1358,7 +1460,7 @@ def _read_source_evidence_seal(
         or not isinstance(envelope.get("producer_fingerprint"), str)
     ):
         raise ValueError(f"Fruit source evidence producer mismatch in {evidence_path}")
-    return _validate_source_evidence(envelope.get("source"))
+    return _validate_source_evidence(envelope.get("source"), spec=spec)
 
 
 def _write_calibration_evidence(
@@ -1638,16 +1740,20 @@ def _assemble_layers(
     return results
 
 
-def _authenticate_base_model(base_model: Path) -> dict[str, object]:
+def _authenticate_base_model(
+    base_model: Path,
+    *,
+    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
+) -> dict[str, object]:
     manifest_path = base_model / "MANIFEST.sha256"
     if not manifest_path.is_file():
         raise FileNotFoundError(manifest_path)
     manifest_bytes = manifest_path.read_bytes()
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-    if manifest_sha256 != BASE_MANIFEST_SHA256:
+    if manifest_sha256 != spec.safetensors_manifest_sha256:
         raise ValueError(
             "Fruit BF16 base manifest identity mismatch: "
-            f"{manifest_sha256} != {BASE_MANIFEST_SHA256}"
+            f"{manifest_sha256} != {spec.safetensors_manifest_sha256}"
         )
     entries: dict[str, str] = {}
     try:
@@ -1709,11 +1815,11 @@ def _authenticate_base_model(base_model: Path) -> dict[str, object]:
     expected_config = {
         "architectures": ["GlmMoeDsaForCausalLM"],
         "dtype": "bfloat16",
-        "hidden_size": HIDDEN_SIZE,
-        "moe_intermediate_size": INTERMEDIATE_SIZE,
-        "n_routed_experts": EXPERTS,
+        "hidden_size": spec.hidden_size,
+        "moe_intermediate_size": spec.intermediate_size,
+        "n_routed_experts": spec.num_experts,
         "num_experts_per_tok": 8,
-        "num_hidden_layers": 13,
+        "num_hidden_layers": spec.mtp_layer,
         "vocab_size": 154_880,
     }
     if any(config.get(name) != value for name, value in expected_config.items()):
@@ -2107,6 +2213,7 @@ def _write_package_manifests(
     calibration: FruitCalibrationStore,
     rate_sweep: dict[str, object],
     layers: dict[str, dict[str, object]],
+    publication: FruitPublicationSpec,
 ) -> None:
     evaluation = output / "evaluation"
     if evaluation.exists():
@@ -2168,6 +2275,7 @@ def _write_package_manifests(
             producer=producer,
             rate_sweep=rate_sweep,
             layers=layers,
+            publication=publication,
         ),
     )
     files = _validated_package_files(
@@ -2250,6 +2358,7 @@ def _validate_output_package(
     producer: dict[str, object],
     rate_sweep: dict[str, object],
     require_complete: bool,
+    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
 ) -> None:
     manifest_path = output / "qsrt-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2291,7 +2400,7 @@ def _validate_output_package(
     }
     if any(manifest.get(name) != value for name, value in expected_identity.items()):
         raise ValueError("Fruit QSRT package identity mismatch")
-    sealed_source = _read_source_evidence_seal(output, producer)
+    sealed_source = _read_source_evidence_seal(output, producer, spec=spec)
     if sealed_source != source_evidence:
         raise ValueError("Fruit QSRT package and sealed source evidence disagree")
     sealed_rate_sweep = json.loads(
@@ -2408,6 +2517,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_model", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--variant",
+        choices=tuple(FRUIT_CALIBRATION_AUTHORITIES),
+        default="annealed",
+    )
     parser.add_argument("--exllamav3-root", required=True, type=Path)
     parser.add_argument("--b12x-root", required=True, type=Path)
     parser.add_argument("--vllm-root", required=True, type=Path)
@@ -2438,6 +2552,9 @@ def _assert_producer_unchanged(
 
 def main() -> None:
     args = parse_args()
+    authority = fruit_calibration_authority(args.variant)
+    spec = authority.spec
+    publication = fruit_publication_spec(args.variant)
     device = torch.device(args.device)
     if device.type != "cuda":
         raise ValueError("Fruit QSRT encoding requires a CUDA device")
@@ -2453,7 +2570,10 @@ def main() -> None:
     )
     for source_root in source_roots:
         _require_clean_source(source_root)
-    calibration = FruitCalibrationStore(args.calibration)
+    calibration = FruitCalibrationStore(
+        args.calibration,
+        authority=authority,
+    )
     if _git_revision(args.exllamav3_root) != EXLLAMAV3_REVISION:
         raise ValueError("ExLlamaV3 source revision does not match the pinned encoder")
     producer = _producer_provenance(
@@ -2466,13 +2586,15 @@ def main() -> None:
     if not isinstance(encoder_fingerprint, str):
         raise TypeError("Fruit QSRT encoder fingerprint must be a string")
     print("authenticating pinned Fruit BF16 base model", flush=True)
-    base_provenance = _authenticate_base_model(args.base_model)
+    if spec.safetensors_manifest_sha256 is None:
+        raise ValueError("Fruit variant has no pinned Safetensors source")
+    base_provenance = _authenticate_base_model(args.base_model, spec=spec)
     store = FruitSafetensorsStore(
         args.base_model,
-        spec=FRUIT_ANNEALED_SPEC,
-        expected_manifest_sha256=BASE_MANIFEST_SHA256,
+        spec=spec,
+        expected_manifest_sha256=spec.safetensors_manifest_sha256,
     )
-    source_evidence = _validate_source_evidence(store.evidence)
+    source_evidence = _validate_source_evidence(store.evidence, spec=spec)
     if source_evidence.get("source_kind") != "safetensors_manifest":
         raise ValueError(
             "Fruit QSRT publication requires the authenticated BF16 safetensors source"
@@ -2490,7 +2612,12 @@ def main() -> None:
     torch.empty(0, device=device)
     _prepare_output_root(args.output)
     (args.output / _COMPLETE_MARKER_NAME).unlink(missing_ok=True)
-    _write_source_evidence_seal(args.output, source_evidence, producer)
+    _write_source_evidence_seal(
+        args.output,
+        source_evidence,
+        producer,
+        spec=spec,
+    )
     seeded = _seed_parts(
         args.output,
         args.seed_cache,
@@ -2530,7 +2657,12 @@ def main() -> None:
         source_evidence,
         base_provenance,
     )
-    _write_source_evidence_seal(args.output, source_evidence, producer)
+    _write_source_evidence_seal(
+        args.output,
+        source_evidence,
+        producer,
+        spec=spec,
+    )
     _write_calibration_evidence(args.output, calibration, producer)
     _assert_producer_unchanged(
         producer,
@@ -2547,6 +2679,7 @@ def main() -> None:
         calibration=calibration,
         rate_sweep=rate_sweep,
         layers=layers,
+        publication=publication,
     )
     _validate_output_package(
         args.output,
@@ -2555,6 +2688,7 @@ def main() -> None:
         producer=producer,
         rate_sweep=rate_sweep,
         require_complete=False,
+        spec=spec,
     )
     staged_cache = _stage_part_cache(args.output)
     try:
@@ -2571,6 +2705,7 @@ def main() -> None:
             producer=producer,
             rate_sweep=rate_sweep,
             require_complete=True,
+            spec=spec,
         )
     except BaseException:
         (args.output / _COMPLETE_MARKER_NAME).unlink(missing_ok=True)

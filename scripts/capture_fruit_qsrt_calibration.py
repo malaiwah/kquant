@@ -22,27 +22,25 @@ from transformers import AutoTokenizer
 
 from kquant.candidate_hessian import weighted_covariance
 from kquant.fruit_calibration import (
+    FRUIT_CALIBRATION_AUTHORITIES,
     FRUIT_CALIBRATION_AXES,
-    FRUIT_CALIBRATION_CLOSURE_LIMITS,
     FRUIT_CALIBRATION_CORPUS,
     FRUIT_CALIBRATION_LAYERS,
     FRUIT_CALIBRATION_PROTOCOL,
-    FRUIT_CALIBRATION_REFERENCE_SHA256,
     FRUIT_CALIBRATION_SCHEMA,
-    FRUIT_CALIBRATION_SOURCE,
     FRUIT_CALIBRATION_TOKEN_BOUNDS,
     FRUIT_CALIBRATION_TOKENIZER_FILES,
     FRUIT_CALIBRATION_TOPK,
     FRUIT_CALIBRATION_TRAINER_FILES,
     FRUIT_CALIBRATION_VERSION,
+    FruitCalibrationAuthority,
     calibration_fingerprint,
+    fruit_calibration_authority,
 )
-from kquant.fruit_source import FRUIT_ANNEALED_SPEC
+from kquant.fruit_source import FruitModelSpec
 
 _SMALL_TOKENIZER_FILES = tuple(FRUIT_CALIBRATION_TOKENIZER_FILES)
 
-assert FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256 is not None
-_BF16_BASE_MANIFEST_SHA256 = FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256
 _BF16_BASE_INDEX = "model.safetensors.index.json"
 _MODEL_MARKER_KEYS = frozenset({"rope_theta_trained", "serve_conv_v"})
 
@@ -315,17 +313,21 @@ def _sample_documents(
     return selected, corpus_sha256
 
 
-def _configure_trainer_environment(*, serve_native: bool) -> None:
+def _configure_trainer_environment(
+    *,
+    serve_native: bool,
+    spec: FruitModelSpec,
+) -> None:
     values = {
-        "GEO_H": str(FRUIT_ANNEALED_SPEC.hidden_size),
-        "GEO_NL": "13",
+        "GEO_H": str(spec.hidden_size),
+        "GEO_NL": str(spec.mtp_layer),
         "GEO_HEADS": "16",
         "GEO_QLORA": "1024",
         "GEO_DENSE_INTER": "2048",
-        "GEO_MOE_INTER": str(FRUIT_ANNEALED_SPEC.intermediate_size),
+        "GEO_MOE_INTER": str(spec.intermediate_size),
         "MOE_IMPL": "grouped",
-        "ROPE_THETA": str(int(FRUIT_ANNEALED_SPEC.trained_rope_theta)),
-        "FRUIT_ROPE_THETA": str(int(FRUIT_ANNEALED_SPEC.trained_rope_theta)),
+        "ROPE_THETA": str(int(spec.trained_rope_theta)),
+        "FRUIT_ROPE_THETA": str(int(spec.trained_rope_theta)),
         "SERVE_CONV": "1" if serve_native else "0",
         "GRAD_CKPT": "0",
         "FP8_LINEAR": "0",
@@ -340,8 +342,13 @@ def _configure_trainer_environment(*, serve_native: bool) -> None:
         os.environ[name] = value
 
 
-def _load_trainer(trainer: Path, *, serve_native: bool):
-    _configure_trainer_environment(serve_native=serve_native)
+def _load_trainer(
+    trainer: Path,
+    *,
+    serve_native: bool,
+    spec: FruitModelSpec,
+):
+    _configure_trainer_environment(serve_native=serve_native, spec=spec)
     trainer_root = str(trainer.parent.resolve())
     if trainer_root not in sys.path:
         sys.path.insert(0, trainer_root)
@@ -350,12 +357,12 @@ def _load_trainer(trainer: Path, *, serve_native: bool):
     if Path(module.__file__).resolve() != trainer.resolve():
         raise RuntimeError("imported the wrong Fruit trainer module")
     expected = {
-        "H": FRUIT_ANNEALED_SPEC.hidden_size,
-        "NL": 13,
-        "N_EXP": FRUIT_ANNEALED_SPEC.num_experts,
+        "H": spec.hidden_size,
+        "NL": spec.mtp_layer,
+        "N_EXP": spec.num_experts,
         "TOPK": FRUIT_CALIBRATION_TOPK,
-        "MOE_INTER": FRUIT_ANNEALED_SPEC.intermediate_size,
-        "THETA": FRUIT_ANNEALED_SPEC.trained_rope_theta,
+        "MOE_INTER": spec.intermediate_size,
+        "THETA": spec.trained_rope_theta,
     }
     for name, value in expected.items():
         if getattr(module, name) != value:
@@ -371,7 +378,7 @@ class _HFBinding:
     expert: int | None = None
 
 
-def _hf_binding(name: str) -> _HFBinding:
+def _hf_binding(name: str, spec: FruitModelSpec) -> _HFBinding:
     roots = {
         "lm_head.weight": _HFBinding("lm_head.weight"),
         "model.embed_tokens.weight": _HFBinding("embed_tokens.weight"),
@@ -386,10 +393,10 @@ def _hf_binding(name: str) -> _HFBinding:
         layer = int(pieces[2])
     except ValueError as exc:
         raise ValueError(f"invalid Fruit BF16 layer name: {name}") from exc
-    if not 0 <= layer <= FRUIT_ANNEALED_SPEC.mtp_layer:
+    if not 0 <= layer <= spec.mtp_layer:
         raise ValueError(f"Fruit BF16 layer is out of range: {name}")
     suffix = ".".join(pieces[3:])
-    if layer == FRUIT_ANNEALED_SPEC.mtp_layer:
+    if layer == spec.mtp_layer:
         mtp_roots = {
             "eh_proj.weight": "mtp_eh_proj.weight",
             "enorm.weight": "mtp_enorm.weight",
@@ -410,7 +417,7 @@ def _hf_binding(name: str) -> _HFBinding:
             expert = int(expert_parts[0])
         except ValueError as exc:
             raise ValueError(f"invalid Fruit BF16 expert index: {name}") from exc
-        if not 0 <= expert < FRUIT_ANNEALED_SPEC.num_experts:
+        if not 0 <= expert < spec.num_experts:
             raise ValueError(f"Fruit BF16 expert is out of range: {name}")
         projection = {
             "gate_proj": "w_gate",
@@ -425,7 +432,10 @@ def _hf_binding(name: str) -> _HFBinding:
     return _HFBinding(prefix + suffix)
 
 
-def _authenticate_bf16_base(root: Path) -> tuple[dict[str, object], dict[str, str]]:
+def _authenticate_bf16_base(
+    root: Path,
+    authority: FruitCalibrationAuthority,
+) -> tuple[dict[str, object], dict[str, str]]:
     if not root.is_dir() or root.is_symlink():
         raise ValueError("Fruit BF16 base must be a real directory")
     manifest_path = root / "MANIFEST.sha256"
@@ -433,7 +443,7 @@ def _authenticate_bf16_base(root: Path) -> tuple[dict[str, object], dict[str, st
         raise FileNotFoundError(manifest_path)
     manifest_bytes = manifest_path.read_bytes()
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-    if manifest_sha256 != _BF16_BASE_MANIFEST_SHA256:
+    if manifest_sha256 != authority.spec.safetensors_manifest_sha256:
         raise ValueError("Fruit BF16 base MANIFEST.sha256 identity mismatch")
     entries: dict[str, str] = {}
     try:
@@ -456,7 +466,11 @@ def _authenticate_bf16_base(root: Path) -> tuple[dict[str, object], dict[str, st
         for path in root.iterdir()
         if path.name != manifest_path.name and path.is_file() and not path.is_symlink()
     }
-    if not set(entries) <= actual_names or actual_names - set(entries) - {"README.md"}:
+    unsealed_metadata = {"README.md", ".gitattributes"}
+    if (
+        not set(entries) <= actual_names
+        or actual_names - set(entries) - unsealed_metadata
+    ):
         raise ValueError("Fruit BF16 base file inventory differs from its manifest")
     for name, expected_sha256 in sorted(entries.items()):
         if _sha256(root / name) != expected_sha256:
@@ -464,14 +478,14 @@ def _authenticate_bf16_base(root: Path) -> tuple[dict[str, object], dict[str, st
     config = json.loads((root / "config.json").read_text(encoding="utf-8"))
     expected_config = {
         "dtype": "bfloat16",
-        "hidden_size": FRUIT_ANNEALED_SPEC.hidden_size,
-        "moe_intermediate_size": FRUIT_ANNEALED_SPEC.intermediate_size,
-        "n_routed_experts": FRUIT_ANNEALED_SPEC.num_experts,
+        "hidden_size": authority.spec.hidden_size,
+        "moe_intermediate_size": authority.spec.intermediate_size,
+        "n_routed_experts": authority.spec.num_experts,
         "num_experts_per_tok": FRUIT_CALIBRATION_TOPK,
-        "num_hidden_layers": FRUIT_ANNEALED_SPEC.mtp_layer,
+        "num_hidden_layers": authority.spec.mtp_layer,
         "num_nextn_predict_layers": 1,
         "rope_interleave": True,
-        "rope_theta": FRUIT_ANNEALED_SPEC.trained_rope_theta,
+        "rope_theta": authority.spec.trained_rope_theta,
         "tie_word_embeddings": False,
     }
     if any(config.get(name) != value for name, value in expected_config.items()):
@@ -491,16 +505,18 @@ def _authenticate_bf16_base(root: Path) -> tuple[dict[str, object], dict[str, st
     shard_names = {name for name in entries if name.endswith(".safetensors")}
     if set(weight_map.values()) != shard_names:
         raise ValueError("Fruit BF16 weight index shard inventory mismatch")
-    return (
-        {
-            "kind": "authenticated_bf16_export",
-            "directory": root.name,
-            "manifest_sha256": manifest_sha256,
-            "index_sha256": entries[_BF16_BASE_INDEX],
-            "file_count": len(entries),
-        },
-        weight_map,
-    )
+    source_evidence = {
+        "kind": "authenticated_bf16_export",
+        "directory": root.name,
+        "manifest_sha256": manifest_sha256,
+        "index_sha256": entries[_BF16_BASE_INDEX],
+        "file_count": len(entries),
+    }
+    if any(
+        source_evidence.get(name) != value for name, value in authority.source.items()
+    ):
+        raise ValueError("Fruit calibration source identity mismatch")
+    return source_evidence, weight_map
 
 
 def _load_bf16_model(
@@ -508,10 +524,11 @@ def _load_bf16_model(
     weight_map: dict[str, str],
     trainer: Any,
     device: torch.device,
+    spec: FruitModelSpec,
 ) -> torch.nn.Module:
     model = trainer.Fruit()
     state = model.state_dict(keep_vars=True)
-    bindings = {name: _hf_binding(name) for name in weight_map}
+    bindings = {name: _hf_binding(name, spec) for name in weight_map}
     destination_keys = {binding.destination for binding in bindings.values()}
     expected_keys = set(state) - _MODEL_MARKER_KEYS
     if destination_keys != expected_keys:
@@ -524,7 +541,7 @@ def _load_bf16_model(
     for binding in bindings.values():
         if binding.expert is not None:
             indexed_destinations[binding.destination].add(binding.expert)
-    expected_experts = set(range(FRUIT_ANNEALED_SPEC.num_experts))
+    expected_experts = set(range(spec.num_experts))
     if any(indices != expected_experts for indices in indexed_destinations.values()):
         raise ValueError("Fruit BF16 expert stack is incomplete")
 
@@ -570,9 +587,10 @@ def _verify_source_closure(
     reference_path: Path,
     *,
     device: torch.device,
+    authority: FruitCalibrationAuthority,
 ) -> dict[str, object]:
     reference_sha256 = _sha256(reference_path)
-    if reference_sha256 != FRUIT_CALIBRATION_REFERENCE_SHA256:
+    if reference_sha256 != authority.reference_sha256:
         raise ValueError("Fruit calibration closure reference identity mismatch")
     with torch.serialization.safe_globals([TorchVersion]):
         reference = torch.load(reference_path, map_location="cpu", weights_only=True)
@@ -582,7 +600,7 @@ def _verify_source_closure(
         or reference.get("schema_version") != 1
         or not isinstance(reference.get("metadata"), dict)
         or reference["metadata"].get("checkpoint_sha256")
-        != FRUIT_ANNEALED_SPEC.checkpoint_sha256
+        != authority.spec.checkpoint_sha256
     ):
         raise ValueError("Fruit calibration closure reference contract mismatch")
     token_ids = reference.get("token_ids")
@@ -640,7 +658,7 @@ def _verify_source_closure(
         metrics["top1_matches"] != positions
         or any(
             float(metrics[name]) > limit
-            for name, limit in FRUIT_CALIBRATION_CLOSURE_LIMITS.items()
+            for name, limit in authority.closure_limits.items()
         )
         or metrics["mtp_positions"] != positions
         or not metrics["mtp_finite"]
@@ -655,6 +673,7 @@ def _capture(
     documents: list[_CorpusDocument],
     *,
     device: torch.device,
+    spec: FruitModelSpec,
 ) -> dict[int, dict[str, torch.Tensor]]:
     chunks = {layer: _LayerChunks() for layer in FRUIT_CALIBRATION_LAYERS}
     current_document = {"id": -1}
@@ -685,9 +704,9 @@ def _capture(
 
         handles.append(module.register_forward_pre_hook(pre_hook))
 
-    for layer in FRUIT_ANNEALED_SPEC.layers:
+    for layer in spec.layers:
         install(layer, model.layers[layer].mlp)
-    install(FRUIT_ANNEALED_SPEC.mtp_layer, model.mtp_block.mlp)
+    install(spec.mtp_layer, model.mtp_block.mlp)
 
     torch.use_deterministic_algorithms(True)
     try:
@@ -716,7 +735,7 @@ def _capture(
 
 def _capture_identity(
     *,
-    checkpoint_sha256: str,
+    authority: FruitCalibrationAuthority,
     source: dict[str, object],
     source_closure: dict[str, object],
     documents_per_axis: int,
@@ -737,7 +756,7 @@ def _capture_identity(
         "schema": FRUIT_CALIBRATION_SCHEMA,
         "version": FRUIT_CALIBRATION_VERSION,
         "kind": "fruit_qsrt_activation_calibration",
-        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_sha256": authority.spec.checkpoint_sha256,
         "source": source,
         "source_closure": source_closure,
         "corpus": {
@@ -753,20 +772,14 @@ def _capture_identity(
             "files": trainer_hashes,
         },
         "geometry": {
-            "hidden_size": FRUIT_ANNEALED_SPEC.hidden_size,
-            "intermediate_size": FRUIT_ANNEALED_SPEC.intermediate_size,
-            "experts": FRUIT_ANNEALED_SPEC.num_experts,
+            "hidden_size": authority.spec.hidden_size,
+            "intermediate_size": authority.spec.intermediate_size,
+            "experts": authority.spec.num_experts,
             "topk": FRUIT_CALIBRATION_TOPK,
-            "layers": list(FRUIT_CALIBRATION_LAYERS),
+            "layers": [*authority.spec.layers, authority.spec.mtp_layer],
         },
         "routed_scale": routed_scale,
-        "conventions": {
-            "serve_conv_v": 2,
-            "trained_rope_theta": FRUIT_ANNEALED_SPEC.trained_rope_theta,
-            "moe_impl": "grouped",
-            "sdpa_backend": "math",
-            "deterministic_algorithms": True,
-        },
+        "conventions": authority.conventions,
         "token_bounds": {"minimum": min_tokens, "maximum": max_tokens},
         "protocol": {
             "normalization": "fruit_data_prep_calib_jsonl_v1",
@@ -789,6 +802,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("tokenizer", type=Path)
     parser.add_argument("trainer", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--variant",
+        choices=tuple(FRUIT_CALIBRATION_AUTHORITIES),
+        default="annealed",
+    )
     parser.add_argument("--reference", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--documents-per-axis", type=int, default=64)
@@ -801,6 +819,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    authority = fruit_calibration_authority(args.variant)
     for path in (args.corpus, args.reference, args.trainer):
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -837,13 +856,7 @@ def main() -> None:
         raise ValueError("Fruit calibration capture requires CUDA")
     torch.cuda.set_device(device)
 
-    source_evidence, weight_map = _authenticate_bf16_base(args.source)
-    if any(
-        source_evidence.get(name) != value
-        for name, value in FRUIT_CALIBRATION_SOURCE.items()
-    ):
-        raise ValueError("Fruit calibration source identity mismatch")
-    checkpoint_sha256 = FRUIT_ANNEALED_SPEC.checkpoint_sha256
+    source_evidence, weight_map = _authenticate_bf16_base(args.source, authority)
     tokenizer_hashes = {
         name: _sha256(args.tokenizer / name)
         for name in _SMALL_TOKENIZER_FILES
@@ -905,20 +918,37 @@ def main() -> None:
         flush=True,
     )
 
-    trainer = _load_trainer(args.trainer, serve_native=True)
-    model = _load_bf16_model(args.source, weight_map, trainer, device)
+    trainer = _load_trainer(
+        args.trainer,
+        serve_native=True,
+        spec=authority.spec,
+    )
+    model = _load_bf16_model(
+        args.source,
+        weight_map,
+        trainer,
+        device,
+        authority.spec,
+    )
     source_closure = _verify_source_closure(
         model,
         args.reference,
         device=device,
+        authority=authority,
     )
-    captured = _capture(model, trainer, documents, device=device)
+    captured = _capture(
+        model,
+        trainer,
+        documents,
+        device=device,
+        spec=authority.spec,
+    )
     routed_scale = float(trainer.ROUTED_SCALE)
     del model
     torch.cuda.empty_cache()
 
     identity = _capture_identity(
-        checkpoint_sha256=checkpoint_sha256,
+        authority=authority,
         source=source_evidence,
         source_closure=source_closure,
         documents_per_axis=args.documents_per_axis,
