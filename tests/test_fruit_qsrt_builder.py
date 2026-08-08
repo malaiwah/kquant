@@ -303,6 +303,39 @@ def test_remove_part_cache_preserves_package_files(tmp_path: Path) -> None:
     assert config.read_text(encoding="utf-8") == "{}"
 
 
+def test_copy_authenticated_breaks_source_hardlink(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    target = tmp_path / "target.bin"
+    content = b"authenticated source"
+    source.write_bytes(content)
+    target.hardlink_to(source)
+
+    builder._copy_authenticated(source, target, hashlib.sha256(content).hexdigest())
+    source.write_bytes(b"mutated after copy")
+
+    assert not target.samefile(source)
+    assert target.read_bytes() == content
+
+
+def test_materialize_base_model_reauthenticates_index(tmp_path: Path) -> None:
+    base_model = tmp_path / "base"
+    output = tmp_path / "output"
+    base_model.mkdir()
+    output.mkdir()
+    index_path = base_model / "model.safetensors.index.json"
+    original = b'{"weight_map": {}}\n'
+    index_path.write_bytes(original)
+    provenance = {
+        "files": {
+            "model.safetensors.index.json": hashlib.sha256(original).hexdigest(),
+        }
+    }
+    index_path.write_bytes(b'{"weight_map": {"changed": "shard.safetensors"}}\n')
+
+    with pytest.raises(ValueError, match="base hash mismatch"):
+        builder._materialize_base_model(base_model, output, provenance)
+
+
 def test_seed_parts_validate_source_read_only_before_copy(
     monkeypatch, tmp_path: Path
 ) -> None:
