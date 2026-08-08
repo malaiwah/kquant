@@ -217,6 +217,7 @@ def test_model_card_uses_sealed_calibration_and_layer_evidence(monkeypatch) -> N
     assert "capture-id" in card
     assert "calibration-manifest" in card
     assert "https://huggingface.co/owner/source" in card
+    assert "hf download malaiwah/GLM-5.2-QSRT-Fruit-exact" in card
     assert "1" * 40 in card
     assert "2 documents /" in card and "18 tokens" in card
     assert "2 experts, 4.00 GPU-seconds" in card
