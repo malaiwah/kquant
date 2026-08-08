@@ -335,6 +335,39 @@ def test_part_cache_rejects_nested_layer_symlink(monkeypatch, tmp_path: Path) ->
         )
 
 
+def test_encoder_cache_allows_only_private_active_temporaries(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(builder, "LAYERS", (3,))
+    monkeypatch.setattr(builder, "EXPERTS", 1)
+    cache = tmp_path / ".qsrt-parts"
+    layer = cache / "layer-003"
+    run_manifests = cache / "run-manifests"
+    layer.mkdir(parents=True)
+    run_manifests.mkdir()
+    safetensors_temporary = layer / ".tmpXWW6j5"
+    safetensors_temporary.write_bytes(b"active")
+    (layer / ".expert-000.json.tmp-123").write_bytes(b"active")
+    (run_manifests / ".run-0000.json.tmp-123").write_bytes(b"active")
+
+    builder._validate_part_cache_root(
+        cache,
+        create=False,
+        allow_run_manifests=True,
+    )
+
+    safetensors_temporary.unlink()
+    external = tmp_path / "external"
+    external.write_bytes(b"external")
+    safetensors_temporary.symlink_to(external)
+    with pytest.raises(ValueError, match="part path"):
+        builder._validate_part_cache_root(
+            cache,
+            create=False,
+            allow_run_manifests=True,
+        )
+
+
 def test_prepare_output_root_rejects_symlink(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
