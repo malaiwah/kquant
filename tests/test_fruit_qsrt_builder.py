@@ -291,9 +291,9 @@ def test_package_files_reject_resume_cache_before_sealing(tmp_path: Path) -> Non
     evaluation = tmp_path / "evaluation"
     evaluation.mkdir()
     (evaluation / "report.json").write_text("{}", encoding="utf-8")
-    parts = tmp_path / ".qsrt-parts"
-    parts.mkdir()
-    (parts / "resume.bin").write_bytes(b"resume")
+    parts = tmp_path / ".qsrt-parts/layer-003"
+    parts.mkdir(parents=True)
+    (parts / "expert-000.json").write_bytes(b"resume")
 
     with pytest.raises(ValueError, match="unexpected Fruit package directory"):
         builder._package_files(tmp_path)
