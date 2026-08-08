@@ -16,16 +16,15 @@ from scripts.kquant_import_guard import (  # isort: skip
 )
 
 from kquant.exl3_loader import load_qsrt_encoder
-from kquant.fruit_calibration import FruitCalibrationStore
-from kquant.fruit_qsrt import measure_fruit_uniform_rates
-from kquant.fruit_source import (
-    FRUIT_ANNEALED_SPEC,
-    FruitCheckpointStore,
-    FruitSafetensorsStore,
+from kquant.fruit_calibration import (
+    FRUIT_CALIBRATION_AUTHORITIES,
+    FruitCalibrationStore,
+    fruit_calibration_authority,
 )
+from kquant.fruit_qsrt import measure_fruit_uniform_rates
+from kquant.fruit_source import FruitCheckpointStore, FruitSafetensorsStore
 from kquant.sqg_quantizer import install_sqg_quantizer
 from scripts.build_fruit_qsrt_model import (
-    BASE_MANIFEST_SHA256,
     _validate_source_evidence,
     current_encoder_provenance,
 )
@@ -68,6 +67,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--variant",
+        choices=tuple(FRUIT_CALIBRATION_AUTHORITIES),
+        default="annealed",
+    )
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--assignment", action="append", type=_assignment)
     selection.add_argument("--sample", action="store_true")
@@ -81,6 +85,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    authority = fruit_calibration_authority(args.variant)
+    spec = authority.spec
     device = torch.device(args.device)
     if device.type != "cuda":
         raise ValueError("Fruit uniform-rate sweep requires a CUDA device")
@@ -101,18 +107,23 @@ def main() -> None:
         raise ValueError(f"Fruit rate-sweep output must be private: {args.output}")
 
     if args.checkpoint.is_dir():
+        if spec.safetensors_manifest_sha256 is None:
+            raise ValueError("Fruit variant has no pinned Safetensors source")
         store = FruitSafetensorsStore(
             args.checkpoint,
-            spec=FRUIT_ANNEALED_SPEC,
-            expected_manifest_sha256=BASE_MANIFEST_SHA256,
+            spec=spec,
+            expected_manifest_sha256=spec.safetensors_manifest_sha256,
         )
     else:
         store = FruitCheckpointStore(
             args.checkpoint,
-            spec=FRUIT_ANNEALED_SPEC,
-            expected_sha256=FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+            spec=spec,
+            expected_sha256=spec.checkpoint_sha256,
         )
-    calibration_store = FruitCalibrationStore(args.calibration)
+    calibration_store = FruitCalibrationStore(
+        args.calibration,
+        authority=authority,
+    )
     encoder = current_encoder_provenance(
         exllamav3_root=args.exllamav3_root,
         calibration=calibration_store,
@@ -134,7 +145,7 @@ def main() -> None:
         raise ValueError("Fruit encoder sources changed while loading the encoder")
     signature = {
         "schema": _SCHEMA,
-        "source": _validate_source_evidence(store.evidence),
+        "source": _validate_source_evidence(store.evidence, spec=spec),
         "calibration": {
             "capture_id": calibration_store.capture_id,
             "fingerprint": calibration_store.fingerprint,

@@ -17,6 +17,7 @@ import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 import torch
@@ -24,6 +25,7 @@ from safetensors import safe_open
 
 FruitMatrix = Literal["w1", "w3", "w2"]
 FruitRepresentation = Literal["stacked", "per_expert"]
+FruitVariant = Literal["annealed", "instruct"]
 FRUIT_EXPERT_MATRICES: tuple[FruitMatrix, ...] = ("w1", "w3", "w2")
 _STACKED_NAMES: dict[FruitMatrix, str] = {
     "w1": "w_gate",
@@ -151,6 +153,44 @@ FRUIT_ANNEALED_SPEC = FruitModelSpec(
         "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
     ),
 )
+
+FRUIT_INSTRUCT_SPEC = FruitModelSpec(
+    model_id="malaiwah/GLM-5.2-SIQ-Fruit-Instruct",
+    checkpoint_sha256=(
+        "32dbf82d40b88a92b8dccd563c593b5971be358cf11895eb150f18644ff93c27"
+    ),
+    layers=tuple(range(3, 13)),
+    mtp_layer=13,
+    num_experts=256,
+    hidden_size=1024,
+    intermediate_size=512,
+    trained_rope_theta=500_000.0,
+    serve_conv_v=None,
+    safetensors_repository="malaiwah/GLM-5.2-SIQ-Fruit-Instruct-bf16",
+    safetensors_revision="678954f65e056a0f508e21eeb9251c655bb9463f",
+    safetensors_manifest_sha256=(
+        "8f23aed5e9b12000ed103a76da772a20730ca53ab7e352d6cb94da2709165245"
+    ),
+)
+
+FRUIT_MODEL_SPECS: Mapping[str, FruitModelSpec] = MappingProxyType(
+    {
+        "annealed": FRUIT_ANNEALED_SPEC,
+        "instruct": FRUIT_INSTRUCT_SPEC,
+    }
+)
+
+
+def fruit_model_spec(variant: str) -> FruitModelSpec:
+    """Resolve one supported Fruit checkpoint variant."""
+
+    try:
+        return FRUIT_MODEL_SPECS[variant]
+    except KeyError as exc:
+        supported = ", ".join(FRUIT_MODEL_SPECS)
+        raise ValueError(
+            f"unsupported Fruit variant {variant!r}; expected one of {supported}"
+        ) from exc
 
 
 def _sha256(path: Path) -> str:
