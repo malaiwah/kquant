@@ -314,7 +314,7 @@ def test_validated_package_files_reject_unknown_top_level_file(
         path.write_bytes(b"sealed")
     (tmp_path / "model.safetensors").write_bytes(b"stale competing model")
 
-    with pytest.raises(ValueError, match="unexpected=.*model.safetensors"):
+    with pytest.raises(ValueError, match=r"unexpected=.*model\.safetensors"):
         builder._validated_package_files(tmp_path, base_provenance)
 
 
