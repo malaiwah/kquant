@@ -200,12 +200,12 @@ docker build \
   vllm-fruit
 
 MODEL_REVISION="$(
-  curl -fsSL https://huggingface.co/api/models/malaiwah/GLM-5.2-QSRT-Fruit \
+  curl -fsSL https://huggingface.co/api/models/malaiwah/GLM-5.2-QSRT-Fruit-exact \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
 )"
-MODEL_DIR="GLM-5.2-QSRT-Fruit-${MODEL_REVISION}"
+MODEL_DIR="GLM-5.2-QSRT-Fruit-exact-${MODEL_REVISION}"
 test ! -e "${MODEL_DIR}"
-hf download malaiwah/GLM-5.2-QSRT-Fruit \
+hf download malaiwah/GLM-5.2-QSRT-Fruit-exact \
   --revision "${MODEL_REVISION}" \
   --local-dir "${MODEL_DIR}"
 
