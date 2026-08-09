@@ -8,10 +8,48 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+
 import torch
 
+from scripts.tracked_worktree import (
+    TrackedWorktreeSnapshot,
+    snapshot_tracked_worktree,
+)
 
 _BACKEND_MODULE = "exllamav3.modules.quant.exl3_lib.kquant_qsrt_encoder"
+_EXLLAMAV3_SNAPSHOT: TrackedWorktreeSnapshot | None = None
+_EXLLAMAV3_SOURCE_ROOT: Path | None = None
+
+
+def _exllamav3_snapshot(exllamav3_root: str | Path) -> TrackedWorktreeSnapshot:
+    global _EXLLAMAV3_SNAPSHOT, _EXLLAMAV3_SOURCE_ROOT
+
+    source_root = Path(exllamav3_root).resolve(strict=True)
+    if _EXLLAMAV3_SNAPSHOT is None:
+        preloaded = sorted(
+            name
+            for name in sys.modules
+            if name == "exllamav3" or name.startswith("exllamav3.")
+        )
+        if preloaded:
+            raise RuntimeError(
+                "ExLlamaV3 modules were imported before source snapshot creation: "
+                + ", ".join(preloaded[:3])
+            )
+        _EXLLAMAV3_SNAPSHOT = snapshot_tracked_worktree(source_root)
+        _EXLLAMAV3_SOURCE_ROOT = source_root
+    elif source_root != _EXLLAMAV3_SOURCE_ROOT:
+        raise ValueError(
+            "one process cannot load QSRT encoders from multiple ExLlamaV3 sources"
+        )
+    return _EXLLAMAV3_SNAPSHOT
+
+
+def exllamav3_source_identity(exllamav3_root: str | Path) -> tuple[str, str]:
+    """Return the immutable identity of the process-lifetime source snapshot."""
+
+    snapshot = _exllamav3_snapshot(exllamav3_root)
+    return snapshot.revision, snapshot.sha256
 
 
 def load_qsrt_encoder(exllamav3_root: str | Path) -> types.ModuleType:
@@ -23,7 +61,8 @@ def load_qsrt_encoder(exllamav3_root: str | Path) -> types.ModuleType:
     dependencies that are intentionally absent from kquant's environment.
     """
 
-    root = Path(exllamav3_root).resolve() / "exllamav3"
+    source_snapshot = _exllamav3_snapshot(exllamav3_root)
+    root = source_snapshot.root / "exllamav3"
     packages = (
         ("exllamav3", root),
         ("exllamav3.modules", root / "modules"),
@@ -107,5 +146,7 @@ def load_qsrt_encoder(exllamav3_root: str | Path) -> types.ModuleType:
         except BaseException:
             sys.modules.pop(_BACKEND_MODULE, None)
             raise
-        setattr(sys.modules["exllamav3.modules.quant.exl3_lib"], "kquant_qsrt_encoder", module)
+        module.__kquant_exllamav3_revision__ = source_snapshot.revision
+        module.__kquant_exllamav3_source_sha256__ = source_snapshot.sha256
+        sys.modules["exllamav3.modules.quant.exl3_lib"].kquant_qsrt_encoder = module
     return module

@@ -12,13 +12,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import stat
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import torch
 from safetensors import safe_open
@@ -199,6 +201,199 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(8 << 20):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _write_all(file_fd: int, chunk: bytes) -> None:
+    offset = 0
+    while offset < len(chunk):
+        written = os.write(file_fd, chunk[offset:])
+        if written <= 0:
+            raise OSError("short write while creating private source snapshot")
+        offset += written
+
+
+def _copy_authenticated_file(
+    *,
+    source_root_fd: int,
+    filename: str,
+    destination: Path,
+    expected_sha256: str,
+    capture_bytes: bool = False,
+) -> tuple[bytes | None, tuple[int, ...]]:
+    encoded_filename = os.fsencode(filename)
+    try:
+        source_fd = os.open(
+            encoded_filename,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=source_root_fd,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"cannot securely open Fruit safetensors file: {filename}"
+        ) from exc
+    destination_fd: int | None = None
+    captured = bytearray() if capture_bytes else None
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(
+                f"Fruit safetensors source is not a regular file: {filename}"
+            )
+        if before.st_nlink != 1:
+            raise ValueError(
+                f"Fruit safetensors source must not have hard links: {filename}"
+            )
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        digest = hashlib.sha256()
+        bytes_read = 0
+        while chunk := os.read(source_fd, 8 << 20):
+            bytes_read += len(chunk)
+            digest.update(chunk)
+            _write_all(destination_fd, chunk)
+            if captured is not None:
+                captured.extend(chunk)
+        os.fsync(destination_fd)
+        after = os.fstat(source_fd)
+        try:
+            path_after = os.stat(
+                encoded_filename,
+                dir_fd=source_root_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"Fruit safetensors source changed while copying: {filename}"
+            ) from exc
+        if (
+            bytes_read != before.st_size
+            or _file_identity(before) != _file_identity(after)
+            or _file_identity(after) != _file_identity(path_after)
+        ):
+            raise ValueError(
+                f"Fruit safetensors source changed while copying: {filename}"
+            )
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"Fruit safetensors SHA-256 mismatch for {filename}: "
+                f"got {actual_sha256}, expected {expected_sha256}"
+            )
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        os.close(source_fd)
+
+    if _sha256(destination) != expected_sha256:
+        raise ValueError(
+            f"private Fruit safetensors snapshot verification failed: {filename}"
+        )
+    destination.chmod(0o400)
+    snapshot_stat = destination.stat()
+    if not stat.S_ISREG(snapshot_stat.st_mode) or snapshot_stat.st_nlink != 1:
+        raise ValueError(
+            f"private Fruit safetensors snapshot is not isolated: {filename}"
+        )
+    return (
+        bytes(captured) if captured is not None else None,
+        _file_identity(snapshot_stat),
+    )
+
+
+def _parse_safetensors_manifest(manifest_bytes: bytes) -> dict[str, str]:
+    try:
+        manifest_text = manifest_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Fruit safetensors manifest is not UTF-8") from exc
+    entries: dict[str, str] = {}
+    for line in manifest_text.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            raise ValueError(f"malformed Fruit safetensors manifest line: {line!r}")
+        digest, filename = fields
+        if (
+            _SHA256_RE.fullmatch(digest) is None
+            or Path(filename).name != filename
+            or filename in entries
+        ):
+            raise ValueError(f"invalid Fruit safetensors manifest line: {line!r}")
+        entries[filename] = digest
+    required = {"config.json", "model.safetensors.index.json"}
+    if not required.issubset(entries):
+        raise ValueError("Fruit safetensors manifest omits config or tensor index")
+    return entries
+
+
+def _snapshot_safetensors_source(
+    source_root: Path,
+    *,
+    expected_manifest_sha256: str,
+) -> tuple[
+    tempfile.TemporaryDirectory[str],
+    Path,
+    dict[str, str],
+    dict[str, tuple[int, ...]],
+    int,
+]:
+    temporary_directory = tempfile.TemporaryDirectory(
+        prefix="kquant-fruit-safetensors-"
+    )
+    snapshot_root = Path(temporary_directory.name)
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    try:
+        source_root_fd = os.open(source_root, directory_flags)
+    except OSError as exc:
+        temporary_directory.cleanup()
+        raise ValueError(
+            f"cannot securely open Fruit safetensors root: {source_root}"
+        ) from exc
+    try:
+        manifest_bytes, manifest_identity = _copy_authenticated_file(
+            source_root_fd=source_root_fd,
+            filename="MANIFEST.sha256",
+            destination=snapshot_root / "MANIFEST.sha256",
+            expected_sha256=expected_manifest_sha256,
+            capture_bytes=True,
+        )
+        assert manifest_bytes is not None
+        entries = _parse_safetensors_manifest(manifest_bytes)
+        identities = {"MANIFEST.sha256": manifest_identity}
+        for filename, expected_sha256 in entries.items():
+            _, identities[filename] = _copy_authenticated_file(
+                source_root_fd=source_root_fd,
+                filename=filename,
+                destination=snapshot_root / filename,
+                expected_sha256=expected_sha256,
+            )
+    except BaseException:
+        temporary_directory.cleanup()
+        raise
+    finally:
+        os.close(source_root_fd)
+    return (
+        temporary_directory,
+        snapshot_root,
+        entries,
+        identities,
+        len(manifest_bytes),
+    )
 
 
 def _prefix(spec: FruitModelSpec, layer: int) -> str:
@@ -558,72 +753,19 @@ class FruitSafetensorsStore:
                 "expected_manifest_sha256 disagrees with the Fruit model specification"
             )
 
-        manifest_path = resolved / "MANIFEST.sha256"
-        if manifest_path.is_symlink() or not manifest_path.is_file():
-            raise FileNotFoundError(manifest_path)
-        manifest_bytes = manifest_path.read_bytes()
-        actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-        if actual_manifest_sha256 != expected_manifest_sha256:
-            raise ValueError(
-                "Fruit safetensors manifest SHA-256 mismatch: "
-                f"got {actual_manifest_sha256}, "
-                f"expected {expected_manifest_sha256}"
-            )
-        entries: dict[str, str] = {}
-        try:
-            manifest_text = manifest_bytes.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("Fruit safetensors manifest is not UTF-8") from exc
-        for line in manifest_text.splitlines():
-            fields = line.split()
-            if len(fields) != 2:
-                raise ValueError(f"malformed Fruit safetensors manifest line: {line!r}")
-            digest, filename = fields
-            if (
-                _SHA256_RE.fullmatch(digest) is None
-                or Path(filename).name != filename
-                or filename in entries
-            ):
-                raise ValueError(f"invalid Fruit safetensors manifest line: {line!r}")
-            entries[filename] = digest
-        required = {"config.json", "model.safetensors.index.json"}
-        if not required.issubset(entries):
-            raise ValueError("Fruit safetensors manifest omits config or tensor index")
+        (
+            snapshot,
+            snapshot_root,
+            entries,
+            file_identities,
+            manifest_size,
+        ) = _snapshot_safetensors_source(
+            resolved,
+            expected_manifest_sha256=expected_manifest_sha256,
+        )
+        actual_manifest_sha256 = expected_manifest_sha256
 
-        file_identities: dict[str, tuple[int, int, int, int, int]] = {}
-        for filename, expected_sha256 in entries.items():
-            path = resolved / filename
-            if path.is_symlink() or not path.is_file():
-                raise FileNotFoundError(path)
-            before = path.stat()
-            actual_sha256 = _sha256(path)
-            after = path.stat()
-            before_identity = (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            )
-            after_identity = (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
-            if before_identity != after_identity:
-                raise ValueError(
-                    "Fruit safetensors file changed while it was authenticated"
-                )
-            if actual_sha256 != expected_sha256:
-                raise ValueError(
-                    f"Fruit safetensors SHA-256 mismatch for {filename}: "
-                    f"got {actual_sha256}, expected {expected_sha256}"
-                )
-            file_identities[filename] = after_identity
-
-        config = json.loads((resolved / "config.json").read_text(encoding="utf-8"))
+        config = json.loads((snapshot_root / "config.json").read_text(encoding="utf-8"))
         expected_config = {
             "dtype": "bfloat16",
             "hidden_size": spec.hidden_size,
@@ -644,7 +786,7 @@ class FruitSafetensorsStore:
             raise ValueError("Fruit safetensors trained rope theta mismatch")
 
         index = json.loads(
-            (resolved / "model.safetensors.index.json").read_text(encoding="utf-8")
+            (snapshot_root / "model.safetensors.index.json").read_text(encoding="utf-8")
         )
         if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
             raise TypeError("Fruit safetensors index has no weight_map")
@@ -682,7 +824,9 @@ class FruitSafetensorsStore:
         for (_, _, matrix), name in keys.items():
             names_by_file.setdefault(weight_map[name], []).append((name, matrix))
         for filename, names in names_by_file.items():
-            with safe_open(resolved / filename, framework="pt", device="cpu") as handle:
+            with safe_open(
+                snapshot_root / filename, framework="pt", device="cpu"
+            ) as handle:
                 available = set(handle.keys())
                 for name, matrix in names:
                     if name not in available:
@@ -700,7 +844,8 @@ class FruitSafetensorsStore:
                             f"expected {_matrix_shape(spec, matrix)}"
                         )
 
-        self.path = resolved
+        self._snapshot = snapshot
+        self.path = snapshot_root
         self.spec = spec
         self.representation: FruitRepresentation = "per_expert"
         self._entries = entries
@@ -711,8 +856,8 @@ class FruitSafetensorsStore:
             "checkpoint_sha256": actual_manifest_sha256,
             "checkpoint_sha256_provenance": "safetensors_manifest_authenticated",
             "source_sha256": actual_manifest_sha256,
-            "checkpoint_filename": manifest_path.name,
-            "checkpoint_bytes": manifest_path.stat().st_size,
+            "checkpoint_filename": "MANIFEST.sha256",
+            "checkpoint_bytes": manifest_size,
             "source_kind": "safetensors_manifest",
             "expected_checkpoint_sha256": spec.checkpoint_sha256,
             "conventions": {
@@ -745,6 +890,17 @@ class FruitSafetensorsStore:
             "version": 1,
         }
 
+    def close(self) -> None:
+        """Remove the process-private checkpoint snapshot."""
+
+        self._snapshot.cleanup()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
     def _assert_file_unchanged(self, filename: str) -> None:
         path = self.path / filename
         try:
@@ -753,13 +909,7 @@ class FruitSafetensorsStore:
             raise ValueError(
                 "Fruit safetensors source became unavailable after authentication"
             ) from exc
-        identity = (
-            current.st_dev,
-            current.st_ino,
-            current.st_size,
-            current.st_mtime_ns,
-            current.st_ctime_ns,
-        )
+        identity = _file_identity(current)
         if identity != self._file_identities[filename]:
             raise ValueError("Fruit safetensors source changed after authentication")
 

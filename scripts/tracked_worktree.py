@@ -6,9 +6,14 @@ import hashlib
 import os
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
+from typing import Self
 
 _FINGERPRINT_PREFIX = b"kquant-tracked-worktree-sha256-v1\0"
+
+_READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 
 
 def _git_output(root: Path, *args: str) -> bytes:
@@ -126,13 +131,63 @@ def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _require_status_clean(root: Path) -> None:
-    if _git_output(root, "status", "--porcelain=v1", "--untracked-files=all"):
-        raise ValueError(f"source checkout has uncommitted files: {root}")
+class TrackedWorktreeSnapshot:
+    """A process-private copy of one attested tracked source tree."""
+
+    def __init__(
+        self,
+        temporary_directory: tempfile.TemporaryDirectory[str],
+        *,
+        revision: str,
+        sha256: str,
+    ) -> None:
+        self._temporary_directory = temporary_directory
+        self.root = Path(temporary_directory.name)
+        self.revision = revision
+        self.sha256 = sha256
+
+    def close(self) -> None:
+        self._temporary_directory.cleanup()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
 
 
-def tracked_worktree_sha256(root: Path, *, require_clean: bool = True) -> str:
-    """Hash tracked paths, executable modes, and actual bytes, failing on races."""
+def _write_all(file_fd: int, chunk: bytes) -> None:
+    offset = 0
+    while offset < len(chunk):
+        written = os.write(file_fd, chunk[offset:])
+        if written <= 0:
+            raise OSError("short write while creating private source snapshot")
+        offset += written
+
+
+def _open_tracked_file(root_fd: int, relative_path: bytes) -> tuple[int, int]:
+    """Open a tracked file without following any path component."""
+
+    components = relative_path.split(b"/")
+    parent_fd = os.dup(root_fd)
+    try:
+        for component in components[:-1]:
+            child_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        file_fd = os.open(components[-1], _READ_FLAGS, dir_fd=parent_fd)
+    except BaseException:
+        os.close(parent_fd)
+        raise
+    return parent_fd, file_fd
+
+
+def _attest_tracked_worktree(
+    root: Path,
+    *,
+    require_clean: bool,
+    snapshot_root: Path | None,
+) -> tuple[str, str]:
     if not root.is_dir():
         raise FileNotFoundError(root)
     revision = git_revision(root)
@@ -143,23 +198,23 @@ def tracked_worktree_sha256(root: Path, *, require_clean: bool = True) -> str:
     if require_clean:
         _require_status_clean(root)
 
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
     tree_digest = hashlib.sha256(_FINGERPRINT_PREFIX)
     try:
-        root_fd = os.open(root, directory_flags)
+        root_fd = os.open(root, _DIRECTORY_FLAGS)
     except OSError as exc:
         raise ValueError(f"cannot securely open source checkout: {root}") from exc
     try:
         for relative_path in sorted(index):
             expected_mode, expected_object_id = index[relative_path]
             try:
-                file_fd = os.open(relative_path, flags, dir_fd=root_fd)
+                parent_fd, file_fd = _open_tracked_file(root_fd, relative_path)
             except OSError as exc:
                 raise ValueError(
                     f"cannot securely open tracked source file: "
                     f"{os.fsdecode(relative_path)!r}"
                 ) from exc
+            relative_name = relative_path.rsplit(b"/", 1)[-1]
+            snapshot_fd: int | None = None
             try:
                 before = os.fstat(file_fd)
                 if not stat.S_ISREG(before.st_mode):
@@ -174,6 +229,19 @@ def tracked_worktree_sha256(root: Path, *, require_clean: bool = True) -> str:
                         f"{os.fsdecode(relative_path)!r}"
                     )
 
+                if snapshot_root is not None:
+                    snapshot_path = snapshot_root / os.fsdecode(relative_path)
+                    snapshot_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    snapshot_fd = os.open(
+                        snapshot_path,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_CLOEXEC
+                        | os.O_NOFOLLOW,
+                        0o600,
+                    )
+
                 tree_digest.update(actual_mode)
                 tree_digest.update(len(relative_path).to_bytes(8, "big"))
                 tree_digest.update(relative_path)
@@ -186,12 +254,14 @@ def tracked_worktree_sha256(root: Path, *, require_clean: bool = True) -> str:
                     bytes_read += len(chunk)
                     tree_digest.update(chunk)
                     blob_digest.update(chunk)
+                    if snapshot_fd is not None:
+                        _write_all(snapshot_fd, chunk)
 
                 after = os.fstat(file_fd)
                 try:
                     path_after = os.stat(
-                        relative_path,
-                        dir_fd=root_fd,
+                        relative_name,
+                        dir_fd=parent_fd,
                         follow_symlinks=False,
                     )
                 except OSError as exc:
@@ -216,8 +286,22 @@ def tracked_worktree_sha256(root: Path, *, require_clean: bool = True) -> str:
                         f"tracked source bytes differ from Git: "
                         f"{os.fsdecode(relative_path)!r}"
                     )
+                if snapshot_fd is not None:
+                    snapshot_after = os.fstat(snapshot_fd)
+                    if (
+                        not stat.S_ISREG(snapshot_after.st_mode)
+                        or snapshot_after.st_nlink != 1
+                        or snapshot_after.st_size != bytes_read
+                    ):
+                        raise ValueError(
+                            f"cannot securely snapshot tracked source file: "
+                            f"{os.fsdecode(relative_path)!r}"
+                        )
             finally:
+                if snapshot_fd is not None:
+                    os.close(snapshot_fd)
                 os.close(file_fd)
+                os.close(parent_fd)
     finally:
         os.close(root_fd)
 
@@ -229,4 +313,43 @@ def tracked_worktree_sha256(root: Path, *, require_clean: bool = True) -> str:
         raise ValueError(f"source checkout changed while hashing: {root}")
     if require_clean:
         _require_status_clean(root)
-    return tree_digest.hexdigest()
+    return revision, tree_digest.hexdigest()
+
+
+def snapshot_tracked_worktree(
+    root: Path, *, require_clean: bool = True
+) -> TrackedWorktreeSnapshot:
+    """Copy tracked bytes once, retaining their revision and canonical digest."""
+
+    temporary_directory = tempfile.TemporaryDirectory(prefix="kquant-source-")
+    snapshot_root = Path(temporary_directory.name)
+    try:
+        revision, digest = _attest_tracked_worktree(
+            root,
+            require_clean=require_clean,
+            snapshot_root=snapshot_root,
+        )
+    except BaseException:
+        temporary_directory.cleanup()
+        raise
+    return TrackedWorktreeSnapshot(
+        temporary_directory,
+        revision=revision,
+        sha256=digest,
+    )
+
+
+def _require_status_clean(root: Path) -> None:
+    if _git_output(root, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise ValueError(f"source checkout has uncommitted files: {root}")
+
+
+def tracked_worktree_sha256(root: Path, *, require_clean: bool = True) -> str:
+    """Hash tracked paths, executable modes, and actual bytes, failing on races."""
+
+    _, digest = _attest_tracked_worktree(
+        root,
+        require_clean=require_clean,
+        snapshot_root=None,
+    )
+    return digest
