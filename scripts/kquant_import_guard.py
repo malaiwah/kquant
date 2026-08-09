@@ -2,27 +2,18 @@
 
 from __future__ import annotations
 
-import hashlib
-import subprocess
 from pathlib import Path
+
+from scripts.tracked_worktree import git_revision, tracked_worktree_sha256
 
 
 def _capture() -> tuple[str, str]:
     root = Path(__file__).resolve().parents[1]
-    revision = subprocess.run(
-        ("git", "-C", str(root), "rev-parse", "HEAD"),
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    tree = subprocess.run(
-        ("git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", "HEAD"),
-        check=True,
-        capture_output=True,
-    ).stdout
-    if len(revision) != 40 or not tree:
-        raise RuntimeError("cannot capture committed KQuant import identity")
-    return revision, hashlib.sha256(b"git-ls-tree-v1\0" + tree).hexdigest()
+    revision = git_revision(root)
+    fingerprint = tracked_worktree_sha256(root, require_clean=False)
+    if git_revision(root) != revision:
+        raise RuntimeError("KQuant source revision changed during import attestation")
+    return revision, fingerprint
 
 
 KQUANT_IMPORT_IDENTITY = _capture()

@@ -10,6 +10,11 @@ dependencies = [
     "tqdm>=4.66",
 ]
 
+[project.optional-dependencies]
+fruit-calibration = [
+    "transformers>=5.0,<6",
+]
+
 [dependency-groups]
 dev = ["pytest>=8.0"]
 

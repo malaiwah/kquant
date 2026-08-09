@@ -1,0 +1,232 @@
+"""Deterministically attest the actual bytes in a tracked Git worktree."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+import subprocess
+from pathlib import Path
+
+_FINGERPRINT_PREFIX = b"kquant-tracked-worktree-sha256-v1\0"
+
+
+def _git_output(root: Path, *args: str) -> bytes:
+    try:
+        return subprocess.run(
+            ("git", "-C", str(root), *args),
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"cannot inspect source tree: {root}") from exc
+
+
+def git_revision(root: Path) -> str:
+    revision = _git_output(root, "rev-parse", "HEAD").strip().decode("ascii")
+    if len(revision) != 40 or any(
+        character not in "0123456789abcdef" for character in revision
+    ):
+        raise ValueError(f"source revision is not a commit digest: {root}")
+    return revision
+
+
+def _nul_records(output: bytes, *, description: str) -> list[bytes]:
+    if not output or output[-1:] != b"\0":
+        raise ValueError(f"source checkout has malformed {description}")
+    records = output.split(b"\0")
+    records.pop()
+    if not records or any(not record for record in records):
+        raise ValueError(f"source checkout has malformed {description}")
+    return records
+
+
+def _tracked_index(root: Path) -> dict[bytes, tuple[bytes, bytes]]:
+    index: dict[bytes, tuple[bytes, bytes]] = {}
+    records = _nul_records(
+        _git_output(root, "ls-files", "--stage", "-v", "-z"),
+        description="Git index",
+    )
+    for record in records:
+        if len(record) < 3 or record[1:2] != b" " or b"\t" not in record:
+            raise ValueError("source checkout has malformed Git index")
+        tag = record[:1]
+        if tag == b"h":
+            raise ValueError("source checkout has assume-unchanged tracked files")
+        if tag in (b"S", b"s"):
+            raise ValueError("source checkout has skip-worktree tracked files")
+        if tag != b"H":
+            raise ValueError("source checkout has anomalous tracked files")
+        metadata, relative_path = record[2:].split(b"\t", 1)
+        fields = metadata.split(b" ")
+        if (
+            len(fields) != 3
+            or fields[2] != b"0"
+            or len(fields[1]) != 40
+            or any(byte not in b"0123456789abcdef" for byte in fields[1])
+        ):
+            raise ValueError("source checkout has malformed or unmerged Git index")
+        mode, object_id = fields[:2]
+        if mode not in (b"100644", b"100755"):
+            raise ValueError(
+                f"source checkout tracks a non-regular entry: "
+                f"{os.fsdecode(relative_path)!r}"
+            )
+        if (
+            not relative_path
+            or relative_path.startswith(b"/")
+            or any(part in (b"", b".", b"..") for part in relative_path.split(b"/"))
+            or relative_path in index
+        ):
+            raise ValueError("source checkout has anomalous tracked paths")
+        index[relative_path] = (mode, object_id)
+    return index
+
+
+def _tracked_head(root: Path) -> dict[bytes, tuple[bytes, bytes]]:
+    head: dict[bytes, tuple[bytes, bytes]] = {}
+    records = _nul_records(
+        _git_output(root, "ls-tree", "-r", "-z", "--full-tree", "HEAD"),
+        description="HEAD tree",
+    )
+    for record in records:
+        if b"\t" not in record:
+            raise ValueError("source checkout has malformed HEAD tree")
+        metadata, relative_path = record.split(b"\t", 1)
+        fields = metadata.split(b" ")
+        if (
+            len(fields) != 3
+            or len(fields[2]) != 40
+            or any(byte not in b"0123456789abcdef" for byte in fields[2])
+        ):
+            raise ValueError("source checkout has malformed HEAD tree")
+        mode, object_type, object_id = fields
+        if object_type != b"blob" or mode not in (b"100644", b"100755"):
+            raise ValueError(
+                f"source checkout tracks a symlink, submodule, or non-regular entry: "
+                f"{os.fsdecode(relative_path)!r}"
+            )
+        if not relative_path or relative_path in head:
+            raise ValueError("source checkout has anomalous HEAD paths")
+        head[relative_path] = (mode, object_id)
+    return head
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _require_status_clean(root: Path) -> None:
+    if _git_output(root, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise ValueError(f"source checkout has uncommitted files: {root}")
+
+
+def tracked_worktree_sha256(root: Path, *, require_clean: bool = True) -> str:
+    """Hash tracked paths, executable modes, and actual bytes, failing on races."""
+    if not root.is_dir():
+        raise FileNotFoundError(root)
+    revision = git_revision(root)
+    index = _tracked_index(root)
+    head = _tracked_head(root)
+    if index != head:
+        raise ValueError(f"source checkout index does not match HEAD: {root}")
+    if require_clean:
+        _require_status_clean(root)
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    tree_digest = hashlib.sha256(_FINGERPRINT_PREFIX)
+    try:
+        root_fd = os.open(root, directory_flags)
+    except OSError as exc:
+        raise ValueError(f"cannot securely open source checkout: {root}") from exc
+    try:
+        for relative_path in sorted(index):
+            expected_mode, expected_object_id = index[relative_path]
+            try:
+                file_fd = os.open(relative_path, flags, dir_fd=root_fd)
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot securely open tracked source file: "
+                    f"{os.fsdecode(relative_path)!r}"
+                ) from exc
+            try:
+                before = os.fstat(file_fd)
+                if not stat.S_ISREG(before.st_mode):
+                    raise ValueError(
+                        f"tracked source is not a regular file: "
+                        f"{os.fsdecode(relative_path)!r}"
+                    )
+                actual_mode = b"100755" if before.st_mode & 0o111 else b"100644"
+                if actual_mode != expected_mode:
+                    raise ValueError(
+                        f"tracked source executable mode differs from Git: "
+                        f"{os.fsdecode(relative_path)!r}"
+                    )
+
+                tree_digest.update(actual_mode)
+                tree_digest.update(len(relative_path).to_bytes(8, "big"))
+                tree_digest.update(relative_path)
+                tree_digest.update(before.st_size.to_bytes(8, "big"))
+                blob_digest = hashlib.sha1(
+                    b"blob " + str(before.st_size).encode("ascii") + b"\0"
+                )
+                bytes_read = 0
+                while chunk := os.read(file_fd, 1 << 20):
+                    bytes_read += len(chunk)
+                    tree_digest.update(chunk)
+                    blob_digest.update(chunk)
+
+                after = os.fstat(file_fd)
+                try:
+                    path_after = os.stat(
+                        relative_path,
+                        dir_fd=root_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        f"tracked source path changed while hashing: "
+                        f"{os.fsdecode(relative_path)!r}"
+                    ) from exc
+                if (
+                    bytes_read != before.st_size
+                    or _stat_identity(before) != _stat_identity(after)
+                    or _stat_identity(after) != _stat_identity(path_after)
+                ):
+                    raise ValueError(
+                        f"tracked source changed while hashing: "
+                        f"{os.fsdecode(relative_path)!r}"
+                    )
+                if (
+                    require_clean
+                    and blob_digest.hexdigest().encode("ascii") != expected_object_id
+                ):
+                    raise ValueError(
+                        f"tracked source bytes differ from Git: "
+                        f"{os.fsdecode(relative_path)!r}"
+                    )
+            finally:
+                os.close(file_fd)
+    finally:
+        os.close(root_fd)
+
+    if (
+        git_revision(root) != revision
+        or _tracked_index(root) != index
+        or _tracked_head(root) != head
+    ):
+        raise ValueError(f"source checkout changed while hashing: {root}")
+    if require_clean:
+        _require_status_clean(root)
+    return tree_digest.hexdigest()
