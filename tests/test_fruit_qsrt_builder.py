@@ -403,23 +403,39 @@ def _runtime_qualification_fixture(
     }
 
     def loader(arm: str) -> dict[str, object]:
+        ports = {"bf16": "8101", "siq": "8102", "qsrt": "8103"}
+        model_options = {
+            "bf16": ["--load-format", "fastsafetensors"],
+            "siq": ["--load-format", "fastsafetensors"],
+            "qsrt": [
+                "--quantization",
+                "kquant_hybrid",
+                "--load-format",
+                "fastsafetensors",
+            ],
+        }
+        runtime_revisions = (
+            revisions
+            if arm == "qsrt"
+            else {
+                "vllm_revision": "8" * 40,
+                "b12x_revision": "9" * 40,
+                "kquant_revision": "a" * 40,
+            }
+        )
         argv = [
             "vllm",
             "serve",
-            "/model",
+            f"/models/{arm}",
+            "--served-model-name",
+            f"fruit-{arm}",
+            "--host=127.0.0.1",
+            "--port",
+            ports[arm],
             "--tensor-parallel-size",
             "1",
             "--pipeline-parallel-size=1",
-            "--max-num-seqs",
-            "1",
-            "--max-model-len",
-            "4096",
-            "--max-num-batched-tokens",
-            "4096",
-            "--compilation-config",
-            json.dumps(builder._FIXED_COMPILATION_CONFIG, separators=(",", ":")),
-            "--speculative-config",
-            '{"method":"mtp","num_speculative_tokens":1}',
+            *model_options[arm],
             "--attention-backend",
             "B12X_MLA_SPARSE",
             "--moe-backend",
@@ -428,18 +444,40 @@ def _runtime_qualification_fixture(
             "nvfp4_ds_mla",
             "--enable-chunked-prefill",
             "--enable-prefix-caching",
-            "--quantization",
-            "kquant_hybrid",
-            "--load-format",
-            "fastsafetensors",
+            "--compilation-config",
+            json.dumps(builder._FIXED_COMPILATION_CONFIG, separators=(",", ":")),
+            "--speculative-config",
+            '{"method":"mtp","num_speculative_tokens":1}',
+            "--gpu-memory-utilization",
+            "0.80",
+            "--max-model-len",
+            "4096",
+            "--max-num-batched-tokens",
+            "4096",
+            "--max-num-seqs",
+            "1",
+            "--tool-call-parser",
+            "glm47",
+            "--enable-auto-tool-choice",
+            "--reasoning-parser",
+            "glm45",
+            "--generation-config",
+            "vllm",
         ]
         return {
             "runtime": {
-                "image": f"registry.invalid/{arm}@sha256:{'f' * 64}",
-                **revisions,
+                "image": (
+                    f"registry.invalid/fruit-final@sha256:{'f' * 64}"
+                    if arm == "qsrt"
+                    else f"registry.invalid/fruit-r28@sha256:{'e' * 64}"
+                ),
+                **runtime_revisions,
                 "argv": argv,
-                "environment": {"CUDA_VISIBLE_DEVICES": "0"},
-                "software": {"cuda": "13.2.1", "torch": "2.12.0"},
+                "environment": dict(builder._FIXED_RUNTIME_ENVIRONMENT),
+                "software": {
+                    "cuda": "13.2.1",
+                    "torch": "2.12.0" if arm == "qsrt" else "2.8.0",
+                },
                 "compilation_backend": "inductor",
                 "cudagraph_mode": "FULL_AND_PIECEWISE",
             },
@@ -918,11 +956,11 @@ def test_runtime_qualification_rejects_argv_contradictions_and_omissions(
     malformed_values.append(mutated_capture_sizes)
 
     eager_arm = json.loads(builder._canonical_json(payload))
-    eager_arm["loaders"]["bf16"]["runtime"]["compilation_backend"] = "eager"
+    eager_arm["loaders"]["qsrt"]["runtime"]["compilation_backend"] = "eager"
     malformed_values.append(eager_arm)
 
     no_graph_arm = json.loads(builder._canonical_json(payload))
-    no_graph_arm["loaders"]["siq"]["runtime"]["cudagraph_mode"] = "NONE"
+    no_graph_arm["loaders"]["qsrt"]["runtime"]["cudagraph_mode"] = "NONE"
     malformed_values.append(no_graph_arm)
     argv = forged_graph["loaders"]["qsrt"]["runtime"]["argv"]
     argv[argv.index("--compilation-config") + 1] = (
@@ -940,6 +978,70 @@ def test_runtime_qualification_rejects_argv_contradictions_and_omissions(
     for malformed in malformed_values:
         path.write_text(builder._canonical_json(malformed), encoding="utf-8")
         with pytest.raises(ValueError):
+            _validate_runtime_fixture(path, output, producer, source)
+
+
+def test_runtime_qualification_rejects_unlisted_duplicate_and_negative_argv(
+    tmp_path: Path,
+) -> None:
+    path, output, payload, producer, source = _runtime_qualification_fixture(tmp_path)
+    base_argv = payload["loaders"]["bf16"]["runtime"]["argv"]
+    malformed_values = []
+
+    for extra in (
+        ["--no-enable-prefix-caching"],
+        ["--no-enable-chunked-prefill"],
+        ["--unknown-qualification-flag"],
+        ["unexpected-positional"],
+    ):
+        malformed = json.loads(builder._canonical_json(payload))
+        malformed["loaders"]["bf16"]["runtime"]["argv"].extend(extra)
+        malformed_values.append(malformed)
+
+    for index, argument in enumerate(base_argv):
+        if not argument.startswith("--"):
+            continue
+        duplicate = [argument]
+        flag = argument.partition("=")[0]
+        if "=" not in argument and flag not in builder._FIXED_RUNTIME_SWITCHES:
+            duplicate.append(base_argv[index + 1])
+        malformed = json.loads(builder._canonical_json(payload))
+        malformed["loaders"]["siq"]["runtime"]["argv"].extend(duplicate)
+        malformed_values.append(malformed)
+
+    for malformed in malformed_values:
+        path.write_text(builder._canonical_json(malformed), encoding="utf-8")
+        with pytest.raises(ValueError):
+            _validate_runtime_fixture(path, output, producer, source)
+
+
+def test_runtime_qualification_requires_exact_runtime_environment(
+    tmp_path: Path,
+) -> None:
+    path, output, payload, producer, source = _runtime_qualification_fixture(tmp_path)
+    malformed_values = []
+
+    drift = json.loads(builder._canonical_json(payload))
+    drift["loaders"]["siq"]["runtime"]["environment"]["CUDA_VISIBLE_DEVICES"] = "1"
+    malformed_values.append(drift)
+
+    same_extra = json.loads(builder._canonical_json(payload))
+    for arm in builder._RUNTIME_ARMS:
+        same_extra["loaders"][arm]["runtime"]["environment"][
+            "VLLM_FAKE_PRODUCTION_TOGGLE"
+        ] = "1"
+    malformed_values.append(same_extra)
+
+    same_production_drift = json.loads(builder._canonical_json(payload))
+    for arm in builder._RUNTIME_ARMS:
+        same_production_drift["loaders"][arm]["runtime"]["environment"][
+            "PYTHONSAFEPATH"
+        ] = "0"
+    malformed_values.append(same_production_drift)
+
+    for malformed in malformed_values:
+        path.write_text(builder._canonical_json(malformed), encoding="utf-8")
+        with pytest.raises(ValueError, match="sanitized production environment"):
             _validate_runtime_fixture(path, output, producer, source)
 
 
