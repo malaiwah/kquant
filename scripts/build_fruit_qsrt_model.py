@@ -579,17 +579,33 @@ def current_encoder_provenance(
     exllamav3_root: Path,
     calibration: FruitCalibrationStore,
     kquant_root: Path | None = None,
+    kquant_identity: tuple[str, str] | None = None,
 ) -> dict[str, object]:
-    if kquant_root is None:
-        if _KQUANT_IMPORT_IDENTITY is None:
-            raise RuntimeError(
-                "KQuant source identity requires the authenticated production bootstrap"
-            )
-        kquant_revision, kquant_source_sha256 = _KQUANT_IMPORT_IDENTITY
-    else:
+    if kquant_root is not None and kquant_identity is not None:
+        raise ValueError(
+            "KQuant root and authenticated identity are mutually exclusive"
+        )
+    if kquant_root is not None:
         kquant_checkout = kquant_root.resolve(strict=True)
         kquant_revision = _git_revision(kquant_checkout)
         kquant_source_sha256 = tracked_worktree_sha256(kquant_checkout)
+    elif kquant_identity is not None:
+        kquant_revision, kquant_source_sha256 = kquant_identity
+        if (
+            len(kquant_revision) != 40
+            or len(kquant_source_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in kquant_revision + kquant_source_sha256
+            )
+        ):
+            raise ValueError("KQuant authenticated source identity is invalid")
+    elif _KQUANT_IMPORT_IDENTITY is not None:
+        kquant_revision, kquant_source_sha256 = _KQUANT_IMPORT_IDENTITY
+    else:
+        raise RuntimeError(
+            "KQuant source identity requires the authenticated production bootstrap"
+        )
     exllamav3_revision, exllamav3_source_sha256 = exllamav3_source_identity(
         exllamav3_root
     )

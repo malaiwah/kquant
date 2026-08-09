@@ -331,6 +331,7 @@ def main() -> None:
     encoder = current_encoder_provenance(
         exllamav3_root=args.exllamav3_root,
         calibration=calibration_store,
+        kquant_identity=_KQUANT_IMPORT_IDENTITY,
     )
     if (
         _KQUANT_IMPORT_IDENTITY is not None
@@ -347,6 +348,7 @@ def main() -> None:
         current_encoder_provenance(
             exllamav3_root=args.exllamav3_root,
             calibration=calibration_store,
+            kquant_identity=_KQUANT_IMPORT_IDENTITY,
         )
         != encoder
     ):
@@ -424,6 +426,7 @@ def main() -> None:
         current_encoder_provenance(
             exllamav3_root=args.exllamav3_root,
             calibration=calibration_store,
+            kquant_identity=_KQUANT_IMPORT_IDENTITY,
         )
         != encoder
     ):

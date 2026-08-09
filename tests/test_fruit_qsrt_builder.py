@@ -150,6 +150,14 @@ def test_current_encoder_provenance_uses_process_lifetime_source_snapshot(
         calibration=calibration,
         kquant_root=kquant_root,
     )
+    anchored = builder.current_encoder_provenance(
+        exllamav3_root=exllamav3_root,
+        calibration=calibration,
+        kquant_identity=(
+            str(before["kquant_revision"]),
+            str(before["kquant_source_sha256"]),
+        ),
+    )
     source.write_text("CODEBOOK = 2\n", encoding="utf-8")
     after = builder.current_encoder_provenance(
         exllamav3_root=exllamav3_root,
@@ -158,6 +166,7 @@ def test_current_encoder_provenance_uses_process_lifetime_source_snapshot(
     )
 
     assert after == before
+    assert anchored == before
     assert before["exllamav3_revision"] == revision
 
 
