@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import math
@@ -3349,7 +3350,14 @@ def _finalize_part_cache(output: Path) -> None:
     if parts.is_symlink() or not parts.is_dir():
         raise ValueError("Fruit candidate finalization requires an active part cache")
     os.replace(parts, staged)
-    shutil.rmtree(staged)
+    for attempt in range(8):
+        try:
+            shutil.rmtree(staged)
+            return
+        except OSError as exc:
+            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY} or attempt == 7:
+                raise
+            time.sleep(min(0.05 * (2**attempt), 0.5))
 
 
 def _package_files(
