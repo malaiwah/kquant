@@ -1555,6 +1555,34 @@ def test_finalize_part_cache_removes_active_and_staged_trees(
     assert not builder._staged_part_cache_path(output).exists()
 
 
+def test_finalize_part_cache_retries_transient_directory_not_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(builder, "LAYERS", (3,))
+    monkeypatch.setattr(builder, "EXPERTS", 1)
+    output = tmp_path / "candidate"
+    layer = output / ".qsrt-parts" / "layer-003"
+    layer.mkdir(parents=True)
+    staged = builder._staged_part_cache_path(output)
+    real_rmtree = builder.shutil.rmtree
+    removals: list[Path] = []
+    delays: list[float] = []
+
+    def transient_removal(path: Path) -> None:
+        removals.append(path)
+        if len(removals) == 1:
+            raise OSError(builder.errno.ENOTEMPTY, "injected transient directory race")
+        real_rmtree(path)
+
+    monkeypatch.setattr(builder.shutil, "rmtree", transient_removal)
+    monkeypatch.setattr(builder.time, "sleep", delays.append)
+    builder._finalize_part_cache(output)
+
+    assert removals == [staged, staged]
+    assert delays == [0.05]
+    assert not staged.exists()
+
+
 def test_empty_layer_assembly_consumes_part_cache(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
