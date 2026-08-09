@@ -4,8 +4,10 @@ import hashlib
 import json
 import subprocess
 import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Self
 
 import pytest
 
@@ -1581,6 +1583,89 @@ def test_finalize_part_cache_retries_transient_directory_not_empty(
     assert removals == [staged, staged]
     assert delays == [0.05]
     assert not staged.exists()
+
+
+def test_layer_assembly_releases_part_views_before_cache_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(builder, "LAYERS", (3,))
+    monkeypatch.setattr(builder, "EXPERTS", 1)
+    monkeypatch.setattr(builder, "FRUIT_QSRT_ARTIFACT_TENSORS", ("payload",))
+    output = tmp_path / "candidate"
+    (output / ".qsrt-parts").mkdir(parents=True)
+    source_refs: list[weakref.ReferenceType[object]] = []
+    handle_refs: list[weakref.ReferenceType[object]] = []
+    finalized = False
+
+    class SourceTensor:
+        pass
+
+    class IndependentTensor:
+        shape = (1,)
+
+        def contiguous(self) -> IndependentTensor:
+            return self
+
+    class FakeSafeOpen:
+        def __init__(self) -> None:
+            handle_refs.append(weakref.ref(self))
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get_tensor(self, _name: str) -> SourceTensor:
+            tensor = SourceTensor()
+            source_refs.append(weakref.ref(tensor))
+            return tensor
+
+    def write_safetensors(
+        path: Path, _tensors: dict[str, object], _metadata: dict[str, str]
+    ) -> None:
+        path.write_bytes(b"assembled")
+
+    def finalize_part_cache(_output: Path) -> None:
+        nonlocal finalized
+        assert source_refs and all(reference() is None for reference in source_refs)
+        assert handle_refs and all(reference() is None for reference in handle_refs)
+        finalized = True
+
+    monkeypatch.setattr(builder, "_validate_part_cache_root", lambda *_a, **_k: None)
+    monkeypatch.setattr(builder, "_validate_layer", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        builder,
+        "_validate_part",
+        lambda *_a, **_k: {
+            "layer": 3,
+            "expert": 0,
+            "format": {"r13": 0, "r2": 0},
+        },
+    )
+    monkeypatch.setattr(builder, "safe_open", lambda *_a, **_k: FakeSafeOpen())
+    monkeypatch.setattr(
+        builder.torch,
+        "cat",
+        lambda _values, *, dim: IndependentTensor(),
+    )
+    monkeypatch.setattr(
+        builder,
+        "pack_fruit_atom_layer",
+        lambda _pairs, *, layer: {"packed": IndependentTensor()},
+    )
+    monkeypatch.setattr(builder, "_atomic_safetensors", write_safetensors)
+    monkeypatch.setattr(builder, "_fruit_atom_metadata", lambda **_k: {})
+    monkeypatch.setattr(builder, "_finalize_part_cache", finalize_part_cache)
+
+    layers = builder._assemble_layers(
+        output,
+        source_sha256="a" * 64,
+        encoder_fingerprint="b" * 64,
+    )
+
+    assert finalized
+    assert layers["3"]["expert_count"] == 1
 
 
 def test_empty_layer_assembly_consumes_part_cache(

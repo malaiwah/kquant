@@ -2912,10 +2912,13 @@ def _assemble_layers(
             with safe_open(part_tensor, framework="pt", device="cpu") as handle:
                 for name in FRUIT_QSRT_ARTIFACT_TENSORS:
                     parts[name].append(handle.get_tensor(name))
+            del handle
         pair_tensors = {
             name: torch.cat(values, dim=1 if name == "w13_trellis" else 0).contiguous()
             for name, values in parts.items()
         }
+        parts.clear()
+        del parts
         tensors = pack_fruit_atom_layer(pair_tensors, layer=layer)
         _atomic_safetensors(
             tensor_path,
@@ -2961,6 +2964,7 @@ def _assemble_layers(
             f"layer {layer}: assembled {tensor_path.stat().st_size / (1 << 20):.2f} MiB",
             flush=True,
         )
+        del pair_tensors, tensors
     _finalize_part_cache(output)
     return results
 
