@@ -329,7 +329,7 @@ def test_safetensors_store_authenticates_and_maps_mtp_matrix(
     )
 
 
-def test_safetensors_store_fails_closed_on_inventory_and_mutation(
+def test_safetensors_store_fails_closed_on_inventory_and_snapshots_bytes(
     tmp_path: Path,
 ) -> None:
     omitted = "model.layers.4.mlp.experts.1.up_proj.weight"
@@ -349,11 +349,39 @@ def test_safetensors_store_fails_closed_on_inventory_and_mutation(
         spec=_BASE_SPEC,
         expected_manifest_sha256=intact_manifest,
     )
+    snapshot_root = store.path
+    (intact / "config.json").write_text("{}", encoding="utf-8")
+    (intact / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
     shard = intact / "model-00001-of-00001.safetensors"
     with shard.open("ab") as handle:
         handle.write(b"changed")
-    with pytest.raises(ValueError, match="changed after authentication"):
-        store.load_matrix(3, 0, "w1")
+
+    result = store.load_matrix(3, 0, "w1")
+
+    assert snapshot_root != intact
+    torch.testing.assert_close(
+        result,
+        _matrix(_BASE_SPEC, "w1", offset=0).float(),
+        rtol=0,
+        atol=0,
+    )
+    store.close()
+    assert not snapshot_root.exists()
+
+
+def test_safetensors_store_rejects_manifest_listed_hard_link(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hard-linked"
+    manifest_sha256 = _save_safetensors_store(root)
+    os.link(root / "config.json", tmp_path / "config-alias.json")
+
+    with pytest.raises(ValueError, match="must not have hard links"):
+        FruitSafetensorsStore(
+            root,
+            spec=_BASE_SPEC,
+            expected_manifest_sha256=manifest_sha256,
+        )
 
 
 def test_preflight_is_json_serializable_and_pins_legacy_theta(tmp_path: Path) -> None:

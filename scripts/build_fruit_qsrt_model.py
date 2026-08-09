@@ -22,12 +22,12 @@ from safetensors.torch import save_file
 
 from scripts.kquant_import_guard import (  # isort: skip
     KQUANT_IMPORT_IDENTITY as _KQUANT_IMPORT_IDENTITY,
+    KQUANT_IMPORT_SOURCE_ROOT as _KQUANT_IMPORT_SOURCE_ROOT,
 )
 from scripts.tracked_worktree import tracked_worktree_sha256  # isort: skip
 
-from kquant.exl3_loader import load_qsrt_encoder
+from kquant.exl3_loader import exllamav3_source_identity, load_qsrt_encoder
 from kquant.fruit_calibration import (
-    FRUIT_CALIBRATION_AUTHORITIES,
     FruitCalibrationStore,
     fruit_calibration_authority,
 )
@@ -54,16 +54,16 @@ from kquant.fruit_qsrt import (
     pack_fruit_atom_layer,
 )
 from kquant.fruit_source import (
-    FRUIT_ANNEALED_SPEC,
+    FRUIT_INSTRUCT_SPEC,
     FruitModelSpec,
     FruitSafetensorsStore,
 )
 from kquant.sqg_quantizer import install_sqg_quantizer
 
-LAYERS = (*FRUIT_ANNEALED_SPEC.layers, FRUIT_ANNEALED_SPEC.mtp_layer)
-EXPERTS = FRUIT_ANNEALED_SPEC.num_experts
-HIDDEN_SIZE = FRUIT_ANNEALED_SPEC.hidden_size
-INTERMEDIATE_SIZE = FRUIT_ANNEALED_SPEC.intermediate_size
+LAYERS = (*FRUIT_INSTRUCT_SPEC.layers, FRUIT_INSTRUCT_SPEC.mtp_layer)
+EXPERTS = FRUIT_INSTRUCT_SPEC.num_experts
+HIDDEN_SIZE = FRUIT_INSTRUCT_SPEC.hidden_size
+INTERMEDIATE_SIZE = FRUIT_INSTRUCT_SPEC.intermediate_size
 PAIR_COUNT = FRUIT_QSRT_PAIR_COUNT
 PAIR_WORDS = FRUIT_QSRT_PAIR_WORDS
 
@@ -80,43 +80,8 @@ class FruitPublicationSpec:
 
 
 FRUIT_PUBLICATIONS = {
-    "annealed": FruitPublicationSpec(
-        repository="malaiwah/GLM-5.2-QSRT-Fruit-exact",
-        title="GLM-5.2 QSRT Fruit",
-        introduction=(
-            "This is a **5.04B-parameter GLM-5.2 serving proxy**, not the 754B "
-            "GLM-5.2 model. It is the first complete Fruit checkpoint encoded "
-            "in KQuant's canonical QSRT atom format and served without "
-            "reconstructing dense expert weights.\n\n"
-            "The artifact is a codec/storage/runtime integration release. "
-            "Packaging, provenance, exact state decoding, and the canonical "
-            "single-GPU runtime path are implemented. The checkpoint itself "
-            "has no downstream chat-quality qualification; see "
-            "[Known limitations](#known-limitations)."
-        ),
-        quality_limitations=(
-            "- **Not chat-quality.** No representative downstream instruction/chat "
-            "evaluation is sealed by default. Any optional runtime qualification "
-            "receipt is a narrow protocol record, not a task-quality benchmark, "
-            "and this checkpoint must not be deployed as a user-facing assistant."
-        ),
-        fruit_audit_rows=(
-            "| [Fruit QSRT (pre-adjacent-rate-evidence publication)]"
-            "(https://huggingface.co/malaiwah/GLM-5.2-QSRT-Fruit/tree/"
-            "c1a0c62d220602fdd8b7940dcba716671fb0033c) | `c1a0c62d` | "
-            "2,963,027,998 | 2,909,352,104 |\n"
-            "| [Fruit BF16](https://huggingface.co/malaiwah/"
-            "GLM-5.2-SIQ-Fruit-bf16/tree/"
-            "ff1178d233fddc644dc053c723d58839eb921334) | `ff1178d2` | "
-            "10,102,776,679 | 10,081,800,232 |\n"
-            "| [Fruit prior mixed SIQ](https://huggingface.co/malaiwah/"
-            "GLM-5.2-SIQ-Fruit/tree/"
-            "c1798e3676fa16b4a874381171adab1e3033fbd5) | `c1798e36` | "
-            "3,125,527,019 | 3,102,116,152 |"
-        ),
-    ),
     "instruct": FruitPublicationSpec(
-        repository="malaiwah/GLM-5.2-QSRT-Fruit-Instruct-exact",
+        repository="malaiwah/GLM-5.2-QSRT-Fruit-Instruct",
         title="GLM-5.2 QSRT Fruit Instruct",
         introduction=(
             "This is the assistant-masked SFT form of a **5.04B-parameter "
@@ -130,10 +95,9 @@ FRUIT_PUBLICATIONS = {
             "[Known limitations](#known-limitations)."
         ),
         quality_limitations=(
-            "- **Not assistant-quality.** No representative downstream instruction/"
-            "chat evaluation is sealed by default. Any optional runtime "
-            "qualification receipt is a narrow protocol record, not a "
-            "representative task-quality benchmark."
+            "- **Not assistant-quality.** The required runtime qualification "
+            "receipt is a narrow protocol record, not a representative downstream "
+            "instruction/chat task-quality benchmark."
         ),
         fruit_audit_rows=(
             "| [Fruit Instruct BF16](https://huggingface.co/malaiwah/"
@@ -158,6 +122,8 @@ def fruit_publication_spec(variant: str) -> FruitPublicationSpec:
 
 EXLLAMAV3_REVISION = "791c83073f7f90c44f765a0ceeab7a05fa15b96b"
 _COMPLETE_MARKER_NAME = "QSRT_COMPLETE.json"
+_CANDIDATE_MARKER_NAME = "QSRT_CANDIDATE.json"
+_KQUANT_SNAPSHOT_CLEAN_VERIFIED = False
 MODEL_CARD_TEMPLATE = r"""---
 license: mit
 library_name: vllm
@@ -220,7 +186,7 @@ BF16. Isolating the 4,429,185,024 routed-expert weights gives:
 
 QSRT is therefore 10.25% smaller than SIQ on the routed-expert component and
 6.21% smaller on the compared tensor files. Package-level totals are not used
-for the comparison because tokenizer, card, and optional evaluation files are
+for the comparison because tokenizer, card, and evaluation evidence files are
 not model weights. The previous card's 7,593,020,594-byte BF16 row was not the
 complete BF16 tensor set and has been removed.
 
@@ -287,6 +253,11 @@ docker build \
   --tag fruit-qsrt:__VLLM_REVISION__ \
   vllm-fruit
 
+# This digest is an operator-supplied trust root obtained independently of the
+# package being authenticated. Never derive it from MODEL_DIR.
+test -n "${FRUIT_QSRT_EXPECTED_COMPLETE_SHA256:?set an independently supplied completion digest}"
+test "${#FRUIT_QSRT_EXPECTED_COMPLETE_SHA256}" -eq 64
+
 MODEL_REVISION="$(
   curl -fsSL https://huggingface.co/api/models/__MODEL_REPOSITORY__ \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
@@ -305,6 +276,7 @@ docker run --rm --gpus '"device=0"' --shm-size=16g \
   --publish 8000:8000 \
   --volume "$PWD/${MODEL_DIR}:/model:ro" \
   --env MODEL=/model \
+  --env FRUIT_QSRT_EXPECTED_COMPLETE_SHA256="${FRUIT_QSRT_EXPECTED_COMPLETE_SHA256}" \
   fruit-qsrt:__VLLM_REVISION__
 ```
 
@@ -342,7 +314,7 @@ activation modes, metadata, or incomplete manifests fail closed.
 - Full encoding: __ENCODED_EXPERTS__ experts, __ENCODE_SECONDS__ GPU-seconds,
   __PEAK_GIB__ GiB peak CUDA allocation.
 - `MANIFEST.sha256`, `qsrt-manifest.json`, `.qsrt-source-evidence.json`,
-  `qsrt-calibration-evidence.json`, optional
+  `qsrt-calibration-evidence.json`,
   `evaluation/fruit-runtime-qualification.json`, and `QSRT_COMPLETE.json` bind
   the published package to the source, producer, and evaluation receipts.
 
@@ -370,6 +342,66 @@ _RATE_SWEEP_NAME = "evaluation/fruit-uniform-rate-sweep.json"
 _RUNTIME_QUALIFICATION_SCHEMA = "kquant_fruit_runtime_qualification_v1"
 _RUNTIME_QUALIFICATION_NAME = "evaluation/fruit-runtime-qualification.json"
 _RUNTIME_ARMS = ("bf16", "siq", "qsrt")
+_RUNTIME_PATHS_SCHEMA = "kquant_fruit_runtime_paths_v1"
+_INSTRUCT_COMPARATOR_MODELS = {
+    "bf16": {
+        "repository": "malaiwah/GLM-5.2-SIQ-Fruit-Instruct-bf16",
+        "revision": "678954f65e056a0f508e21eeb9251c655bb9463f",
+        "manifest_sha256": "8f23aed5e9b12000ed103a76da772a20730ca53ab7e352d6cb94da2709165245",
+        "config_sha256": "1b1ea852c2bea8644774ec795025df2d0247b67131bccc8bf7e1137699518d55",
+        "model_index_sha256": "86e6cc1d8548c7bdbbc117e93b85b8ae249f446de9b48d2195e51f358674ba56",
+        "safetensors_bytes": 10_081_800_232,
+        "safetensors_sha256": "01fb6ad26356fc22f07f2598385b132db59df4eddd92bc005dfc0622284ee12b",
+    },
+    "siq": {
+        "repository": "malaiwah/GLM-5.2-SIQ-Fruit-Instruct",
+        "revision": "48452ef397d8b4a4d6d0c00ea376a2abb3ef6314",
+        "manifest_sha256": "ac5485e2552f54850eebfecf11e23f3f640c391ed335d06562f91eb34f613639",
+        "config_sha256": "9d137e2b59fff529eb122581b0bce6eb7ace458a0785368d2ba587b4a5c2aa6f",
+        "model_index_sha256": "5808a4b3e75c4a949a1ede42e6c6fb2576089ec1544038b77de24076e99bf3da",
+        "safetensors_bytes": 3_102_116_152,
+        "safetensors_sha256": "9c6c5c2c07eeb3aed026db4f6c5fc208dc04272304ba4f39ea9d23a31f9012b5",
+    },
+}
+
+_FIXED_CUDAGRAPH_CAPTURE_SIZES = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    20,
+    24,
+    32,
+    48,
+    64,
+]
+_FIXED_COMPILATION_CONFIG = {
+    "backend": "inductor",
+    "cudagraph_mode": "FULL_AND_PIECEWISE",
+    "custom_ops": ["all"],
+    "cudagraph_capture_sizes": _FIXED_CUDAGRAPH_CAPTURE_SIZES,
+}
+_FIXED_RUNTIME_OPTIONS = {
+    "--attention-backend": "B12X_MLA_SPARSE",
+    "--moe-backend": "b12x",
+    "--kv-cache-dtype": "nvfp4_ds_mla",
+}
+_FIXED_RUNTIME_SWITCHES = (
+    "--enable-chunked-prefill",
+    "--enable-prefix-caching",
+)
 _ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v3"
 _DTYPE_BYTES = {
     "BOOL": 1,
@@ -435,33 +467,40 @@ def current_encoder_provenance(
     calibration: FruitCalibrationStore,
     kquant_root: Path | None = None,
 ) -> dict[str, object]:
-    kquant_checkout = (
-        Path(__file__).resolve().parents[1]
-        if kquant_root is None
-        else kquant_root.resolve(strict=True)
+    global _KQUANT_SNAPSHOT_CLEAN_VERIFIED
+    if kquant_root is None:
+        if _KQUANT_IMPORT_IDENTITY is None:
+            raise RuntimeError("KQuant source snapshot identity is unavailable")
+        if not _KQUANT_SNAPSHOT_CLEAN_VERIFIED:
+            clean_identity = (
+                _git_revision(_KQUANT_IMPORT_SOURCE_ROOT),
+                tracked_worktree_sha256(_KQUANT_IMPORT_SOURCE_ROOT),
+            )
+            if clean_identity != _KQUANT_IMPORT_IDENTITY:
+                raise ValueError(
+                    "KQuant source snapshot does not match the clean committed tree"
+                )
+            _KQUANT_SNAPSHOT_CLEAN_VERIFIED = True
+        kquant_revision, kquant_source_sha256 = _KQUANT_IMPORT_IDENTITY
+    else:
+        kquant_checkout = kquant_root.resolve(strict=True)
+        kquant_revision = _git_revision(kquant_checkout)
+        kquant_source_sha256 = tracked_worktree_sha256(kquant_checkout)
+    exllamav3_revision, exllamav3_source_sha256 = exllamav3_source_identity(
+        exllamav3_root
     )
-    exllamav3_revision = _git_revision(exllamav3_root)
     if exllamav3_revision != EXLLAMAV3_REVISION:
         raise ValueError("ExLlamaV3 source revision does not match the pinned encoder")
     encoder: dict[str, object] = {
-        "kquant_revision": _git_revision(kquant_checkout),
-        "kquant_source_sha256": tracked_worktree_sha256(kquant_checkout),
+        "kquant_revision": kquant_revision,
+        "kquant_source_sha256": kquant_source_sha256,
         "exllamav3_revision": exllamav3_revision,
-        "exllamav3_source_sha256": tracked_worktree_sha256(exllamav3_root),
+        "exllamav3_source_sha256": exllamav3_source_sha256,
         "calibration_fingerprint": calibration.fingerprint,
         "calibration_capture_id": calibration.capture_id,
         "calibration_manifest_sha256": calibration.manifest_sha256,
         "fingerprint_schema": _ENCODER_FINGERPRINT_SCHEMA,
     }
-    if (
-        _KQUANT_IMPORT_IDENTITY is not None
-        and (
-            encoder["kquant_revision"],
-            encoder["kquant_source_sha256"],
-        )
-        != _KQUANT_IMPORT_IDENTITY
-    ):
-        raise ValueError("KQuant sources changed while importing the builder")
     encoder["fingerprint"] = hashlib.sha256(
         _canonical_json(_encoder_fingerprint_payload(encoder)).encode("utf-8")
     ).hexdigest()
@@ -779,6 +818,243 @@ def _qualification_revision(value: object, *, name: str) -> str:
     return revision
 
 
+def _runtime_argv_option(argv: list[str], flag: str) -> str:
+    values: list[str] = []
+    prefix = f"{flag}="
+    for index, argument in enumerate(argv):
+        if argument.startswith(prefix):
+            values.append(argument[len(prefix) :])
+        elif argument == flag:
+            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                raise ValueError(
+                    f"Fruit runtime qualification argv option {flag} has no value"
+                )
+            values.append(argv[index + 1])
+    if len(values) != 1 or not values[0]:
+        raise ValueError(
+            f"Fruit runtime qualification argv must contain exactly one {flag}"
+        )
+    return values[0]
+
+
+def _runtime_argv_json(argv: list[str], flag: str) -> dict[str, object]:
+    raw_value = _runtime_argv_option(argv, flag)
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Fruit runtime qualification argv option {flag} is not JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise TypeError(
+            f"Fruit runtime qualification argv option {flag} must be an object"
+        )
+    return value
+
+
+def _normalized_runtime_argv(argv: list[str]) -> tuple[str, ...]:
+    if len(argv) < 3 or argv[:2] != ["vllm", "serve"] or argv[2].startswith("-"):
+        raise ValueError("Fruit runtime qualification argv is not vllm serve MODEL")
+    normalized = list(argv)
+    normalized[2] = "<MODEL>"
+    variable_options = {
+        "--model": "<MODEL>",
+        "--served-model-name": "<MODEL>",
+        "--port": "<PORT>",
+        "--download-dir": "<PATH>",
+    }
+    for index, argument in enumerate(normalized):
+        for flag, replacement in variable_options.items():
+            if argument == flag:
+                if index + 1 >= len(normalized):
+                    raise ValueError(
+                        f"Fruit runtime qualification argv option {flag} has no value"
+                    )
+                normalized[index + 1] = replacement
+            elif argument.startswith(f"{flag}="):
+                normalized[index] = f"{flag}={replacement}"
+    return tuple(normalized)
+
+
+def _validate_runtime_argv(
+    argv: list[str],
+    *,
+    arm: str,
+    protocol: dict[str, object],
+    compilation_backend: str,
+    cudagraph_mode: object,
+) -> tuple[str, ...]:
+    if "--enforce-eager" in argv:
+        raise ValueError("Fruit runtime qualification argv may not force eager mode")
+    expected_integers = {
+        "--tensor-parallel-size": int(protocol["tensor_parallel_size"]),
+        "--pipeline-parallel-size": 1,
+        "--max-num-seqs": int(protocol["max_num_seqs"]),
+        "--max-model-len": 4096,
+        "--max-num-batched-tokens": 4096,
+    }
+    for flag, expected in expected_integers.items():
+        raw_value = _runtime_argv_option(argv, flag)
+        try:
+            measured = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Fruit runtime qualification argv option {flag} is not an integer"
+            ) from exc
+        if str(measured) != raw_value or measured != expected:
+            raise ValueError(
+                f"Fruit runtime qualification argv option {flag} is not {expected}"
+            )
+
+    if compilation_backend != "inductor" or cudagraph_mode != "FULL_AND_PIECEWISE":
+        raise ValueError(
+            f"Fruit runtime qualification loaders.{arm} must use non-eager "
+            "inductor FULL_AND_PIECEWISE"
+        )
+    compilation = _runtime_argv_json(argv, "--compilation-config")
+    if compilation != _FIXED_COMPILATION_CONFIG:
+        raise ValueError(
+            f"Fruit runtime qualification loaders.{arm} compilation config "
+            "is not the fixed deployment contract"
+        )
+    speculative = _runtime_argv_json(argv, "--speculative-config")
+    if speculative != {"method": "mtp", "num_speculative_tokens": 1}:
+        raise ValueError(
+            f"Fruit runtime qualification loaders.{arm} MTP argv is not qualified"
+        )
+    for flag, expected in _FIXED_RUNTIME_OPTIONS.items():
+        if _runtime_argv_option(argv, flag) != expected:
+            raise ValueError(
+                f"Fruit runtime qualification loaders.{arm} argv option {flag} "
+                f"is not {expected}"
+            )
+    for flag in _FIXED_RUNTIME_SWITCHES:
+        if argv.count(flag) != 1 or any(
+            argument.startswith(f"{flag}=") for argument in argv
+        ):
+            raise ValueError(
+                f"Fruit runtime qualification loaders.{arm} argv must contain "
+                f"exactly one {flag}"
+            )
+
+    for flag, expected in {
+        "--quantization": "kquant_hybrid",
+        "--load-format": "fastsafetensors",
+    }.items():
+        if _runtime_argv_option(argv, flag) != expected:
+            raise ValueError(
+                f"Fruit runtime qualification loaders.{arm} argv option {flag} "
+                f"is not {expected}"
+            )
+    return _normalized_runtime_argv(argv)
+
+
+def _positive_runtime_count(value: object, *, name: str) -> None:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"Fruit runtime path evidence {name} must be positive")
+
+
+def _validate_runtime_paths(value: object) -> None:
+    runtime_paths = _qualification_object(
+        value,
+        name="runtime_paths",
+        keys={"schema", "version", "layers", "cudagraph", "speculative"},
+    )
+    if (
+        runtime_paths["schema"] != _RUNTIME_PATHS_SCHEMA
+        or type(runtime_paths["version"]) is not int
+        or runtime_paths["version"] != 1
+    ):
+        raise ValueError("Fruit runtime path evidence has the wrong schema")
+
+    layers = _qualification_object(
+        runtime_paths["layers"],
+        name="runtime_paths.layers",
+        keys={str(layer) for layer in range(3, 14)},
+    )
+    for layer in range(3, 13):
+        layer_paths = _qualification_object(
+            layers[str(layer)],
+            name=f"runtime_paths.layers.{layer}",
+            keys={"prefill", "decode"},
+        )
+        prefill = _qualification_object(
+            layer_paths["prefill"],
+            name=f"runtime_paths.layers.{layer}.prefill",
+            keys={"mode", "calls"},
+        )
+        if prefill["mode"] != "w4a16":
+            raise ValueError(
+                f"Fruit runtime path layer {layer} prefill did not use W4A16"
+            )
+        _positive_runtime_count(prefill["calls"], name=f"layers.{layer}.prefill.calls")
+        decode = _qualification_object(
+            layer_paths["decode"],
+            name=f"runtime_paths.layers.{layer}.decode",
+            keys={
+                "mode",
+                "calls",
+                "part_count",
+                "capture_calls",
+                "replay_calls",
+            },
+        )
+        if (
+            decode["mode"] != "w4a8"
+            or type(decode["part_count"]) is not int
+            or decode["part_count"] != 2
+        ):
+            raise ValueError(
+                f"Fruit runtime path layer {layer} decode is not two-part W4A8"
+            )
+        for key in ("calls", "capture_calls", "replay_calls"):
+            _positive_runtime_count(decode[key], name=f"layers.{layer}.decode.{key}")
+
+    mtp_layer = _qualification_object(
+        layers["13"],
+        name="runtime_paths.layers.13",
+        keys={"mtp_decode"},
+    )
+    mtp_decode = _qualification_object(
+        mtp_layer["mtp_decode"],
+        name="runtime_paths.layers.13.mtp_decode",
+        keys={"mode", "calls", "part_count", "capture_calls", "replay_calls"},
+    )
+    if (
+        mtp_decode["mode"] != "w4a8"
+        or type(mtp_decode["part_count"]) is not int
+        or mtp_decode["part_count"] != 2
+    ):
+        raise ValueError("Fruit runtime path MTP decode is not two-part W4A8")
+    for key in ("calls", "capture_calls", "replay_calls"):
+        _positive_runtime_count(mtp_decode[key], name=f"layers.13.mtp_decode.{key}")
+
+    cudagraph = _qualification_object(
+        runtime_paths["cudagraph"],
+        name="runtime_paths.cudagraph",
+        keys={"mode", "capture_count", "replay_count"},
+    )
+    if cudagraph["mode"] != "FULL_AND_PIECEWISE":
+        raise ValueError("Fruit runtime path CUDA graph mode is not qualified")
+    _positive_runtime_count(cudagraph["capture_count"], name="cudagraph.capture_count")
+    _positive_runtime_count(cudagraph["replay_count"], name="cudagraph.replay_count")
+
+    speculative = _qualification_object(
+        runtime_paths["speculative"],
+        name="runtime_paths.speculative",
+        keys={"method", "num_speculative_tokens", "draft_tokens"},
+    )
+    if (
+        speculative["method"] != "mtp"
+        or type(speculative["num_speculative_tokens"]) is not int
+        or speculative["num_speculative_tokens"] != 1
+    ):
+        raise ValueError("Fruit runtime path speculative configuration is not MTP")
+    _positive_runtime_count(
+        speculative["draft_tokens"], name="speculative.draft_tokens"
+    )
+
+
 def _candidate_safetensors_sha256(output: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     for path in output.iterdir():
@@ -819,9 +1095,12 @@ def _validate_runtime_qualification(
     source_evidence: dict[str, object],
 ) -> dict[str, object]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        receipt_bytes = path.read_bytes()
+        payload = json.loads(receipt_bytes)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(f"cannot read Fruit runtime qualification: {path}") from exc
+    if receipt_bytes != _canonical_json(payload).encode("utf-8"):
+        raise ValueError("Fruit runtime qualification receipt is not canonical JSON")
     payload = _qualification_object(
         payload,
         name="root",
@@ -840,6 +1119,7 @@ def _validate_runtime_qualification(
             "decode",
             "generation",
             "fidelity",
+            "runtime_paths",
         },
     )
     if (
@@ -857,12 +1137,14 @@ def _validate_runtime_qualification(
         keys={"variant", "repository"},
     )
     if measured_publication != {
-        "variant": variant,
+        "variant": "instruct",
         "repository": publication.repository,
     }:
         raise ValueError(
             "Fruit runtime qualification publication does not match this build"
         )
+    if variant != "instruct":
+        raise ValueError("only the Instruct Fruit publication may be qualified")
     if payload["producer"] != producer:
         raise ValueError(
             "Fruit runtime qualification producer does not match this build"
@@ -873,8 +1155,22 @@ def _validate_runtime_qualification(
     candidate = _qualification_object(
         payload["candidate"],
         name="candidate",
-        keys={"model_index_sha256", "safetensors_sha256"},
+        keys={
+            "marker_sha256",
+            "model_index_sha256",
+            "safetensors_sha256",
+        },
     )
+    measured_candidate_marker = _qualification_digest(
+        candidate["marker_sha256"], name="candidate.marker_sha256"
+    )
+    candidate_marker_path = output / _CANDIDATE_MARKER_NAME
+    if not candidate_marker_path.is_file() or measured_candidate_marker != _sha256(
+        candidate_marker_path
+    ):
+        raise ValueError(
+            "Fruit runtime qualification candidate marker does not match output"
+        )
     measured_index = _qualification_digest(
         candidate["model_index_sha256"], name="candidate.model_index_sha256"
     )
@@ -937,6 +1233,13 @@ def _validate_runtime_qualification(
             model["safetensors_sha256"],
             name=f"models.{arm}.safetensors_sha256",
         )
+    if variant == "instruct":
+        for arm, expected_identity in _INSTRUCT_COMPARATOR_MODELS.items():
+            if models[arm] != expected_identity:
+                raise ValueError(
+                    f"Fruit runtime qualification {arm.upper()} comparator "
+                    "identity is not the pinned Instruct checkpoint"
+                )
     qsrt_model = models["qsrt"]
     if (
         qsrt_model["repository"] != publication.repository
@@ -1007,6 +1310,7 @@ def _validate_runtime_qualification(
     producer_encoder = producer.get("encoder")
     if not isinstance(producer_runtime, dict) or not isinstance(producer_encoder, dict):
         raise TypeError("Fruit runtime qualification producer identity is malformed")
+    normalized_runtime_argv: tuple[str, ...] | None = None
     for arm in _RUNTIME_ARMS:
         loader = _qualification_object(
             loaders[arm],
@@ -1099,13 +1403,27 @@ def _validate_runtime_qualification(
             runtime["compilation_backend"],
             name=f"loaders.{arm}.runtime.compilation_backend",
         )
-        if compilation_backend not in {"eager", "inductor"}:
+        if (
+            compilation_backend != "inductor"
+            or runtime["cudagraph_mode"] != "FULL_AND_PIECEWISE"
+        ):
             raise ValueError(
-                f"Fruit runtime qualification loaders.{arm} backend is invalid"
+                f"Fruit runtime qualification loaders.{arm} must use "
+                "inductor FULL_AND_PIECEWISE"
             )
-        if runtime["cudagraph_mode"] not in {"NONE", "FULL_AND_PIECEWISE"}:
+        measured_runtime_argv = _validate_runtime_argv(
+            argv,
+            arm=arm,
+            protocol=protocol,
+            compilation_backend=compilation_backend,
+            cudagraph_mode=runtime["cudagraph_mode"],
+        )
+        if normalized_runtime_argv is None:
+            normalized_runtime_argv = measured_runtime_argv
+        elif measured_runtime_argv != normalized_runtime_argv:
             raise ValueError(
-                f"Fruit runtime qualification loaders.{arm} cudagraph mode is invalid"
+                "Fruit runtime qualification arms do not use the same fixed "
+                "launcher contract"
             )
         _qualification_string(loader["log_line"], name=f"loaders.{arm}.log_line")
         for key in (
@@ -1122,15 +1440,17 @@ def _validate_runtime_qualification(
                 raise ValueError(
                     f"Fruit runtime qualification loaders.{arm}.{key} is invalid"
                 )
-        if loader["weight_bytes"] <= 0:
-            raise ValueError(
-                f"Fruit runtime qualification loaders.{arm}.weight_bytes is invalid"
-            )
+        for key in ("weight_bytes", "cudagraph_bytes", "kv_cache_bytes"):
+            if loader[key] <= 0:
+                raise ValueError(
+                    f"Fruit runtime qualification loaders.{arm}.{key} must be positive"
+                )
         _qualification_number(
             loader["load_seconds"],
             name=f"loaders.{arm}.load_seconds",
             positive=True,
         )
+    _validate_runtime_paths(payload["runtime_paths"])
 
     decode = _qualification_object(
         payload["decode"], name="decode", keys=set(_RUNTIME_ARMS)
@@ -1370,12 +1690,7 @@ def _validate_runtime_qualification(
     return payload
 
 
-def _runtime_qualification_section(payload: dict[str, object] | None) -> str:
-    if payload is None:
-        return (
-            "## Runtime and quality qualification\n\n"
-            "No package-specific runtime or quality benchmark is sealed."
-        )
+def _runtime_qualification_section(payload: dict[str, object]) -> str:
     protocol = payload["protocol"]
     loaders = payload["loaders"]
     decode = payload["decode"]
@@ -1446,7 +1761,7 @@ def _render_model_card(
     rate_sweep: dict[str, object],
     layers: dict[str, dict[str, object]],
     publication: FruitPublicationSpec,
-    runtime_qualification: dict[str, object] | None = None,
+    runtime_qualification: dict[str, object],
 ) -> str:
     format_counts: Counter[str] = Counter()
     elapsed_seconds = 0.0
@@ -1855,7 +2170,7 @@ def _validate_part(
             f"malformed Fruit QSRT part manifest: {manifest_path}"
         ) from exc
     if not isinstance(value, dict):
-        raise ValueError(f"malformed Fruit QSRT part manifest: {manifest_path}")
+        raise TypeError(f"malformed Fruit QSRT part manifest: {manifest_path}")
     manifest_format = value.get("format")
     if (
         not isinstance(manifest_format, dict)
@@ -2069,7 +2384,7 @@ def _parts_need_encoder(
 def _validate_source_evidence(
     value: object,
     *,
-    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
+    spec: FruitModelSpec = FRUIT_INSTRUCT_SPEC,
 ) -> dict[str, object]:
     if not isinstance(value, dict):
         raise TypeError("sealed Fruit source evidence must be a JSON object")
@@ -2121,7 +2436,7 @@ def _write_source_evidence_seal(
     source_evidence: dict[str, object],
     producer: dict[str, object],
     *,
-    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
+    spec: FruitModelSpec = FRUIT_INSTRUCT_SPEC,
 ) -> None:
     source_evidence = _validate_source_evidence(source_evidence, spec=spec)
     encoder = producer.get("encoder")
@@ -2148,7 +2463,7 @@ def _read_source_evidence_seal(
     root: Path | None,
     producer: dict[str, object],
     *,
-    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
+    spec: FruitModelSpec = FRUIT_INSTRUCT_SPEC,
 ) -> dict[str, object] | None:
     if root is None:
         return None
@@ -2456,7 +2771,7 @@ def _assemble_layers(
 def _authenticate_base_model(
     base_model: Path,
     *,
-    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
+    spec: FruitModelSpec = FRUIT_INSTRUCT_SPEC,
 ) -> dict[str, object]:
     manifest_path = base_model / "MANIFEST.sha256"
     if not manifest_path.is_file():
@@ -2852,7 +3167,11 @@ def _package_files(
             raise ValueError(f"unexpected Fruit package path: {path}")
         if path.stat().st_nlink != 1:
             raise ValueError(f"Fruit package file must not be hard-linked: {path}")
-        if path.name not in {"MANIFEST.sha256", _COMPLETE_MARKER_NAME}:
+        if path.name not in {
+            "MANIFEST.sha256",
+            _COMPLETE_MARKER_NAME,
+            _CANDIDATE_MARKER_NAME,
+        }:
             files[path.name] = path
     evaluation = output / "evaluation"
     if evaluation.is_dir():
@@ -2877,7 +3196,7 @@ def _package_files(
 def _expected_package_inventory(
     base_provenance: dict[str, object],
     *,
-    runtime_qualification: bool = False,
+    include_runtime_qualification: bool = True,
 ) -> set[str]:
     base_files = base_provenance.get("files")
     if not isinstance(base_files, dict) or any(
@@ -2894,10 +3213,9 @@ def _expected_package_inventory(
             _SOURCE_EVIDENCE_SHA_NAME,
             _CALIBRATION_EVIDENCE_NAME,
             _RATE_SWEEP_NAME,
+            *((_RUNTIME_QUALIFICATION_NAME,) if include_runtime_qualification else ()),
         }
     )
-    if runtime_qualification:
-        expected.add(_RUNTIME_QUALIFICATION_NAME)
     for layer in LAYERS:
         expected.add(f"qsrt-layer-{layer:03d}.json")
         expected.add(f"qsrt-layer-{layer:03d}.safetensors")
@@ -2907,13 +3225,14 @@ def _expected_package_inventory(
 def _validated_package_files(
     output: Path,
     base_provenance: dict[str, object],
-    *,
     allow_part_cache: bool = False,
-    runtime_qualification: bool = False,
+    *,
+    include_runtime_qualification: bool = True,
 ) -> dict[str, Path]:
     files = _package_files(output, allow_part_cache=allow_part_cache)
     expected = _expected_package_inventory(
-        base_provenance, runtime_qualification=runtime_qualification
+        base_provenance,
+        include_runtime_qualification=include_runtime_qualification,
     )
     if set(files) != expected:
         raise ValueError(
@@ -2924,30 +3243,16 @@ def _validated_package_files(
     return files
 
 
-def _write_package_manifests(
+def _manifest_record(
     output: Path,
     *,
     source_evidence: dict[str, object],
     base_provenance: dict[str, object],
     producer: dict[str, object],
-    calibration: FruitCalibrationStore,
-    rate_sweep: dict[str, object],
     layers: dict[str, dict[str, object]],
     publication: FruitPublicationSpec,
-    runtime_qualification: dict[str, object] | None = None,
-) -> None:
-    evaluation = output / "evaluation"
-    if evaluation.exists():
-        shutil.rmtree(evaluation)
-    evaluation.mkdir()
-    rate_sweep_path = output / _RATE_SWEEP_NAME
-    _atomic_text(rate_sweep_path, _canonical_json(rate_sweep))
-    runtime_qualification_path = output / _RUNTIME_QUALIFICATION_NAME
-    if runtime_qualification is not None:
-        _atomic_text(
-            runtime_qualification_path,
-            _canonical_json(runtime_qualification),
-        )
+    runtime_qualification: dict[str, object] | None,
+) -> dict[str, object]:
     manifest_layers = {
         layer: {
             "qsrt_atoms": value["safetensors_file"],
@@ -2958,9 +3263,24 @@ def _write_package_manifests(
         }
         for layer, value in sorted(layers.items(), key=lambda item: int(item[0]))
     }
-    manifest = {
+    evaluation = {
+        "uniform_rate_sweep": {
+            "file": _RATE_SWEEP_NAME,
+            "sha256": _sha256(output / _RATE_SWEEP_NAME),
+        }
+    }
+    if runtime_qualification is not None:
+        evaluation["runtime_qualification"] = {
+            "file": _RUNTIME_QUALIFICATION_NAME,
+            "sha256": _sha256(output / _RUNTIME_QUALIFICATION_NAME),
+        }
+    return {
         "schema": "kquant_qsrt_model_manifest_v1",
         "version": 1,
+        "publication": {
+            "variant": "instruct",
+            "repository": publication.repository,
+        },
         "codec": "QSRT",
         "storage_schema": FRUIT_QSRT_ATOM_SCHEMA,
         "encoding": "qsrt_sqg_e4m3",
@@ -2984,25 +3304,60 @@ def _write_package_manifests(
         "base_model": base_provenance,
         "producer": producer,
         "source": source_evidence,
-        "evaluation": {
-            "uniform_rate_sweep": {
-                "file": _RATE_SWEEP_NAME,
-                "sha256": _sha256(rate_sweep_path),
-            },
-            **(
-                {
-                    "runtime_qualification": {
-                        "file": _RUNTIME_QUALIFICATION_NAME,
-                        "sha256": _sha256(runtime_qualification_path),
-                    }
-                }
-                if runtime_qualification is not None
-                else {}
-            ),
-        },
+        "evaluation": evaluation,
         "layers": manifest_layers,
-        "complete": True,
+        "complete": runtime_qualification is not None,
     }
+
+
+def _write_checksum_manifest(
+    output: Path,
+    base_provenance: dict[str, object],
+    *,
+    include_runtime_qualification: bool,
+) -> None:
+    files = _validated_package_files(
+        output,
+        base_provenance,
+        allow_part_cache=True,
+        include_runtime_qualification=include_runtime_qualification,
+    )
+    entries = [f"{_sha256(path)}  {relative}" for relative, path in files.items()]
+    _atomic_text(output / "MANIFEST.sha256", "\n".join(entries) + "\n")
+
+
+def _write_package_manifests(
+    output: Path,
+    *,
+    source_evidence: dict[str, object],
+    base_provenance: dict[str, object],
+    producer: dict[str, object],
+    calibration: FruitCalibrationStore,
+    rate_sweep: dict[str, object],
+    layers: dict[str, dict[str, object]],
+    publication: FruitPublicationSpec,
+    runtime_qualification: dict[str, object],
+) -> None:
+    evaluation = output / "evaluation"
+    if evaluation.exists():
+        shutil.rmtree(evaluation)
+    evaluation.mkdir()
+    rate_sweep_path = output / _RATE_SWEEP_NAME
+    _atomic_text(rate_sweep_path, _canonical_json(rate_sweep))
+    runtime_qualification_path = output / _RUNTIME_QUALIFICATION_NAME
+    _atomic_text(
+        runtime_qualification_path,
+        _canonical_json(runtime_qualification),
+    )
+    manifest = _manifest_record(
+        output,
+        source_evidence=source_evidence,
+        base_provenance=base_provenance,
+        producer=producer,
+        layers=layers,
+        publication=publication,
+        runtime_qualification=runtime_qualification,
+    )
     _atomic_text(output / "qsrt-manifest.json", _canonical_json(manifest))
     _atomic_text(
         output / "README.md",
@@ -3016,14 +3371,141 @@ def _write_package_manifests(
             runtime_qualification=runtime_qualification,
         ),
     )
-    files = _validated_package_files(
+    _write_checksum_manifest(
         output,
         base_provenance,
-        allow_part_cache=True,
-        runtime_qualification=runtime_qualification is not None,
+        include_runtime_qualification=True,
     )
-    entries = [f"{_sha256(path)}  {relative}" for relative, path in files.items()]
-    _atomic_text(output / "MANIFEST.sha256", "\n".join(entries) + "\n")
+
+
+def _candidate_record(
+    output: Path,
+    *,
+    source_evidence: dict[str, object],
+    base_provenance: dict[str, object],
+    producer: dict[str, object],
+    publication: FruitPublicationSpec,
+) -> dict[str, object]:
+    return {
+        "schema": "kquant_qsrt_candidate_v1",
+        "publication": {
+            "variant": "instruct",
+            "repository": publication.repository,
+        },
+        "package_manifest_sha256": _sha256(output / "qsrt-manifest.json"),
+        "checksum_manifest_sha256": _sha256(output / "MANIFEST.sha256"),
+        "model_index_sha256": _sha256(output / "model.safetensors.index.json"),
+        "source": {
+            "kind": source_evidence["source_kind"],
+            "sha256": source_evidence["source_sha256"],
+        },
+        "base_manifest_sha256": base_provenance["manifest_sha256"],
+        "producer_fingerprint": producer["fingerprint"],
+        "encoder_fingerprint": producer["encoder"]["fingerprint"],
+    }
+
+
+def _write_candidate_package(
+    output: Path,
+    *,
+    source_evidence: dict[str, object],
+    base_provenance: dict[str, object],
+    producer: dict[str, object],
+    rate_sweep: dict[str, object],
+    layers: dict[str, dict[str, object]],
+    publication: FruitPublicationSpec,
+) -> None:
+    (output / _COMPLETE_MARKER_NAME).unlink(missing_ok=True)
+    evaluation = output / "evaluation"
+    if evaluation.exists():
+        shutil.rmtree(evaluation)
+    evaluation.mkdir()
+    _atomic_text(output / _RATE_SWEEP_NAME, _canonical_json(rate_sweep))
+    manifest = _manifest_record(
+        output,
+        source_evidence=source_evidence,
+        base_provenance=base_provenance,
+        producer=producer,
+        layers=layers,
+        publication=publication,
+        runtime_qualification=None,
+    )
+    _atomic_text(output / "qsrt-manifest.json", _canonical_json(manifest))
+    _atomic_text(
+        output / "README.md",
+        "# Fruit QSRT qualification candidate\n\n"
+        "This package is not a production publication. It may be launched only "
+        "by the qualification workflow with an independently supplied "
+        "`QSRT_CANDIDATE.json` digest.\n",
+    )
+    _write_checksum_manifest(
+        output,
+        base_provenance,
+        include_runtime_qualification=False,
+    )
+    _atomic_text(
+        output / _CANDIDATE_MARKER_NAME,
+        _canonical_json(
+            _candidate_record(
+                output,
+                source_evidence=source_evidence,
+                base_provenance=base_provenance,
+                producer=producer,
+                publication=publication,
+            )
+        ),
+    )
+
+
+def _validate_candidate_package(
+    output: Path,
+    *,
+    source_evidence: dict[str, object],
+    base_provenance: dict[str, object],
+    producer: dict[str, object],
+    rate_sweep: dict[str, object],
+    layers: dict[str, dict[str, object]],
+    publication: FruitPublicationSpec,
+    allow_part_cache: bool,
+) -> None:
+    marker_path = output / _CANDIDATE_MARKER_NAME
+    marker_bytes = marker_path.read_bytes()
+    marker = json.loads(marker_bytes)
+    if marker_bytes != _canonical_json(marker).encode("utf-8"):
+        raise ValueError("Fruit QSRT candidate marker is not canonical JSON")
+    if marker != _candidate_record(
+        output,
+        source_evidence=source_evidence,
+        base_provenance=base_provenance,
+        producer=producer,
+        publication=publication,
+    ):
+        raise ValueError("Fruit QSRT candidate marker mismatch")
+    manifest = json.loads((output / "qsrt-manifest.json").read_text(encoding="utf-8"))
+    expected_manifest = _manifest_record(
+        output,
+        source_evidence=source_evidence,
+        base_provenance=base_provenance,
+        producer=producer,
+        layers=layers,
+        publication=publication,
+        runtime_qualification=None,
+    )
+    if manifest != expected_manifest:
+        raise ValueError("Fruit QSRT candidate package identity mismatch")
+    if (output / _COMPLETE_MARKER_NAME).exists():
+        raise ValueError("Fruit QSRT candidate contains a production marker")
+    sealed_rate_sweep = json.loads(
+        (output / _RATE_SWEEP_NAME).read_text(encoding="utf-8")
+    )
+    if sealed_rate_sweep != rate_sweep:
+        raise ValueError("Fruit QSRT candidate and sealed rate sweep disagree")
+    _validate_checksum_manifest(
+        output,
+        base_provenance,
+        allow_part_cache=allow_part_cache,
+        include_runtime_qualification=False,
+    )
 
 
 def _completion_record(
@@ -3032,9 +3514,19 @@ def _completion_record(
     source_evidence: dict[str, object],
     base_provenance: dict[str, object],
     producer: dict[str, object],
+    runtime_qualification: dict[str, object],
 ) -> dict[str, object]:
+    candidate = runtime_qualification["candidate"]
+    if not isinstance(candidate, dict):
+        raise TypeError("Fruit runtime qualification candidate is malformed")
     return {
-        "schema": "kquant_qsrt_complete_v2",
+        "schema": "kquant_qsrt_complete_v3",
+        "publication": {
+            "variant": "instruct",
+            "repository": fruit_publication_spec("instruct").repository,
+        },
+        "qualified_candidate_sha256": candidate["marker_sha256"],
+        "runtime_qualification_sha256": _sha256(output / _RUNTIME_QUALIFICATION_NAME),
         "package_manifest_sha256": _sha256(output / "qsrt-manifest.json"),
         "checksum_manifest_sha256": _sha256(output / "MANIFEST.sha256"),
         "model_index_sha256": _sha256(output / "model.safetensors.index.json"),
@@ -3053,7 +3545,7 @@ def _validate_checksum_manifest(
     base_provenance: dict[str, object],
     *,
     allow_part_cache: bool,
-    runtime_qualification: bool = False,
+    include_runtime_qualification: bool = True,
 ) -> None:
     manifest_path = output / "MANIFEST.sha256"
     entries: dict[str, str] = {}
@@ -3077,7 +3569,7 @@ def _validate_checksum_manifest(
             output,
             base_provenance,
             allow_part_cache=allow_part_cache,
-            runtime_qualification=runtime_qualification,
+            include_runtime_qualification=include_runtime_qualification,
         )
     )
     if set(entries) != expected_files:
@@ -3099,8 +3591,8 @@ def _validate_output_package(
     producer: dict[str, object],
     rate_sweep: dict[str, object],
     require_complete: bool,
-    runtime_qualification: dict[str, object] | None = None,
-    spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
+    runtime_qualification: dict[str, object],
+    spec: FruitModelSpec = FRUIT_INSTRUCT_SPEC,
 ) -> None:
     manifest_path = output / "qsrt-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -3109,6 +3601,10 @@ def _validate_output_package(
     expected_identity = {
         "schema": "kquant_qsrt_model_manifest_v1",
         "version": 1,
+        "publication": {
+            "variant": "instruct",
+            "repository": fruit_publication_spec("instruct").repository,
+        },
         "codec": "QSRT",
         "storage_schema": FRUIT_QSRT_ATOM_SCHEMA,
         "encoding": "qsrt_sqg_e4m3",
@@ -3137,18 +3633,12 @@ def _validate_output_package(
                 "file": _RATE_SWEEP_NAME,
                 "sha256": _sha256(output / _RATE_SWEEP_NAME),
             },
-            **(
-                {
-                    "runtime_qualification": {
-                        "file": _RUNTIME_QUALIFICATION_NAME,
-                        "sha256": hashlib.sha256(
-                            _canonical_json(runtime_qualification).encode("utf-8")
-                        ).hexdigest(),
-                    }
-                }
-                if runtime_qualification is not None
-                else {}
-            ),
+            "runtime_qualification": {
+                "file": _RUNTIME_QUALIFICATION_NAME,
+                "sha256": hashlib.sha256(
+                    _canonical_json(runtime_qualification).encode("utf-8")
+                ).hexdigest(),
+            },
         },
         "complete": True,
     }
@@ -3162,8 +3652,7 @@ def _validate_output_package(
     )
     if sealed_rate_sweep != rate_sweep:
         raise ValueError("Fruit QSRT package and sealed rate sweep disagree")
-    if runtime_qualification is not None:
-        _validate_sealed_runtime_qualification(output, runtime_qualification)
+    _validate_sealed_runtime_qualification(output, runtime_qualification)
     config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     quantization = config.get("quantization_config")
     if not isinstance(quantization, dict):
@@ -3234,7 +3723,6 @@ def _validate_output_package(
         output,
         base_provenance,
         allow_part_cache=not require_complete,
-        runtime_qualification=runtime_qualification is not None,
     )
     marker_path = output / _COMPLETE_MARKER_NAME
     if require_complete:
@@ -3244,8 +3732,13 @@ def _validate_output_package(
             source_evidence=source_evidence,
             base_provenance=base_provenance,
             producer=producer,
+            runtime_qualification=runtime_qualification,
         ):
             raise ValueError("Fruit QSRT completion marker mismatch")
+        if (output / _CANDIDATE_MARKER_NAME).exists():
+            raise ValueError(
+                "Fruit QSRT production package contains a candidate marker"
+            )
     elif marker_path.exists():
         raise ValueError("Fruit QSRT completion marker exists before final validation")
 
@@ -3256,7 +3749,9 @@ def _write_complete_marker(
     source_evidence: dict[str, object],
     base_provenance: dict[str, object],
     producer: dict[str, object],
+    runtime_qualification: dict[str, object],
 ) -> None:
+    _validate_sealed_runtime_qualification(output, runtime_qualification)
     _atomic_text(
         output / _COMPLETE_MARKER_NAME,
         _canonical_json(
@@ -3265,6 +3760,7 @@ def _write_complete_marker(
                 source_evidence=source_evidence,
                 base_provenance=base_provenance,
                 producer=producer,
+                runtime_qualification=runtime_qualification,
             )
         ),
     )
@@ -3274,17 +3770,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_model", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument(
-        "--variant",
-        choices=tuple(FRUIT_CALIBRATION_AUTHORITIES),
-        default="annealed",
-    )
+    parser.add_argument("--variant", choices=("instruct",), default="instruct")
+    stage = parser.add_mutually_exclusive_group(required=True)
+    stage.add_argument("--candidate-only", action="store_true")
+    stage.add_argument("--runtime-qualification", type=Path)
     parser.add_argument("--exllamav3-root", required=True, type=Path)
     parser.add_argument("--b12x-root", required=True, type=Path)
     parser.add_argument("--vllm-root", required=True, type=Path)
     parser.add_argument("--calibration", required=True, type=Path)
     parser.add_argument("--rate-sweep", required=True, type=Path)
-    parser.add_argument("--runtime-qualification", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed-cache", type=Path)
     return parser.parse_args()
@@ -3336,12 +3830,38 @@ def main() -> None:
     print("authenticating pinned Fruit BF16 base model", flush=True)
     if spec.safetensors_manifest_sha256 is None:
         raise ValueError("Fruit variant has no pinned Safetensors source")
-    base_provenance = _authenticate_base_model(args.base_model, spec=spec)
     store = FruitSafetensorsStore(
         args.base_model,
         spec=spec,
         expected_manifest_sha256=spec.safetensors_manifest_sha256,
     )
+    try:
+        _build_from_snapshot(
+            args=args,
+            spec=spec,
+            publication=publication,
+            device=device,
+            calibration=calibration,
+            producer=producer,
+            encoder_fingerprint=encoder_fingerprint,
+            store=store,
+        )
+    finally:
+        store.close()
+
+
+def _build_from_snapshot(
+    *,
+    args: argparse.Namespace,
+    spec: FruitModelSpec,
+    publication: FruitPublicationSpec,
+    device: torch.device,
+    calibration: FruitCalibrationStore,
+    producer: dict[str, object],
+    encoder_fingerprint: str,
+    store: FruitSafetensorsStore,
+) -> None:
+    base_provenance = _authenticate_base_model(store.path, spec=spec)
     source_evidence = _validate_source_evidence(store.evidence, spec=spec)
     if source_evidence.get("source_kind") != "safetensors_manifest":
         raise ValueError(
@@ -3397,9 +3917,9 @@ def main() -> None:
         source_sha256=source_sha256,
         encoder_fingerprint=encoder_fingerprint,
     )
-    _materialize_base_model(args.base_model, args.output, base_provenance)
+    _materialize_base_model(store.path, args.output, base_provenance)
     _write_config(
-        args.base_model,
+        store.path,
         args.output,
         producer,
         source_evidence,
@@ -3419,17 +3939,55 @@ def main() -> None:
         vllm_root=args.vllm_root,
         calibration=calibration,
     )
-    runtime_qualification = (
-        _validate_runtime_qualification(
-            args.runtime_qualification,
-            output=args.output,
-            variant=args.variant,
-            publication=publication,
-            producer=producer,
+    if args.candidate_only:
+        _write_candidate_package(
+            args.output,
             source_evidence=source_evidence,
+            base_provenance=base_provenance,
+            producer=producer,
+            rate_sweep=rate_sweep,
+            layers=layers,
+            publication=publication,
         )
-        if args.runtime_qualification is not None
-        else None
+        staged_cache = _stage_part_cache(args.output)
+        try:
+            _validate_candidate_package(
+                args.output,
+                source_evidence=source_evidence,
+                base_provenance=base_provenance,
+                producer=producer,
+                rate_sweep=rate_sweep,
+                layers=layers,
+                publication=publication,
+                allow_part_cache=False,
+            )
+        except BaseException:
+            (args.output / _CANDIDATE_MARKER_NAME).unlink(missing_ok=True)
+            _restore_staged_part_cache(args.output, staged_cache)
+            raise
+        print(
+            f"sealed Fruit QSRT qualification candidate: {args.output}",
+            flush=True,
+        )
+        return
+
+    _validate_candidate_package(
+        args.output,
+        source_evidence=source_evidence,
+        base_provenance=base_provenance,
+        producer=producer,
+        rate_sweep=rate_sweep,
+        layers=layers,
+        publication=publication,
+        allow_part_cache=True,
+    )
+    runtime_qualification = _validate_runtime_qualification(
+        args.runtime_qualification,
+        output=args.output,
+        variant=args.variant,
+        publication=publication,
+        producer=producer,
+        source_evidence=source_evidence,
     )
     _write_package_manifests(
         args.output,
@@ -3453,12 +4011,16 @@ def main() -> None:
         spec=spec,
     )
     staged_cache = _stage_part_cache(args.output)
+    candidate_marker_path = args.output / _CANDIDATE_MARKER_NAME
+    candidate_marker_bytes = candidate_marker_path.read_bytes()
+    candidate_marker_path.unlink()
     try:
         _write_complete_marker(
             args.output,
             source_evidence=source_evidence,
             base_provenance=base_provenance,
             producer=producer,
+            runtime_qualification=runtime_qualification,
         )
         _validate_output_package(
             args.output,
@@ -3472,6 +4034,7 @@ def main() -> None:
         )
     except BaseException:
         (args.output / _COMPLETE_MARKER_NAME).unlink(missing_ok=True)
+        _atomic_text(candidate_marker_path, candidate_marker_bytes.decode("utf-8"))
         _restore_staged_part_cache(args.output, staged_cache)
         raise
     _discard_staged_part_cache(staged_cache)
