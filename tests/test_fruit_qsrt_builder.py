@@ -38,9 +38,60 @@ def _commit_test_checkout(root: Path) -> str:
     ).stdout.strip()
 
 
+def test_tracked_worktree_sha256_is_deterministic_for_clean_checkout(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "package" / "codec.py"
+    source.parent.mkdir()
+    source.write_text("CODEBOOK = 1\n", encoding="utf-8")
+    executable = tmp_path / "build.sh"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    _commit_test_checkout(tmp_path)
+
+    first = builder.tracked_worktree_sha256(tmp_path)
+    second = builder.tracked_worktree_sha256(tmp_path)
+
+    assert first == second
+    assert len(first) == 64
+    assert all(character in "0123456789abcdef" for character in first)
+
+
+def test_tracked_worktree_sha256_rejects_hidden_assume_unchanged_file(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "package" / "codec.py"
+    source.parent.mkdir()
+    source.write_text("CODEBOOK = 1\n", encoding="utf-8")
+    _commit_test_checkout(tmp_path)
+    subprocess.run(
+        ("git", "update-index", "--assume-unchanged", "--", "package/codec.py"),
+        cwd=tmp_path,
+        check=True,
+    )
+    source.write_text("CODEBOOK = 2\n", encoding="utf-8")
+    status = subprocess.run(
+        ("git", "status", "--porcelain=v1"),
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+    with pytest.raises(ValueError, match="assume-unchanged"):
+        builder.tracked_worktree_sha256(tmp_path)
+
+
 def test_current_encoder_provenance_requires_committed_source(
     monkeypatch, tmp_path: Path
 ) -> None:
+    kquant_root = tmp_path / "kquant-root"
+    kquant_source = kquant_root / "kquant" / "codec.py"
+    kquant_source.parent.mkdir(parents=True)
+    kquant_source.write_text("CODEBOOK = 1\n", encoding="utf-8")
+    _commit_test_checkout(kquant_root)
+    monkeypatch.setattr(builder, "_KQUANT_IMPORT_IDENTITY", None)
     exllamav3_root = tmp_path / "exllamav3-root"
     package = exllamav3_root / "exllamav3"
     package.mkdir(parents=True)
@@ -57,6 +108,7 @@ def test_current_encoder_provenance_requires_committed_source(
     before = builder.current_encoder_provenance(
         exllamav3_root=exllamav3_root,
         calibration=calibration,
+        kquant_root=kquant_root,
     )
     source.write_text("CODEBOOK = 2\n", encoding="utf-8")
 
@@ -64,6 +116,7 @@ def test_current_encoder_provenance_requires_committed_source(
         builder.current_encoder_provenance(
             exllamav3_root=exllamav3_root,
             calibration=calibration,
+            kquant_root=kquant_root,
         )
     assert before["exllamav3_revision"] == revision
 
@@ -225,6 +278,7 @@ def test_model_card_uses_sealed_calibration_and_layer_evidence(monkeypatch) -> N
     assert "2.000 GiB peak CUDA allocation" in card
     assert "Adjacent-rate evidence" in card
     assert "1 of 1 predeclared assignments" in card
+    assert "No package-specific runtime or quality benchmark is sealed." in card
     assert "__" not in card
 
 
@@ -235,8 +289,332 @@ def test_instruct_publication_uses_variant_specific_repositories() -> None:
     assert "GLM-5.2-SIQ-Fruit-Instruct/tree/48452ef3" in publication.fruit_audit_rows
     assert "GLM-5.2-QSRT-Fruit/tree/c1a0c62d" not in publication.fruit_audit_rows
     assert "Not assistant-quality" in publication.quality_limitations
-    assert "instead of `126`" in publication.quality_limitations
-    assert "63.54 tokens/s for QSRT" in publication.quality_limitations
+    assert "four-prompt" not in publication.quality_limitations
+    assert "63.54" not in publication.quality_limitations
+
+
+def _runtime_qualification_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, dict[str, object], dict[str, object], dict[str, object]]:
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "config.json").write_text("{}\n", encoding="utf-8")
+    (output / "model.safetensors.index.json").write_text("{}\n", encoding="utf-8")
+    (output / "model.safetensors").write_bytes(b"candidate tensors")
+    revisions = {
+        "vllm_revision": "1" * 40,
+        "b12x_revision": "2" * 40,
+        "kquant_revision": "3" * 40,
+    }
+    producer = {
+        "schema": "kquant_fruit_qsrt_producer_v1",
+        "encoder": {
+            "fingerprint": "a" * 64,
+            "kquant_revision": revisions["kquant_revision"],
+        },
+        "runtime": {
+            "fingerprint": "b" * 64,
+            "vllm_revision": revisions["vllm_revision"],
+            "b12x_revision": revisions["b12x_revision"],
+        },
+        "fingerprint": "c" * 64,
+    }
+    source = {
+        "source_kind": "safetensors_manifest",
+        "source_sha256": "d" * 64,
+        "source_repository": "owner/instruct-source",
+        "source_revision": "e" * 40,
+    }
+
+    def loader(arm: str) -> dict[str, object]:
+        return {
+            "runtime": {
+                "image": f"registry.invalid/{arm}@sha256:{'f' * 64}",
+                **revisions,
+                "argv": ["vllm", "serve", "--tensor-parallel-size", "1"],
+                "environment": {"CUDA_VISIBLE_DEVICES": "0"},
+                "software": {"cuda": "13.2.1", "torch": "2.12.0"},
+                "compilation_backend": "inductor" if arm == "qsrt" else "eager",
+                "cudagraph_mode": ("FULL_AND_PIECEWISE" if arm == "qsrt" else "NONE"),
+            },
+            "log_line": f"{arm} parsed loader statistics",
+            "weight_bytes": 1 << 30,
+            "peak_activation_bytes": 2 << 30,
+            "non_torch_bytes": 3 << 30,
+            "cudagraph_bytes": 4 << 20,
+            "kv_cache_bytes": 5 << 20,
+            "torch_allocated_bytes": 6 << 20,
+            "torch_reserved_bytes": 7 << 20,
+            "nvml_used_bytes": 8 << 20,
+            "load_seconds": 4.0,
+        }
+
+    def runs(rate: float) -> list[dict[str, object]]:
+        return [
+            {
+                "prompt_id": "decode-prompt",
+                "repetition": repetition,
+                "http_status": 200,
+                "elapsed_seconds": 8.0 / rate,
+                "completion_tokens": 8,
+                "tokens_per_second": rate,
+                "finish_reason": "length",
+                "content": f"completion {repetition}",
+            }
+            for repetition in (1, 2, 3)
+        ]
+
+    def fidelity(mean: float) -> dict[str, object]:
+        first = mean / 2
+        second = mean * 1.5
+        return {
+            "mean_forward_kl": mean,
+            "max_forward_kl": second,
+            "top1_agreement": 0.5,
+            "top10_agreement": 1.0,
+            "per_position": [
+                {
+                    "position": 0,
+                    "forward_kl": first,
+                    "top1_agreement": True,
+                    "top10_agreement": True,
+                },
+                {
+                    "position": 1,
+                    "forward_kl": second,
+                    "top1_agreement": False,
+                    "top10_agreement": True,
+                },
+            ],
+        }
+
+    prompts = [
+        {"id": "generation-1", "prompt": "First prompt", "prompt_token_ids": [1, 2]},
+        {"id": "generation-2", "prompt": "Second prompt", "prompt_token_ids": [3, 4]},
+    ]
+    tensors = {"model.safetensors": builder._sha256(output / "model.safetensors")}
+    tensor_set_sha256 = hashlib.sha256(
+        builder._canonical_json(tensors).encode("utf-8")
+    ).hexdigest()
+    index_sha256 = builder._sha256(output / "model.safetensors.index.json")
+    config_sha256 = builder._sha256(output / "config.json")
+
+    def model(arm: str) -> dict[str, object]:
+        return {
+            "repository": (
+                builder.fruit_publication_spec("instruct").repository
+                if arm == "qsrt"
+                else f"owner/{arm}"
+            ),
+            "revision": "4" * 40,
+            "manifest_sha256": "5" * 64,
+            "config_sha256": config_sha256 if arm == "qsrt" else "6" * 64,
+            "model_index_sha256": index_sha256 if arm == "qsrt" else "7" * 64,
+            "safetensors_bytes": (output / "model.safetensors").stat().st_size,
+            "safetensors_sha256": (tensor_set_sha256 if arm == "qsrt" else "8" * 64),
+        }
+
+    payload: dict[str, object] = {
+        "schema": builder._RUNTIME_QUALIFICATION_SCHEMA,
+        "version": 1,
+        "complete": True,
+        "publication": {
+            "variant": "instruct",
+            "repository": builder.fruit_publication_spec("instruct").repository,
+        },
+        "producer": producer,
+        "source": source,
+        "candidate": {
+            "model_index_sha256": index_sha256,
+            "safetensors_sha256": tensors,
+        },
+        "models": {arm: model(arm) for arm in ("bf16", "siq", "qsrt")},
+        "environment": {
+            "gpu_model": "RTX test GPU",
+            "gpu_driver": "999.0",
+            "host": "test host",
+        },
+        "protocol": {
+            "tensor_parallel_size": 1,
+            "max_num_seqs": 1,
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "repetitions": 3,
+            "prompt_id": "decode-prompt",
+            "prompt": "Matched decode prompt",
+            "prompt_token_ids": [7, 8, 9],
+            "launch_order": ["bf16", "siq", "qsrt"],
+        },
+        "loaders": {arm: loader(arm) for arm in ("bf16", "siq", "qsrt")},
+        "decode": {
+            "bf16": runs(8.0),
+            "siq": runs(6.0),
+            "qsrt": runs(7.0),
+        },
+        "generation": {
+            "prompts": prompts,
+            "results": {
+                arm: [
+                    {"prompt_id": prompt["id"], "content": f"{arm} output"}
+                    for prompt in prompts
+                ]
+                for arm in ("bf16", "siq", "qsrt")
+            },
+        },
+        "fidelity": {
+            "full_vocabulary": True,
+            "positions": [0, 1],
+            "vocab_size": 128,
+            "candidates": {"siq": fidelity(0.2), "qsrt": fidelity(0.1)},
+        },
+    }
+    path = tmp_path / "runtime-qualification.json"
+    path.write_text(builder._canonical_json(payload), encoding="utf-8")
+    return path, output, payload, producer, source
+
+
+def _validate_runtime_fixture(
+    path: Path,
+    output: Path,
+    producer: dict[str, object],
+    source: dict[str, object],
+) -> dict[str, object]:
+    return builder._validate_runtime_qualification(
+        path,
+        output=output,
+        variant="instruct",
+        publication=builder.fruit_publication_spec("instruct"),
+        producer=producer,
+        source_evidence=source,
+    )
+
+
+def test_runtime_qualification_validates_seals_and_renders(tmp_path: Path) -> None:
+    path, output, payload, producer, source = _runtime_qualification_fixture(tmp_path)
+
+    validated = _validate_runtime_fixture(path, output, producer, source)
+    receipt = output / builder._RUNTIME_QUALIFICATION_NAME
+    receipt.parent.mkdir()
+    receipt.write_text(builder._canonical_json(validated), encoding="utf-8")
+    builder._validate_sealed_runtime_qualification(output, validated)
+    section = builder._runtime_qualification_section(validated)
+
+    assert "client-observed end-to-end generated-token rate" in section
+    assert "legacy SIQ comparator" in section
+    assert (
+        "| QSRT | 7.00 | 0.875x | 1.000 | `inductor` / `FULL_AND_PIECEWISE` |"
+        in section
+    )
+    assert "not identical software" in section
+    assert builder._RUNTIME_QUALIFICATION_NAME in builder._expected_package_inventory(
+        {"files": {}}, runtime_qualification=True
+    )
+    assert payload == validated
+
+
+def test_runtime_qualification_copy_and_manifests(monkeypatch, tmp_path: Path) -> None:
+    path, output, _, producer, source = _runtime_qualification_fixture(tmp_path)
+    validated = _validate_runtime_fixture(path, output, producer, source)
+    monkeypatch.setattr(
+        builder,
+        "_render_model_card",
+        lambda **_arguments: "sealed card\n",
+    )
+    monkeypatch.setattr(
+        builder,
+        "_validated_package_files",
+        lambda root, _base, **_arguments: builder._package_files(
+            root, allow_part_cache=True
+        ),
+    )
+
+    builder._write_package_manifests(
+        output,
+        source_evidence=source,
+        base_provenance={"files": {}},
+        producer=producer,
+        calibration=SimpleNamespace(),
+        rate_sweep={"sealed": True},
+        layers={},
+        publication=builder.fruit_publication_spec("instruct"),
+        runtime_qualification=validated,
+    )
+
+    receipt = output / builder._RUNTIME_QUALIFICATION_NAME
+    assert receipt.read_text(encoding="utf-8") == builder._canonical_json(validated)
+    manifest = json.loads((output / "qsrt-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["evaluation"]["runtime_qualification"] == {
+        "file": builder._RUNTIME_QUALIFICATION_NAME,
+        "sha256": builder._sha256(receipt),
+    }
+    assert (
+        f"{builder._sha256(receipt)}  {builder._RUNTIME_QUALIFICATION_NAME}"
+        in (output / "MANIFEST.sha256").read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_runtime_qualification_rejects_stale_build_identities(tmp_path: Path) -> None:
+    path, output, payload, producer, source = _runtime_qualification_fixture(tmp_path)
+    mutations = (
+        lambda value: value["producer"].update({"fingerprint": "0" * 64}),
+        lambda value: value["source"].update({"source_sha256": "0" * 64}),
+        lambda value: value["publication"].update({"repository": "owner/stale"}),
+        lambda value: value["candidate"].update({"model_index_sha256": "0" * 64}),
+        lambda value: value["candidate"]["safetensors_sha256"].update(
+            {"model.safetensors": "0" * 64}
+        ),
+        lambda value: value["models"]["siq"].pop("manifest_sha256"),
+        lambda value: value["models"]["bf16"].update(
+            {"model_index_sha256": "not-a-digest"}
+        ),
+        lambda value: value["loaders"]["qsrt"]["runtime"].update(
+            {"vllm_revision": "9" * 40}
+        ),
+    )
+    for mutate in mutations:
+        malformed = json.loads(builder._canonical_json(payload))
+        mutate(malformed)
+        path.write_text(builder._canonical_json(malformed), encoding="utf-8")
+        with pytest.raises((TypeError, ValueError)):
+            _validate_runtime_fixture(path, output, producer, source)
+
+
+def test_runtime_qualification_rejects_run_coverage_and_fidelity_errors(
+    tmp_path: Path,
+) -> None:
+    path, output, payload, producer, source = _runtime_qualification_fixture(tmp_path)
+    malformed_values = []
+    bad_math = json.loads(builder._canonical_json(payload))
+    bad_math["decode"]["qsrt"][0]["tokens_per_second"] = 999.0
+    malformed_values.append(bad_math)
+    bad_coverage = json.loads(builder._canonical_json(payload))
+    bad_coverage["generation"]["results"]["siq"].pop()
+    malformed_values.append(bad_coverage)
+    bad_fidelity = json.loads(builder._canonical_json(payload))
+    bad_fidelity["fidelity"]["candidates"]["qsrt"]["mean_forward_kl"] = 0.9
+    malformed_values.append(bad_fidelity)
+    unknown = json.loads(builder._canonical_json(payload))
+    unknown["summary"] = {}
+    malformed_values.append(unknown)
+
+    for malformed in malformed_values:
+        path.write_text(builder._canonical_json(malformed), encoding="utf-8")
+        with pytest.raises(ValueError):
+            _validate_runtime_fixture(path, output, producer, source)
+
+
+def test_runtime_qualification_rejects_post_copy_mutation(tmp_path: Path) -> None:
+    path, output, payload, producer, source = _runtime_qualification_fixture(tmp_path)
+    validated = _validate_runtime_fixture(path, output, producer, source)
+    receipt = output / builder._RUNTIME_QUALIFICATION_NAME
+    receipt.parent.mkdir()
+    receipt.write_text(
+        builder._canonical_json(validated) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="changed"):
+        builder._validate_sealed_runtime_qualification(output, validated)
 
 
 def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
@@ -468,6 +846,89 @@ def test_materialize_base_model_reauthenticates_index(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="base hash mismatch"):
         builder._materialize_base_model(base_model, output, provenance)
+
+
+def test_seed_parts_rejects_manifest_format_that_disagrees_with_tensor(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(builder, "LAYERS", (3,))
+    monkeypatch.setattr(builder, "EXPERTS", 1)
+    monkeypatch.setattr(builder, "HIDDEN_SIZE", 2)
+    monkeypatch.setattr(builder, "INTERMEDIATE_SIZE", 2)
+    monkeypatch.setattr(builder, "PAIR_COUNT", 2)
+    monkeypatch.setattr(builder, "PAIR_WORDS", 1)
+    seed = tmp_path / "seed"
+    seed_layer = seed / "layer-003"
+    seed_layer.mkdir(parents=True)
+    tensor_path = seed_layer / "expert-000.safetensors"
+    manifest_path = seed_layer / "expert-000.json"
+    torch = builder.torch
+    tensors = {
+        "expert_ids": torch.tensor([0], dtype=torch.int32),
+        "formats": torch.tensor([[1, 2]], dtype=torch.int8),
+        "permutations": torch.tensor([[0, 1]], dtype=torch.int16),
+        "w13_trellis": torch.zeros((2, 1, 2, 1), dtype=torch.int16),
+        "w2_trellis": torch.zeros((1, 2, 1), dtype=torch.int16),
+        "fc1_pair_modes": torch.tensor([[1, 0]], dtype=torch.int32),
+        "fc2_pair_modes": torch.tensor([[1, 1]], dtype=torch.int32),
+        "gate_suh": torch.ones((1, 2), dtype=torch.float16),
+        "up_suh": torch.ones((1, 2), dtype=torch.float16),
+        "intermediate_rotations": torch.ones((1, 6), dtype=torch.float16),
+        "down_svh": torch.ones((1, 2), dtype=torch.float16),
+    }
+    source_sha256 = "a" * 64
+    encoder_fingerprint = "b" * 64
+    builder._atomic_safetensors(
+        tensor_path,
+        tensors,
+        {
+            "schema": builder.FRUIT_QSRT_SCHEMA,
+            "version": "1",
+            "profile_id": str(builder.FRUIT_QSRT_PROFILE_ID),
+            "codebook": builder.FRUIT_QSRT_CODEBOOK,
+            "layer": "3",
+            "expert": "0",
+            "source_sha256": source_sha256,
+            "encoder_fingerprint": encoder_fingerprint,
+        },
+    )
+    manifest = {
+        "schema": builder.FRUIT_QSRT_SCHEMA,
+        "version": 1,
+        "profile_id": builder.FRUIT_QSRT_PROFILE_ID,
+        "codebook": builder.FRUIT_QSRT_CODEBOOK,
+        "layer": 3,
+        "expert": 0,
+        "format": {"r13": 0, "r2": 0},
+        "source_sha256": source_sha256,
+        "encoder_fingerprint": encoder_fingerprint,
+        "safetensors_bytes": tensor_path.stat().st_size,
+        "safetensors_sha256": builder._sha256(tensor_path),
+    }
+    manifest_path.write_text(builder._canonical_json(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="formats disagree with manifest"):
+        builder._validate_part(
+            tensor_path,
+            manifest_path,
+            layer=3,
+            expert=0,
+            source_sha256=source_sha256,
+            encoder_fingerprint=encoder_fingerprint,
+            repair=False,
+        )
+
+    output = tmp_path / "output"
+    assert (
+        builder._seed_parts(
+            output,
+            seed,
+            source_sha256,
+            encoder_fingerprint,
+        )
+        == 0
+    )
+    assert not (output / ".qsrt-parts/layer-003/expert-000.safetensors").exists()
 
 
 def test_seed_parts_validate_source_read_only_before_copy(

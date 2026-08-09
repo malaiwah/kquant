@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import json
 import os
+import stat
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -18,7 +19,6 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.torch_version import TorchVersion
-from transformers import AutoTokenizer
 
 from kquant.candidate_hessian import weighted_covariance
 from kquant.fruit_calibration import (
@@ -432,103 +432,320 @@ def _hf_binding(name: str, spec: FruitModelSpec) -> _HFBinding:
     return _HFBinding(prefix + suffix)
 
 
+def _stable_file_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _open_regular_at(directory_fd: int, name: str) -> tuple[int, tuple[int, ...]]:
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"Fruit BF16 base file cannot be opened safely: {name}"
+        ) from exc
+    try:
+        status = os.fstat(fd)
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(f"Fruit BF16 base entry is not a regular file: {name}")
+        return fd, _stable_file_identity(status)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _hash_open_file(
+    fd: int,
+    name: str,
+    *,
+    capture_bytes: bool,
+) -> tuple[str, bytes | None, tuple[int, ...]]:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"Fruit BF16 base entry is not a regular file: {name}")
+    before_identity = _stable_file_identity(before)
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    captured = bytearray() if capture_bytes else None
+    while chunk := os.read(fd, 1 << 20):
+        digest.update(chunk)
+        if captured is not None:
+            captured.extend(chunk)
+    after = os.fstat(fd)
+    after_identity = _stable_file_identity(after)
+    if after_identity != before_identity:
+        raise ValueError(f"Fruit BF16 base file changed while authenticating: {name}")
+    os.lseek(fd, 0, os.SEEK_SET)
+    return (
+        digest.hexdigest(),
+        bytes(captured) if captured is not None else None,
+        after_identity,
+    )
+
+
+@dataclass
+class _AuthenticatedBf16Base:
+    source_evidence: dict[str, object]
+    weight_map: dict[str, str]
+    _shard_fds: dict[str, int]
+    _shard_identities: dict[str, tuple[int, ...]]
+
+    def shard_path(self, name: str) -> str:
+        self.assert_shard_stable(name)
+        return f"/proc/self/fd/{self._shard_fds[name]}"
+
+    def assert_shard_stable(
+        self,
+        name: str,
+        *,
+        expected_identity: tuple[int, ...] | None = None,
+    ) -> tuple[int, ...]:
+        if name not in self._shard_fds:
+            raise ValueError(f"Fruit BF16 shard is not authenticated: {name}")
+        try:
+            status = os.fstat(self._shard_fds[name])
+        except OSError as exc:
+            raise RuntimeError(
+                f"Fruit BF16 shard descriptor is closed: {name}"
+            ) from exc
+        identity = _stable_file_identity(status)
+        authenticated_identity = self._shard_identities[name]
+        same_authenticated_content = (
+            identity[:3] == authenticated_identity[:3]
+            and identity[4:6] == authenticated_identity[4:6]
+        )
+        changed_without_unlink = (
+            identity[6] != authenticated_identity[6]
+            and identity[3] >= authenticated_identity[3]
+        )
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or (expected_identity is not None and identity != expected_identity)
+            or (
+                expected_identity is None
+                and (not same_authenticated_content or changed_without_unlink)
+            )
+        ):
+            raise ValueError(f"Fruit BF16 shard changed after authentication: {name}")
+        return identity
+
+    def close(self) -> None:
+        shard_fds, self._shard_fds = self._shard_fds, {}
+        first_error: OSError | None = None
+        for fd in shard_fds.values():
+            try:
+                os.close(fd)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def __enter__(self) -> _AuthenticatedBf16Base:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
 def _authenticate_bf16_base(
     root: Path,
     authority: FruitCalibrationAuthority,
-) -> tuple[dict[str, object], dict[str, str]]:
-    if not root.is_dir() or root.is_symlink():
-        raise ValueError("Fruit BF16 base must be a real directory")
-    manifest_path = root / "MANIFEST.sha256"
-    if not manifest_path.is_file() or manifest_path.is_symlink():
-        raise FileNotFoundError(manifest_path)
-    manifest_bytes = manifest_path.read_bytes()
-    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-    if manifest_sha256 != authority.spec.safetensors_manifest_sha256:
-        raise ValueError("Fruit BF16 base MANIFEST.sha256 identity mismatch")
-    entries: dict[str, str] = {}
+) -> _AuthenticatedBf16Base:
+    if not sys.platform.startswith("linux") or not Path("/proc/self/fd").is_dir():
+        raise RuntimeError(
+            "Fruit BF16 calibration authentication requires Linux /proc/self/fd"
+        )
+    shard_fds: dict[str, int] = {}
     try:
-        manifest_text = manifest_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Fruit BF16 base MANIFEST.sha256 is not UTF-8") from exc
-    for line in manifest_text.splitlines():
-        fields = line.split()
+        try:
+            directory_fd = os.open(
+                root,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+        except OSError as exc:
+            raise ValueError("Fruit BF16 base must be a real directory") from exc
+        try:
+            directory_status = os.fstat(directory_fd)
+            if not stat.S_ISDIR(directory_status.st_mode):
+                raise ValueError("Fruit BF16 base must be a real directory")
+            directory_identity = _stable_file_identity(directory_status)
+
+            manifest_fd, _ = _open_regular_at(directory_fd, "MANIFEST.sha256")
+            try:
+                manifest_sha256, manifest_bytes, _ = _hash_open_file(
+                    manifest_fd,
+                    "MANIFEST.sha256",
+                    capture_bytes=True,
+                )
+            finally:
+                os.close(manifest_fd)
+            assert manifest_bytes is not None
+            if manifest_sha256 != authority.spec.safetensors_manifest_sha256:
+                raise ValueError("Fruit BF16 base MANIFEST.sha256 identity mismatch")
+            entries: dict[str, str] = {}
+            try:
+                manifest_text = manifest_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    "Fruit BF16 base MANIFEST.sha256 is not UTF-8"
+                ) from exc
+            for line in manifest_text.splitlines():
+                fields = line.split()
+                if (
+                    len(fields) != 2
+                    or len(fields[0]) != 64
+                    or any(
+                        character not in "0123456789abcdef" for character in fields[0]
+                    )
+                    or Path(fields[1]).name != fields[1]
+                    or fields[1] in entries
+                ):
+                    raise ValueError("Fruit BF16 checksum manifest is malformed")
+                entries[fields[1]] = fields[0]
+
+            actual_names: set[str] = set()
+            for name in os.listdir(directory_fd):
+                if name == "MANIFEST.sha256":
+                    continue
+                try:
+                    status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError as exc:
+                    raise ValueError(
+                        "Fruit BF16 base changed while checking its inventory"
+                    ) from exc
+                if stat.S_ISREG(status.st_mode):
+                    actual_names.add(name)
+            unsealed_metadata = {"README.md", ".gitattributes"}
+            if (
+                not set(entries) <= actual_names
+                or actual_names - set(entries) - unsealed_metadata
+            ):
+                raise ValueError(
+                    "Fruit BF16 base file inventory differs from its manifest"
+                )
+
+            authenticated_bytes: dict[str, bytes] = {}
+            shard_identities: dict[str, tuple[int, ...]] = {}
+            for name, expected_sha256 in sorted(entries.items()):
+                fd, _ = _open_regular_at(directory_fd, name)
+                retain_fd = False
+                try:
+                    digest, content, identity = _hash_open_file(
+                        fd,
+                        name,
+                        capture_bytes=name in {"config.json", _BF16_BASE_INDEX},
+                    )
+                    if digest != expected_sha256:
+                        raise ValueError(f"Fruit BF16 base checksum mismatch: {name}")
+                    if content is not None:
+                        authenticated_bytes[name] = content
+                    if name.endswith(".safetensors"):
+                        shard_fds[name] = fd
+                        shard_identities[name] = identity
+                        retain_fd = True
+                finally:
+                    if not retain_fd:
+                        os.close(fd)
+
+            final_directory_status = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(final_directory_status.st_mode)
+                or _stable_file_identity(final_directory_status) != directory_identity
+            ):
+                raise ValueError(
+                    "Fruit BF16 base directory changed while authenticating"
+                )
+        finally:
+            os.close(directory_fd)
+
+        try:
+            config = json.loads(authenticated_bytes["config.json"].decode("utf-8"))
+            index = json.loads(authenticated_bytes[_BF16_BASE_INDEX].decode("utf-8"))
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "Fruit BF16 base config or weight index is malformed"
+            ) from exc
+        expected_config = {
+            "dtype": "bfloat16",
+            "hidden_size": authority.spec.hidden_size,
+            "moe_intermediate_size": authority.spec.intermediate_size,
+            "n_routed_experts": authority.spec.num_experts,
+            "num_experts_per_tok": FRUIT_CALIBRATION_TOPK,
+            "num_hidden_layers": authority.spec.mtp_layer,
+            "num_nextn_predict_layers": 1,
+            "rope_interleave": True,
+            "rope_theta": authority.spec.trained_rope_theta,
+            "tie_word_embeddings": False,
+        }
+        if any(config.get(name) != value for name, value in expected_config.items()):
+            raise ValueError(
+                "Fruit BF16 base config differs from the calibration contract"
+            )
+        if "quantization_config" in config:
+            raise ValueError(
+                "Fruit calibration source must be an unquantized BF16 export"
+            )
+        weight_map = index.get("weight_map")
         if (
-            len(fields) != 2
-            or len(fields[0]) != 64
-            or any(character not in "0123456789abcdef" for character in fields[0])
-            or Path(fields[1]).name != fields[1]
-            or fields[1] in entries
+            not isinstance(weight_map, dict)
+            or not weight_map
+            or any(not isinstance(name, str) for name in weight_map)
+            or any(not isinstance(filename, str) for filename in weight_map.values())
         ):
-            raise ValueError("Fruit BF16 checksum manifest is malformed")
-        entries[fields[1]] = fields[0]
-    actual_names = {
-        path.name
-        for path in root.iterdir()
-        if path.name != manifest_path.name and path.is_file() and not path.is_symlink()
-    }
-    unsealed_metadata = {"README.md", ".gitattributes"}
-    if (
-        not set(entries) <= actual_names
-        or actual_names - set(entries) - unsealed_metadata
-    ):
-        raise ValueError("Fruit BF16 base file inventory differs from its manifest")
-    for name, expected_sha256 in sorted(entries.items()):
-        if _sha256(root / name) != expected_sha256:
-            raise ValueError(f"Fruit BF16 base checksum mismatch: {name}")
-    config = json.loads((root / "config.json").read_text(encoding="utf-8"))
-    expected_config = {
-        "dtype": "bfloat16",
-        "hidden_size": authority.spec.hidden_size,
-        "moe_intermediate_size": authority.spec.intermediate_size,
-        "n_routed_experts": authority.spec.num_experts,
-        "num_experts_per_tok": FRUIT_CALIBRATION_TOPK,
-        "num_hidden_layers": authority.spec.mtp_layer,
-        "num_nextn_predict_layers": 1,
-        "rope_interleave": True,
-        "rope_theta": authority.spec.trained_rope_theta,
-        "tie_word_embeddings": False,
-    }
-    if any(config.get(name) != value for name, value in expected_config.items()):
-        raise ValueError("Fruit BF16 base config differs from the calibration contract")
-    if "quantization_config" in config:
-        raise ValueError("Fruit calibration source must be an unquantized BF16 export")
-    index_path = root / _BF16_BASE_INDEX
-    index = json.loads(index_path.read_text(encoding="utf-8"))
-    weight_map = index.get("weight_map")
-    if (
-        not isinstance(weight_map, dict)
-        or not weight_map
-        or any(not isinstance(name, str) for name in weight_map)
-        or any(not isinstance(filename, str) for filename in weight_map.values())
-    ):
-        raise ValueError("Fruit BF16 weight index is malformed")
-    shard_names = {name for name in entries if name.endswith(".safetensors")}
-    if set(weight_map.values()) != shard_names:
-        raise ValueError("Fruit BF16 weight index shard inventory mismatch")
-    source_evidence = {
-        "kind": "authenticated_bf16_export",
-        "directory": root.name,
-        "manifest_sha256": manifest_sha256,
-        "index_sha256": entries[_BF16_BASE_INDEX],
-        "file_count": len(entries),
-    }
-    if any(
-        source_evidence.get(name) != value for name, value in authority.source.items()
-    ):
-        raise ValueError("Fruit calibration source identity mismatch")
-    return source_evidence, weight_map
+            raise ValueError("Fruit BF16 weight index is malformed")
+        shard_names = {name for name in entries if name.endswith(".safetensors")}
+        if set(weight_map.values()) != shard_names:
+            raise ValueError("Fruit BF16 weight index shard inventory mismatch")
+        source_evidence = {
+            "kind": "authenticated_bf16_export",
+            "directory": root.name,
+            "manifest_sha256": manifest_sha256,
+            "index_sha256": entries[_BF16_BASE_INDEX],
+            "file_count": len(entries),
+        }
+        if any(
+            source_evidence.get(name) != value
+            for name, value in authority.source.items()
+        ):
+            raise ValueError("Fruit calibration source identity mismatch")
+        authenticated = _AuthenticatedBf16Base(
+            source_evidence=source_evidence,
+            weight_map=weight_map,
+            _shard_fds=shard_fds,
+            _shard_identities=shard_identities,
+        )
+        shard_fds = {}
+        return authenticated
+    except BaseException:
+        for fd in shard_fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
 
 
 def _load_bf16_model(
-    root: Path,
-    weight_map: dict[str, str],
+    source_base: _AuthenticatedBf16Base,
     trainer: Any,
     device: torch.device,
     spec: FruitModelSpec,
 ) -> torch.nn.Module:
     model = trainer.Fruit()
     state = model.state_dict(keep_vars=True)
-    bindings = {name: _hf_binding(name, spec) for name in weight_map}
+    bindings = {name: _hf_binding(name, spec) for name in source_base.weight_map}
     destination_keys = {binding.destination for binding in bindings.values()}
     expected_keys = set(state) - _MODEL_MARKER_KEYS
     if destination_keys != expected_keys:
@@ -546,34 +763,45 @@ def _load_bf16_model(
         raise ValueError("Fruit BF16 expert stack is incomplete")
 
     by_shard: dict[str, set[str]] = defaultdict(set)
-    for name, filename in weight_map.items():
+    for name, filename in source_base.weight_map.items():
         by_shard[filename].add(name)
     loaded: set[tuple[str, int | None]] = set()
     with torch.no_grad():
         for filename, expected_names in sorted(by_shard.items()):
-            path = root / filename
-            with safe_open(path, framework="pt", device="cpu") as handle:
-                if set(handle.keys()) != expected_names:
-                    raise ValueError(
-                        f"Fruit BF16 shard tensor inventory mismatch: {filename}"
-                    )
-                for name in sorted(expected_names):
-                    source = handle.get_tensor(name)
-                    binding = bindings[name]
-                    destination = state[binding.destination]
-                    if binding.expert is not None:
-                        destination = destination[binding.expert]
-                    if tuple(source.shape) != tuple(destination.shape):
-                        raise ValueError(f"Fruit BF16 tensor shape mismatch: {name}")
-                    target_id = (binding.destination, binding.expert)
-                    if target_id in loaded:
-                        if not torch.equal(source, destination.to(dtype=source.dtype)):
+            path = source_base.shard_path(filename)
+            load_identity = source_base.assert_shard_stable(filename)
+            try:
+                with safe_open(path, framework="pt", device="cpu") as handle:
+                    if set(handle.keys()) != expected_names:
+                        raise ValueError(
+                            f"Fruit BF16 shard tensor inventory mismatch: {filename}"
+                        )
+                    for name in sorted(expected_names):
+                        source = handle.get_tensor(name)
+                        binding = bindings[name]
+                        destination = state[binding.destination]
+                        if binding.expert is not None:
+                            destination = destination[binding.expert]
+                        if tuple(source.shape) != tuple(destination.shape):
                             raise ValueError(
-                                f"Fruit BF16 duplicate tensor disagrees: {name}"
+                                f"Fruit BF16 tensor shape mismatch: {name}"
                             )
-                    else:
-                        destination.copy_(source)
-                        loaded.add(target_id)
+                        target_id = (binding.destination, binding.expert)
+                        if target_id in loaded:
+                            if not torch.equal(
+                                source, destination.to(dtype=source.dtype)
+                            ):
+                                raise ValueError(
+                                    f"Fruit BF16 duplicate tensor disagrees: {name}"
+                                )
+                        else:
+                            destination.copy_(source)
+                            loaded.add(target_id)
+            finally:
+                source_base.assert_shard_stable(
+                    filename,
+                    expected_identity=load_identity,
+                )
     expected_loaded = {
         (binding.destination, binding.expert) for binding in bindings.values()
     }
@@ -795,6 +1023,22 @@ def _capture_identity(
     }
 
 
+def _load_tokenizer(root: Path) -> Any:
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Fruit calibration tokenizer support is not installed; install KQuant "
+            "with `kquant[fruit-calibration]` (for a checkout: "
+            "`pip install -e '.[fruit-calibration]'`)."
+        ) from exc
+    return AutoTokenizer.from_pretrained(
+        root,
+        trust_remote_code=False,
+        local_files_only=True,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
@@ -856,7 +1100,7 @@ def main() -> None:
         raise ValueError("Fruit calibration capture requires CUDA")
     torch.cuda.set_device(device)
 
-    source_evidence, weight_map = _authenticate_bf16_base(args.source, authority)
+    source_evidence: dict[str, object]
     tokenizer_hashes = {
         name: _sha256(args.tokenizer / name)
         for name in _SMALL_TOKENIZER_FILES
@@ -868,11 +1112,7 @@ def main() -> None:
     if trainer_hashes != FRUIT_CALIBRATION_TRAINER_FILES:
         raise ValueError("Fruit calibration trainer identity mismatch")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer,
-        trust_remote_code=False,
-        local_files_only=True,
-    )
+    tokenizer = _load_tokenizer(args.tokenizer)
     documents, corpus_sha256 = _sample_documents(
         args.corpus,
         tokenizer,
@@ -923,13 +1163,17 @@ def main() -> None:
         serve_native=True,
         spec=authority.spec,
     )
-    model = _load_bf16_model(
-        args.source,
-        weight_map,
-        trainer,
-        device,
-        authority.spec,
-    )
+    source_base = _authenticate_bf16_base(args.source, authority)
+    source_evidence = source_base.source_evidence
+    try:
+        model = _load_bf16_model(
+            source_base,
+            trainer,
+            device,
+            authority.spec,
+        )
+    finally:
+        source_base.close()
     source_closure = _verify_source_closure(
         model,
         args.reference,

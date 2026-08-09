@@ -23,6 +23,7 @@ from safetensors.torch import save_file
 from scripts.kquant_import_guard import (  # isort: skip
     KQUANT_IMPORT_IDENTITY as _KQUANT_IMPORT_IDENTITY,
 )
+from scripts.tracked_worktree import tracked_worktree_sha256  # isort: skip
 
 from kquant.exl3_loader import load_qsrt_encoder
 from kquant.fruit_calibration import (
@@ -94,11 +95,10 @@ FRUIT_PUBLICATIONS = {
             "[Known limitations](#known-limitations)."
         ),
         quality_limitations=(
-            "- **Not chat-quality.** An informal four-prompt instruction "
-            "battery produced incoherent answers. No representative downstream "
-            "instruction/chat evaluation is sealed by the builder, so no "
-            "task-quality claim is made and this checkpoint must not be "
-            "deployed as a user-facing assistant."
+            "- **Not chat-quality.** No representative downstream instruction/chat "
+            "evaluation is sealed by default. Any optional runtime qualification "
+            "receipt is a narrow protocol record, not a task-quality benchmark, "
+            "and this checkpoint must not be deployed as a user-facing assistant."
         ),
         fruit_audit_rows=(
             "| [Fruit QSRT (pre-adjacent-rate-evidence publication)]"
@@ -123,25 +123,17 @@ FRUIT_PUBLICATIONS = {
             "GLM-5.2 serving proxy**, not the 754B GLM-5.2 model. It is encoded "
             "in KQuant's canonical QSRT atom format and served without "
             "reconstructing dense expert weights.\n\n"
-            "The artifact qualifies the codec/storage/runtime integration on "
+            "The artifact packages the codec/storage/runtime integration for "
             "the instruction-tuned Fruit checkpoint. Packaging, provenance, "
             "exact state decoding, and the canonical single-GPU runtime path "
             "are implemented. No downstream task quality is claimed; see "
             "[Known limitations](#known-limitations)."
         ),
         quality_limitations=(
-            "- **Not assistant-quality.** A matched TP1/eager four-prompt "
-            "protocol on 2026-08-08 found that both BF16 and QSRT missed an "
-            "exact-string instruction, returned `84` for `84 * 3 / 2` instead "
-            "of `126`, and produced incoherent Chinese text; both honored a "
-            "short named-system instruction. This is protocol evidence, not a "
-            "representative benchmark, and no downstream task-quality claim is "
-            "made.\n"
-            "- **Narrow performance result.** On one RTX 5090, three warmed "
-            "eager TP1 requests generating 256 tokens measured median decode "
-            "rates of 63.54 tokens/s for QSRT and 77.45 tokens/s for matched "
-            "BF16. Model loading used 2.7 GiB versus 8.77 GiB. This "
-            "`max_num_seqs=1` protocol is not a general throughput benchmark."
+            "- **Not assistant-quality.** No representative downstream instruction/"
+            "chat evaluation is sealed by default. Any optional runtime "
+            "qualification receipt is a narrow protocol record, not a "
+            "representative task-quality benchmark."
         ),
         fruit_audit_rows=(
             "| [Fruit Instruct BF16](https://huggingface.co/malaiwah/"
@@ -255,6 +247,8 @@ production model has roughly 754B. The apples-to-apples Fruit tensor
 comparison above remains the codec-size result.
 
 __RATE_SWEEP_SECTION__
+__RUNTIME_QUALIFICATION_SECTION__
+
 
 ## Evidence boundary
 
@@ -271,9 +265,9 @@ The runtime is pinned to the reviewed commits below:
 - KQuant encoder: [`local-inference-lab/kquant#4`](https://github.com/local-inference-lab/kquant/pull/4),
   encoded with KQuant revision `__KQUANT_REVISION__`.
 - B12X kernels: [`local-inference-lab/b12x#129`](https://github.com/local-inference-lab/b12x/pull/129),
-  tested revision `__B12X_REVISION__`.
+  packaged producer revision `__B12X_REVISION__`.
 - vLLM loader: [`local-inference-lab/vllm#269`](https://github.com/local-inference-lab/vllm/pull/269),
-  tested revision `__VLLM_REVISION__`.
+  packaged producer revision `__VLLM_REVISION__`.
 
 The derived image starts from the content-addressed public base
 `docker.io/voipmonitor/vllm@sha256:3230c25ff95f8678a8eeb52a463f0d3b9f96f6ad550418cc51ea12177a55b41c`
@@ -314,8 +308,9 @@ docker run --rm --gpus '"device=0"' --shm-size=16g \
   fruit-qsrt:__VLLM_REVISION__
 ```
 
-The qualified path is SM120 with CUDA 13.2.1 and PyTorch 2.12.0+cu132 in the
-content-addressed base, plus `nvidia-cutlass-dsl == 4.6.0` in the derived image.
+The container configuration targets SM120 with CUDA 13.2.1 and PyTorch
+2.12.0+cu132 in the content-addressed base, plus
+`nvidia-cutlass-dsl == 4.6.0` in the derived image.
 The launcher rejects extra vLLM arguments and any value other than TP1,
 `max_num_seqs=1`, `max_model_len=4096`, and
 `max_num_batched_tokens=4096` before importing the GPU runtime. The current
@@ -347,16 +342,17 @@ activation modes, metadata, or incomplete manifests fail closed.
 - Full encoding: __ENCODED_EXPERTS__ experts, __ENCODE_SECONDS__ GPU-seconds,
   __PEAK_GIB__ GiB peak CUDA allocation.
 - `MANIFEST.sha256`, `qsrt-manifest.json`, `.qsrt-source-evidence.json`,
-  `qsrt-calibration-evidence.json`, and `QSRT_COMPLETE.json` bind the published
-  package to the source and encoder fingerprints.
+  `qsrt-calibration-evidence.json`, optional
+  `evaluation/fruit-runtime-qualification.json`, and `QSRT_COMPLETE.json` bind
+  the published package to the source, producer, and evaluation receipts.
 
 ## Known limitations
 
 __QUALITY_LIMITATIONS__
-- TP2 atom ownership is unit-tested, but only TP1 physical serving has been
-  qualified for this Fruit package.
+- The packaged launcher permits TP1. TP2 atom ownership is unit-tested, but no
+  package-specific TP2 serving benchmark is claimed.
 - The current sparse-attention prefill backend requires `max_num_seqs=1`.
-- This release qualifies the QSRT codec, storage, loader, and kernels. It does
+- This release implements the QSRT codec, storage, loader, and kernels. It does
   not establish broad downstream task quality.
 
 ## License
@@ -371,6 +367,9 @@ _CALIBRATION_EVIDENCE_NAME = "qsrt-calibration-evidence.json"
 
 _RATE_SWEEP_SCHEMA = "kquant_fruit_uniform_rate_sweep_v1"
 _RATE_SWEEP_NAME = "evaluation/fruit-uniform-rate-sweep.json"
+_RUNTIME_QUALIFICATION_SCHEMA = "kquant_fruit_runtime_qualification_v1"
+_RUNTIME_QUALIFICATION_NAME = "evaluation/fruit-runtime-qualification.json"
+_RUNTIME_ARMS = ("bf16", "siq", "qsrt")
 _ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v3"
 _DTYPE_BYTES = {
     "BOOL": 1,
@@ -417,45 +416,6 @@ def _git_revision(root: Path) -> str:
     return revision
 
 
-def _require_clean_source(root: Path) -> None:
-    _git_revision(root)
-    try:
-        result = subprocess.run(
-            (
-                "git",
-                "-C",
-                str(root),
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"cannot inspect source tree: {root}") from exc
-    if result.stdout:
-        raise ValueError(f"source checkout has uncommitted files: {root}")
-
-
-def _source_tree_sha256(root: Path) -> str:
-    if not root.is_dir():
-        raise FileNotFoundError(root)
-    _require_clean_source(root)
-    try:
-        result = subprocess.run(
-            ("git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", "HEAD"),
-            check=True,
-            capture_output=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"cannot enumerate tracked source tree: {root}") from exc
-    if not result.stdout:
-        raise ValueError(f"source checkout has no tracked files: {root}")
-    return hashlib.sha256(b"git-ls-tree-v1\0" + result.stdout).hexdigest()
-
-
 def _encoder_fingerprint_payload(encoder: dict[str, object]) -> dict[str, object]:
     return {
         "schema": _ENCODER_FINGERPRINT_SCHEMA,
@@ -473,16 +433,21 @@ def current_encoder_provenance(
     *,
     exllamav3_root: Path,
     calibration: FruitCalibrationStore,
+    kquant_root: Path | None = None,
 ) -> dict[str, object]:
-    kquant_checkout = Path(__file__).resolve().parents[1]
+    kquant_checkout = (
+        Path(__file__).resolve().parents[1]
+        if kquant_root is None
+        else kquant_root.resolve(strict=True)
+    )
     exllamav3_revision = _git_revision(exllamav3_root)
     if exllamav3_revision != EXLLAMAV3_REVISION:
         raise ValueError("ExLlamaV3 source revision does not match the pinned encoder")
     encoder: dict[str, object] = {
         "kquant_revision": _git_revision(kquant_checkout),
-        "kquant_source_sha256": _source_tree_sha256(kquant_checkout),
+        "kquant_source_sha256": tracked_worktree_sha256(kquant_checkout),
         "exllamav3_revision": exllamav3_revision,
-        "exllamav3_source_sha256": _source_tree_sha256(exllamav3_root),
+        "exllamav3_source_sha256": tracked_worktree_sha256(exllamav3_root),
         "calibration_fingerprint": calibration.fingerprint,
         "calibration_capture_id": calibration.capture_id,
         "calibration_manifest_sha256": calibration.manifest_sha256,
@@ -516,9 +481,9 @@ def _producer_provenance(
     )
     runtime = {
         "b12x_revision": _git_revision(b12x_root),
-        "b12x_source_sha256": _source_tree_sha256(b12x_root),
+        "b12x_source_sha256": tracked_worktree_sha256(b12x_root),
         "vllm_revision": _git_revision(vllm_root),
-        "vllm_source_sha256": _source_tree_sha256(vllm_root),
+        "vllm_source_sha256": tracked_worktree_sha256(vllm_root),
     }
     provenance: dict[str, object] = {
         "schema": "kquant_fruit_qsrt_producer_v1",
@@ -757,6 +722,722 @@ captured-H, and validation-routed NMSE. K4 is
 """
 
 
+def _qualification_object(
+    value: object, *, name: str, keys: set[str]
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise TypeError(f"Fruit runtime qualification {name} must be an object")
+    if set(value) != keys:
+        raise ValueError(
+            f"Fruit runtime qualification {name} keys mismatch; "
+            f"missing={sorted(keys - set(value))}, "
+            f"unknown={sorted(set(value) - keys)}"
+        )
+    return value
+
+
+def _qualification_string(value: object, *, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"Fruit runtime qualification {name} must be a nonempty string")
+    return value
+
+
+def _qualification_number(
+    value: object,
+    *,
+    name: str,
+    positive: bool = False,
+    maximum: float | None = None,
+) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < 0
+        or (positive and float(value) <= 0)
+        or (maximum is not None and float(value) > maximum)
+    ):
+        raise ValueError(f"Fruit runtime qualification {name} is invalid")
+    return float(value)
+
+
+def _qualification_digest(value: object, *, name: str) -> str:
+    digest = _qualification_string(value, name=name)
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"Fruit runtime qualification {name} is not a SHA-256 digest")
+    return digest
+
+
+def _qualification_revision(value: object, *, name: str) -> str:
+    revision = _qualification_string(value, name=name)
+    if len(revision) != 40 or any(
+        character not in "0123456789abcdef" for character in revision
+    ):
+        raise ValueError(f"Fruit runtime qualification {name} is not a Git revision")
+    return revision
+
+
+def _candidate_safetensors_sha256(output: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for path in output.iterdir():
+        if path.suffix != ".safetensors":
+            continue
+        if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+            raise ValueError(f"Fruit candidate tensor is not a regular file: {path}")
+        result[path.name] = _sha256(path)
+    if not result:
+        raise ValueError("Fruit runtime qualification candidate has no Safetensors")
+    return dict(sorted(result.items()))
+
+
+def _validate_sealed_runtime_qualification(
+    output: Path, runtime_qualification: dict[str, object]
+) -> None:
+    qualification_path = output / _RUNTIME_QUALIFICATION_NAME
+    if qualification_path.read_bytes() != _canonical_json(runtime_qualification).encode(
+        "utf-8"
+    ):
+        raise ValueError("Fruit QSRT sealed runtime qualification changed")
+    candidate = runtime_qualification["candidate"]
+    if not isinstance(candidate, dict) or (
+        candidate.get("model_index_sha256")
+        != _sha256(output / "model.safetensors.index.json")
+        or candidate.get("safetensors_sha256") != _candidate_safetensors_sha256(output)
+    ):
+        raise ValueError("Fruit QSRT sealed runtime qualification candidate changed")
+
+
+def _validate_runtime_qualification(
+    path: Path,
+    *,
+    output: Path,
+    variant: str,
+    publication: FruitPublicationSpec,
+    producer: dict[str, object],
+    source_evidence: dict[str, object],
+) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read Fruit runtime qualification: {path}") from exc
+    payload = _qualification_object(
+        payload,
+        name="root",
+        keys={
+            "schema",
+            "version",
+            "complete",
+            "publication",
+            "producer",
+            "source",
+            "candidate",
+            "environment",
+            "protocol",
+            "loaders",
+            "models",
+            "decode",
+            "generation",
+            "fidelity",
+        },
+    )
+    if (
+        payload["schema"] != _RUNTIME_QUALIFICATION_SCHEMA
+        or type(payload["version"]) is not int
+        or payload["version"] != 1
+        or payload["complete"] is not True
+    ):
+        raise ValueError(
+            "Fruit runtime qualification is incomplete or has the wrong schema"
+        )
+    measured_publication = _qualification_object(
+        payload["publication"],
+        name="publication",
+        keys={"variant", "repository"},
+    )
+    if measured_publication != {
+        "variant": variant,
+        "repository": publication.repository,
+    }:
+        raise ValueError(
+            "Fruit runtime qualification publication does not match this build"
+        )
+    if payload["producer"] != producer:
+        raise ValueError(
+            "Fruit runtime qualification producer does not match this build"
+        )
+    if payload["source"] != source_evidence:
+        raise ValueError("Fruit runtime qualification source does not match this build")
+
+    candidate = _qualification_object(
+        payload["candidate"],
+        name="candidate",
+        keys={"model_index_sha256", "safetensors_sha256"},
+    )
+    measured_index = _qualification_digest(
+        candidate["model_index_sha256"], name="candidate.model_index_sha256"
+    )
+    if measured_index != _sha256(output / "model.safetensors.index.json"):
+        raise ValueError(
+            "Fruit runtime qualification model index does not match output"
+        )
+    measured_tensors = candidate["safetensors_sha256"]
+    if not isinstance(measured_tensors, dict) or not measured_tensors:
+        raise TypeError("Fruit runtime qualification Safetensors map must be nonempty")
+    for filename, digest in measured_tensors.items():
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.endswith(".safetensors")
+        ):
+            raise ValueError(
+                "Fruit runtime qualification has an invalid tensor filename"
+            )
+        _qualification_digest(digest, name=f"candidate.safetensors_sha256.{filename}")
+    if measured_tensors != _candidate_safetensors_sha256(output):
+        raise ValueError(
+            "Fruit runtime qualification Safetensors map does not exactly match output"
+        )
+    models = _qualification_object(
+        payload["models"], name="models", keys=set(_RUNTIME_ARMS)
+    )
+    actual_tensor_bytes = sum(
+        (output / filename).stat().st_size for filename in measured_tensors
+    )
+    actual_tensor_set_sha256 = hashlib.sha256(
+        _canonical_json(measured_tensors).encode("utf-8")
+    ).hexdigest()
+    for arm in _RUNTIME_ARMS:
+        model = _qualification_object(
+            models[arm],
+            name=f"models.{arm}",
+            keys={
+                "repository",
+                "revision",
+                "manifest_sha256",
+                "config_sha256",
+                "model_index_sha256",
+                "safetensors_bytes",
+                "safetensors_sha256",
+            },
+        )
+        _qualification_string(model["repository"], name=f"models.{arm}.repository")
+        _qualification_revision(model["revision"], name=f"models.{arm}.revision")
+        for key in ("manifest_sha256", "config_sha256", "model_index_sha256"):
+            _qualification_digest(model[key], name=f"models.{arm}.{key}")
+        if (
+            type(model["safetensors_bytes"]) is not int
+            or model["safetensors_bytes"] <= 0
+        ):
+            raise ValueError(
+                f"Fruit runtime qualification models.{arm}.safetensors_bytes is invalid"
+            )
+        _qualification_digest(
+            model["safetensors_sha256"],
+            name=f"models.{arm}.safetensors_sha256",
+        )
+    qsrt_model = models["qsrt"]
+    if (
+        qsrt_model["repository"] != publication.repository
+        or qsrt_model["model_index_sha256"] != measured_index
+        or qsrt_model["config_sha256"] != _sha256(output / "config.json")
+        or qsrt_model["safetensors_bytes"] != actual_tensor_bytes
+        or qsrt_model["safetensors_sha256"] != actual_tensor_set_sha256
+    ):
+        raise ValueError(
+            "Fruit runtime qualification QSRT model identity does not match output"
+        )
+
+    environment = _qualification_object(
+        payload["environment"],
+        name="environment",
+        keys={"gpu_model", "gpu_driver", "host"},
+    )
+    for key in ("gpu_model", "gpu_driver", "host"):
+        _qualification_string(environment[key], name=f"environment.{key}")
+
+    protocol = _qualification_object(
+        payload["protocol"],
+        name="protocol",
+        keys={
+            "tensor_parallel_size",
+            "max_num_seqs",
+            "max_tokens",
+            "temperature",
+            "repetitions",
+            "prompt_id",
+            "prompt",
+            "prompt_token_ids",
+            "launch_order",
+        },
+    )
+    launch_order = protocol["launch_order"]
+    if (
+        type(protocol["tensor_parallel_size"]) is not int
+        or protocol["tensor_parallel_size"] != 1
+        or type(protocol["max_num_seqs"]) is not int
+        or protocol["max_num_seqs"] != 1
+        or type(protocol["max_tokens"]) is not int
+        or int(protocol["max_tokens"]) <= 0
+        or type(protocol["repetitions"]) is not int
+        or int(protocol["repetitions"]) < 3
+        or not isinstance(launch_order, list)
+        or len(launch_order) != len(_RUNTIME_ARMS)
+        or set(launch_order) != set(_RUNTIME_ARMS)
+    ):
+        raise ValueError("Fruit runtime qualification is not a matched TP1 protocol")
+    _qualification_number(protocol["temperature"], name="protocol.temperature")
+    decode_prompt_id = _qualification_string(
+        protocol["prompt_id"], name="protocol.prompt_id"
+    )
+    _qualification_string(protocol["prompt"], name="protocol.prompt")
+    prompt_token_ids = protocol["prompt_token_ids"]
+    if (
+        not isinstance(prompt_token_ids, list)
+        or not prompt_token_ids
+        or any(type(token) is not int or token < 0 for token in prompt_token_ids)
+    ):
+        raise ValueError("Fruit runtime qualification prompt tokens are invalid")
+
+    loaders = _qualification_object(
+        payload["loaders"], name="loaders", keys=set(_RUNTIME_ARMS)
+    )
+    producer_runtime = producer.get("runtime")
+    producer_encoder = producer.get("encoder")
+    if not isinstance(producer_runtime, dict) or not isinstance(producer_encoder, dict):
+        raise TypeError("Fruit runtime qualification producer identity is malformed")
+    for arm in _RUNTIME_ARMS:
+        loader = _qualification_object(
+            loaders[arm],
+            name=f"loaders.{arm}",
+            keys={
+                "runtime",
+                "log_line",
+                "weight_bytes",
+                "peak_activation_bytes",
+                "non_torch_bytes",
+                "cudagraph_bytes",
+                "kv_cache_bytes",
+                "load_seconds",
+                "torch_allocated_bytes",
+                "torch_reserved_bytes",
+                "nvml_used_bytes",
+            },
+        )
+        runtime = _qualification_object(
+            loader["runtime"],
+            name=f"loaders.{arm}.runtime",
+            keys={
+                "image",
+                "vllm_revision",
+                "b12x_revision",
+                "kquant_revision",
+                "argv",
+                "environment",
+                "software",
+                "compilation_backend",
+                "cudagraph_mode",
+            },
+        )
+        image = _qualification_string(
+            runtime["image"], name=f"loaders.{arm}.runtime.image"
+        )
+        image_name, separator, image_digest = image.rpartition("@sha256:")
+        if not image_name or separator != "@sha256:":
+            raise ValueError(
+                f"Fruit runtime qualification loaders.{arm} image is not immutable"
+            )
+        _qualification_digest(image_digest, name=f"loaders.{arm}.runtime.image_digest")
+        for key in ("vllm_revision", "b12x_revision", "kquant_revision"):
+            _qualification_revision(runtime[key], name=f"loaders.{arm}.runtime.{key}")
+        if arm == "qsrt" and (
+            runtime["vllm_revision"] != producer_runtime.get("vllm_revision")
+            or runtime["b12x_revision"] != producer_runtime.get("b12x_revision")
+            or runtime["kquant_revision"] != producer_encoder.get("kquant_revision")
+        ):
+            raise ValueError(
+                "Fruit runtime qualification QSRT runtime does not match producer"
+            )
+        argv = runtime["argv"]
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or any(not isinstance(argument, str) or not argument for argument in argv)
+        ):
+            raise TypeError(
+                f"Fruit runtime qualification loaders.{arm} argv is invalid"
+            )
+        runtime_environment = runtime["environment"]
+        if (
+            not isinstance(runtime_environment, dict)
+            or not runtime_environment
+            or any(
+                not isinstance(name, str) or not name or not isinstance(value, str)
+                for name, value in runtime_environment.items()
+            )
+        ):
+            raise TypeError(
+                f"Fruit runtime qualification loaders.{arm} environment is invalid"
+            )
+        software = runtime["software"]
+        if (
+            not isinstance(software, dict)
+            or not software
+            or any(
+                not isinstance(name, str)
+                or not name
+                or not isinstance(version, str)
+                or not version
+                for name, version in software.items()
+            )
+        ):
+            raise TypeError(
+                f"Fruit runtime qualification loaders.{arm} software is invalid"
+            )
+        compilation_backend = _qualification_string(
+            runtime["compilation_backend"],
+            name=f"loaders.{arm}.runtime.compilation_backend",
+        )
+        if compilation_backend not in {"eager", "inductor"}:
+            raise ValueError(
+                f"Fruit runtime qualification loaders.{arm} backend is invalid"
+            )
+        if runtime["cudagraph_mode"] not in {"NONE", "FULL_AND_PIECEWISE"}:
+            raise ValueError(
+                f"Fruit runtime qualification loaders.{arm} cudagraph mode is invalid"
+            )
+        _qualification_string(loader["log_line"], name=f"loaders.{arm}.log_line")
+        for key in (
+            "weight_bytes",
+            "peak_activation_bytes",
+            "non_torch_bytes",
+            "cudagraph_bytes",
+            "kv_cache_bytes",
+            "torch_allocated_bytes",
+            "torch_reserved_bytes",
+            "nvml_used_bytes",
+        ):
+            if type(loader[key]) is not int or loader[key] < 0:
+                raise ValueError(
+                    f"Fruit runtime qualification loaders.{arm}.{key} is invalid"
+                )
+        if loader["weight_bytes"] <= 0:
+            raise ValueError(
+                f"Fruit runtime qualification loaders.{arm}.weight_bytes is invalid"
+            )
+        _qualification_number(
+            loader["load_seconds"],
+            name=f"loaders.{arm}.load_seconds",
+            positive=True,
+        )
+
+    decode = _qualification_object(
+        payload["decode"], name="decode", keys=set(_RUNTIME_ARMS)
+    )
+    expected_repetitions = set(range(1, int(protocol["repetitions"]) + 1))
+    matched_completion_tokens: dict[int, int] = {}
+    for arm in _RUNTIME_ARMS:
+        runs = decode[arm]
+        if not isinstance(runs, list) or len(runs) != len(expected_repetitions):
+            raise ValueError(
+                f"Fruit runtime qualification decode.{arm} repetition count mismatch"
+            )
+        measured_repetitions: set[int] = set()
+        for row_index, raw_run in enumerate(runs):
+            run = _qualification_object(
+                raw_run,
+                name=f"decode.{arm}[{row_index}]",
+                keys={
+                    "prompt_id",
+                    "repetition",
+                    "http_status",
+                    "elapsed_seconds",
+                    "completion_tokens",
+                    "tokens_per_second",
+                    "finish_reason",
+                    "content",
+                },
+            )
+            if run["prompt_id"] != decode_prompt_id:
+                raise ValueError("Fruit runtime qualification decode prompt mismatch")
+            repetition = run["repetition"]
+            if type(repetition) is not int or repetition not in expected_repetitions:
+                raise ValueError("Fruit runtime qualification repetition is invalid")
+            measured_repetitions.add(repetition)
+            status = run["http_status"]
+            if type(status) is not int or not 200 <= status < 300:
+                raise ValueError(
+                    "Fruit runtime qualification HTTP response was unsuccessful"
+                )
+            elapsed = _qualification_number(
+                run["elapsed_seconds"],
+                name=f"decode.{arm}.elapsed_seconds",
+                positive=True,
+            )
+            tokens = run["completion_tokens"]
+            if (
+                type(tokens) is not int
+                or tokens <= 0
+                or tokens > int(protocol["max_tokens"])
+            ):
+                raise ValueError(
+                    "Fruit runtime qualification completion token count is invalid"
+                )
+            rate = _qualification_number(
+                run["tokens_per_second"],
+                name=f"decode.{arm}.tokens_per_second",
+                positive=True,
+            )
+            if arm == "bf16":
+                matched_completion_tokens[repetition] = tokens
+            elif matched_completion_tokens.get(repetition) != tokens:
+                raise ValueError(
+                    "Fruit runtime qualification matched completion counts differ"
+                )
+            if not math.isclose(rate, tokens / elapsed, rel_tol=1e-9, abs_tol=1e-12):
+                raise ValueError("Fruit runtime qualification token-rate math mismatch")
+            finish_reason = _qualification_string(
+                run["finish_reason"], name=f"decode.{arm}.finish_reason"
+            )
+            if finish_reason == "length" and tokens != int(protocol["max_tokens"]):
+                raise ValueError(
+                    "Fruit runtime qualification length finish disagrees with token cap"
+                )
+            if not isinstance(run["content"], str):
+                raise TypeError(
+                    "Fruit runtime qualification decode content must be a string"
+                )
+        if measured_repetitions != expected_repetitions:
+            raise ValueError(
+                f"Fruit runtime qualification decode.{arm} repetitions are not unique"
+            )
+
+    generation = _qualification_object(
+        payload["generation"],
+        name="generation",
+        keys={"prompts", "results"},
+    )
+    prompts = generation["prompts"]
+    if not isinstance(prompts, list) or not prompts:
+        raise ValueError("Fruit runtime qualification generation prompts are empty")
+    prompt_ids: list[str] = []
+    for row_index, raw_prompt in enumerate(prompts):
+        prompt = _qualification_object(
+            raw_prompt,
+            name=f"generation.prompts[{row_index}]",
+            keys={"id", "prompt", "prompt_token_ids"},
+        )
+        prompt_id = _qualification_string(
+            prompt["id"], name=f"generation.prompts[{row_index}].id"
+        )
+        _qualification_string(
+            prompt["prompt"], name=f"generation.prompts[{row_index}].prompt"
+        )
+        generation_tokens = prompt["prompt_token_ids"]
+        if (
+            not isinstance(generation_tokens, list)
+            or not generation_tokens
+            or any(type(token) is not int or token < 0 for token in generation_tokens)
+        ):
+            raise ValueError(
+                "Fruit runtime qualification generation tokens are invalid"
+            )
+        prompt_ids.append(prompt_id)
+    if len(set(prompt_ids)) != len(prompt_ids) or decode_prompt_id in prompt_ids:
+        raise ValueError("Fruit runtime qualification prompt IDs are not unique")
+    results = _qualification_object(
+        generation["results"],
+        name="generation.results",
+        keys=set(_RUNTIME_ARMS),
+    )
+    for arm in _RUNTIME_ARMS:
+        rows = results[arm]
+        if not isinstance(rows, list) or len(rows) != len(prompt_ids):
+            raise ValueError(
+                f"Fruit runtime qualification generation.{arm} coverage mismatch"
+            )
+        covered: list[str] = []
+        for row_index, raw_result in enumerate(rows):
+            result = _qualification_object(
+                raw_result,
+                name=f"generation.results.{arm}[{row_index}]",
+                keys={"prompt_id", "content"},
+            )
+            covered.append(
+                _qualification_string(
+                    result["prompt_id"],
+                    name=f"generation.results.{arm}[{row_index}].prompt_id",
+                )
+            )
+            if not isinstance(result["content"], str):
+                raise TypeError(
+                    "Fruit runtime qualification generation content must be a string"
+                )
+        if len(set(covered)) != len(covered) or set(covered) != set(prompt_ids):
+            raise ValueError(
+                f"Fruit runtime qualification generation.{arm} coverage mismatch"
+            )
+
+    fidelity = _qualification_object(
+        payload["fidelity"],
+        name="fidelity",
+        keys={"full_vocabulary", "positions", "vocab_size", "candidates"},
+    )
+    positions = fidelity["positions"]
+    if (
+        fidelity["full_vocabulary"] is not True
+        or not isinstance(positions, list)
+        or not positions
+        or any(type(position) is not int or position < 0 for position in positions)
+        or len(set(positions)) != len(positions)
+        or type(fidelity["vocab_size"]) is not int
+        or int(fidelity["vocab_size"]) <= 10
+    ):
+        raise ValueError("Fruit runtime qualification fidelity geometry is invalid")
+    candidates = _qualification_object(
+        fidelity["candidates"],
+        name="fidelity.candidates",
+        keys={"siq", "qsrt"},
+    )
+    for candidate_name in ("siq", "qsrt"):
+        candidate_result = _qualification_object(
+            candidates[candidate_name],
+            name=f"fidelity.candidates.{candidate_name}",
+            keys={
+                "mean_forward_kl",
+                "max_forward_kl",
+                "top1_agreement",
+                "top10_agreement",
+                "per_position",
+            },
+        )
+        rows = candidate_result["per_position"]
+        if not isinstance(rows, list) or len(rows) != len(positions):
+            raise ValueError("Fruit runtime qualification fidelity coverage mismatch")
+        measured_positions: list[int] = []
+        divergences: list[float] = []
+        top1_matches = 0
+        top10_matches = 0
+        for row_index, raw_row in enumerate(rows):
+            row = _qualification_object(
+                raw_row,
+                name=f"fidelity.candidates.{candidate_name}.per_position[{row_index}]",
+                keys={"position", "forward_kl", "top1_agreement", "top10_agreement"},
+            )
+            if type(row["position"]) is not int:
+                raise TypeError(
+                    "Fruit runtime qualification fidelity position is invalid"
+                )
+            measured_positions.append(int(row["position"]))
+            divergences.append(
+                _qualification_number(
+                    row["forward_kl"],
+                    name=f"fidelity.{candidate_name}.forward_kl",
+                )
+            )
+            if (
+                type(row["top1_agreement"]) is not bool
+                or type(row["top10_agreement"]) is not bool
+            ):
+                raise TypeError(
+                    "Fruit runtime qualification fidelity agreement is invalid"
+                )
+            if row["top1_agreement"] and not row["top10_agreement"]:
+                raise ValueError(
+                    "Fruit runtime qualification top-1 match is absent from top-10"
+                )
+            top1_matches += int(row["top1_agreement"])
+            top10_matches += int(row["top10_agreement"])
+        if measured_positions != positions:
+            raise ValueError("Fruit runtime qualification fidelity positions mismatch")
+        aggregates = {
+            "mean_forward_kl": sum(divergences) / len(divergences),
+            "max_forward_kl": max(divergences),
+            "top1_agreement": top1_matches / len(divergences),
+            "top10_agreement": top10_matches / len(divergences),
+        }
+        for name, computed in aggregates.items():
+            measured = _qualification_number(
+                candidate_result[name],
+                name=f"fidelity.{candidate_name}.{name}",
+                maximum=1.0 if "agreement" in name else None,
+            )
+            if not math.isclose(measured, computed, rel_tol=1e-9, abs_tol=1e-12):
+                raise ValueError(
+                    "Fruit runtime qualification fidelity aggregate mismatch"
+                )
+    return payload
+
+
+def _runtime_qualification_section(payload: dict[str, object] | None) -> str:
+    if payload is None:
+        return (
+            "## Runtime and quality qualification\n\n"
+            "No package-specific runtime or quality benchmark is sealed."
+        )
+    protocol = payload["protocol"]
+    loaders = payload["loaders"]
+    decode = payload["decode"]
+    fidelity = payload["fidelity"]
+    medians: dict[str, float] = {}
+    for arm in _RUNTIME_ARMS:
+        rates = sorted(float(run["tokens_per_second"]) for run in decode[arm])
+        middle = len(rates) // 2
+        medians[arm] = (
+            rates[middle] if len(rates) % 2 else (rates[middle - 1] + rates[middle]) / 2
+        )
+    runtime_rows = "\n".join(
+        "| {arm} | {rate:.2f} | {ratio:.3f}x | {weight:.3f} | `{backend}` / `{graphs}` |".format(
+            arm=arm.upper(),
+            rate=medians[arm],
+            ratio=medians[arm] / medians["bf16"],
+            weight=int(loaders[arm]["weight_bytes"]) / (1 << 30),
+            backend=loaders[arm]["runtime"]["compilation_backend"],
+            graphs=loaders[arm]["runtime"]["cudagraph_mode"],
+        )
+        for arm in _RUNTIME_ARMS
+    )
+    fidelity_rows = "\n".join(
+        "| {name} | {mean:.6g} | {maximum:.6g} | {top1:.2%} | {top10:.2%} |".format(
+            name=name.upper(),
+            mean=float(fidelity["candidates"][name]["mean_forward_kl"]),
+            maximum=float(fidelity["candidates"][name]["max_forward_kl"]),
+            top1=float(fidelity["candidates"][name]["top1_agreement"]),
+            top10=float(fidelity["candidates"][name]["top10_agreement"]),
+        )
+        for name in ("siq", "qsrt")
+    )
+    return f"""## Runtime and quality qualification
+
+The sealed receipt [`{_RUNTIME_QUALIFICATION_NAME}`]({_RUNTIME_QUALIFICATION_NAME})
+records the exact BF16, SIQ, and QSRT model identities, candidate tensors,
+producer, GPU and driver, per-arm immutable runtime images, exact launch argv,
+environment and software revisions, parsed loader memory fields, decode runs,
+generation outputs, and full-vocabulary fidelity rows. Under its fixed
+hardware, prompt tokens, generation settings, recorded launch order, TP1, and
+`max_num_seqs=1`, {protocol["repetitions"]}-repetition same-prompt protocol:
+
+| Arm | Median client-observed end-to-end generated-token rate (tokens/s) | Rate / BF16 | Loader weight GiB | Backend / CUDA graph mode |
+|---|---:|---:|---:|---|
+{runtime_rows}
+
+The legacy SIQ comparator uses its recorded compatible runtime rather than the
+QSRT clean-cutover runtime. The derived ratios therefore compare observed
+end-to-end runs on identical hardware and inputs, not identical software.
+These rates include request and serving overhead; they are not decode-only
+kernel rates, an apples-to-apples software comparison, or a general throughput
+benchmark.
+
+| Candidate relative to BF16 | Mean forward KL | Max forward KL | Top-1 agreement | Top-10 agreement |
+|---|---:|---:|---:|---:|
+{fidelity_rows}
+
+The raw generation section covers {len(payload["generation"]["prompts"])} matched
+prompts across BF16, SIQ, and QSRT. It is explicitly non-representative and does
+not establish downstream instruction/chat task quality."""
+
+
 def _render_model_card(
     *,
     source_evidence: dict[str, object],
@@ -765,6 +1446,7 @@ def _render_model_card(
     rate_sweep: dict[str, object],
     layers: dict[str, dict[str, object]],
     publication: FruitPublicationSpec,
+    runtime_qualification: dict[str, object] | None = None,
 ) -> str:
     format_counts: Counter[str] = Counter()
     elapsed_seconds = 0.0
@@ -826,6 +1508,9 @@ def _render_model_card(
             f"| `{name}` | {count:,} |" for name, count in sorted(format_counts.items())
         ),
         "__RATE_SWEEP_SECTION__": _rate_sweep_section(rate_sweep),
+        "__RUNTIME_QUALIFICATION_SECTION__": _runtime_qualification_section(
+            runtime_qualification
+        ),
         "__KQUANT_REVISION__": str(encoder["kquant_revision"]),
         "__B12X_REVISION__": str(runtime["b12x_revision"]),
         "__VLLM_REVISION__": str(runtime["vllm_revision"]),
@@ -950,6 +1635,7 @@ def _validate_qsrt_tensor_contract(
     tensor_path: Path,
     *,
     expected_expert_ids: torch.Tensor,
+    expected_formats: torch.Tensor,
 ) -> dict[str, str]:
     expected_count = int(expected_expert_ids.numel())
     expected_shapes = {
@@ -1004,6 +1690,10 @@ def _validate_qsrt_tensor_contract(
     formats = tensors["formats"]
     if bool(((formats < 0) | (formats > 2)).any().item()):
         raise ValueError(f"Fruit QSRT formats are outside R0/R1/R2 in {tensor_path}")
+    if not torch.equal(formats, expected_formats):
+        raise ValueError(
+            f"Fruit QSRT tensor formats disagree with manifest in {tensor_path}"
+        )
     mode_table = torch.tensor(((0, 0), (1, 0), (1, 1)), dtype=torch.int32)
     if not torch.equal(
         tensors["fc1_pair_modes"], mode_table.index_select(0, formats[:, 0].long())
@@ -1164,6 +1854,20 @@ def _validate_part(
         raise ValueError(
             f"malformed Fruit QSRT part manifest: {manifest_path}"
         ) from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"malformed Fruit QSRT part manifest: {manifest_path}")
+    manifest_format = value.get("format")
+    if (
+        not isinstance(manifest_format, dict)
+        or set(manifest_format) != {"r13", "r2"}
+        or any(
+            isinstance(manifest_format[name], bool)
+            or not isinstance(manifest_format[name], int)
+            or manifest_format[name] not in (0, 1, 2)
+            for name in ("r13", "r2")
+        )
+    ):
+        raise ValueError(f"malformed Fruit QSRT part format: {manifest_path}")
     expected = {
         "schema": FRUIT_QSRT_SCHEMA,
         "version": 1,
@@ -1194,6 +1898,10 @@ def _validate_part(
     metadata = _validate_qsrt_tensor_contract(
         tensor_path,
         expected_expert_ids=torch.tensor([expert], dtype=torch.int32),
+        expected_formats=torch.tensor(
+            [[manifest_format["r13"], manifest_format["r2"]]],
+            dtype=torch.int8,
+        ),
     )
     for name, expected_value in (
         ("schema", FRUIT_QSRT_SCHEMA),
@@ -2168,6 +2876,8 @@ def _package_files(
 
 def _expected_package_inventory(
     base_provenance: dict[str, object],
+    *,
+    runtime_qualification: bool = False,
 ) -> set[str]:
     base_files = base_provenance.get("files")
     if not isinstance(base_files, dict) or any(
@@ -2186,6 +2896,8 @@ def _expected_package_inventory(
             _RATE_SWEEP_NAME,
         }
     )
+    if runtime_qualification:
+        expected.add(_RUNTIME_QUALIFICATION_NAME)
     for layer in LAYERS:
         expected.add(f"qsrt-layer-{layer:03d}.json")
         expected.add(f"qsrt-layer-{layer:03d}.safetensors")
@@ -2197,9 +2909,12 @@ def _validated_package_files(
     base_provenance: dict[str, object],
     *,
     allow_part_cache: bool = False,
+    runtime_qualification: bool = False,
 ) -> dict[str, Path]:
     files = _package_files(output, allow_part_cache=allow_part_cache)
-    expected = _expected_package_inventory(base_provenance)
+    expected = _expected_package_inventory(
+        base_provenance, runtime_qualification=runtime_qualification
+    )
     if set(files) != expected:
         raise ValueError(
             "Fruit package inventory mismatch; "
@@ -2219,6 +2934,7 @@ def _write_package_manifests(
     rate_sweep: dict[str, object],
     layers: dict[str, dict[str, object]],
     publication: FruitPublicationSpec,
+    runtime_qualification: dict[str, object] | None = None,
 ) -> None:
     evaluation = output / "evaluation"
     if evaluation.exists():
@@ -2226,6 +2942,12 @@ def _write_package_manifests(
     evaluation.mkdir()
     rate_sweep_path = output / _RATE_SWEEP_NAME
     _atomic_text(rate_sweep_path, _canonical_json(rate_sweep))
+    runtime_qualification_path = output / _RUNTIME_QUALIFICATION_NAME
+    if runtime_qualification is not None:
+        _atomic_text(
+            runtime_qualification_path,
+            _canonical_json(runtime_qualification),
+        )
     manifest_layers = {
         layer: {
             "qsrt_atoms": value["safetensors_file"],
@@ -2266,7 +2988,17 @@ def _write_package_manifests(
             "uniform_rate_sweep": {
                 "file": _RATE_SWEEP_NAME,
                 "sha256": _sha256(rate_sweep_path),
-            }
+            },
+            **(
+                {
+                    "runtime_qualification": {
+                        "file": _RUNTIME_QUALIFICATION_NAME,
+                        "sha256": _sha256(runtime_qualification_path),
+                    }
+                }
+                if runtime_qualification is not None
+                else {}
+            ),
         },
         "layers": manifest_layers,
         "complete": True,
@@ -2281,12 +3013,14 @@ def _write_package_manifests(
             rate_sweep=rate_sweep,
             layers=layers,
             publication=publication,
+            runtime_qualification=runtime_qualification,
         ),
     )
     files = _validated_package_files(
         output,
         base_provenance,
         allow_part_cache=True,
+        runtime_qualification=runtime_qualification is not None,
     )
     entries = [f"{_sha256(path)}  {relative}" for relative, path in files.items()]
     _atomic_text(output / "MANIFEST.sha256", "\n".join(entries) + "\n")
@@ -2319,6 +3053,7 @@ def _validate_checksum_manifest(
     base_provenance: dict[str, object],
     *,
     allow_part_cache: bool,
+    runtime_qualification: bool = False,
 ) -> None:
     manifest_path = output / "MANIFEST.sha256"
     entries: dict[str, str] = {}
@@ -2342,6 +3077,7 @@ def _validate_checksum_manifest(
             output,
             base_provenance,
             allow_part_cache=allow_part_cache,
+            runtime_qualification=runtime_qualification,
         )
     )
     if set(entries) != expected_files:
@@ -2363,6 +3099,7 @@ def _validate_output_package(
     producer: dict[str, object],
     rate_sweep: dict[str, object],
     require_complete: bool,
+    runtime_qualification: dict[str, object] | None = None,
     spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
 ) -> None:
     manifest_path = output / "qsrt-manifest.json"
@@ -2399,7 +3136,19 @@ def _validate_output_package(
             "uniform_rate_sweep": {
                 "file": _RATE_SWEEP_NAME,
                 "sha256": _sha256(output / _RATE_SWEEP_NAME),
-            }
+            },
+            **(
+                {
+                    "runtime_qualification": {
+                        "file": _RUNTIME_QUALIFICATION_NAME,
+                        "sha256": hashlib.sha256(
+                            _canonical_json(runtime_qualification).encode("utf-8")
+                        ).hexdigest(),
+                    }
+                }
+                if runtime_qualification is not None
+                else {}
+            ),
         },
         "complete": True,
     }
@@ -2413,6 +3162,8 @@ def _validate_output_package(
     )
     if sealed_rate_sweep != rate_sweep:
         raise ValueError("Fruit QSRT package and sealed rate sweep disagree")
+    if runtime_qualification is not None:
+        _validate_sealed_runtime_qualification(output, runtime_qualification)
     config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     quantization = config.get("quantization_config")
     if not isinstance(quantization, dict):
@@ -2483,6 +3234,7 @@ def _validate_output_package(
         output,
         base_provenance,
         allow_part_cache=not require_complete,
+        runtime_qualification=runtime_qualification is not None,
     )
     marker_path = output / _COMPLETE_MARKER_NAME
     if require_complete:
@@ -2532,6 +3284,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-root", required=True, type=Path)
     parser.add_argument("--calibration", required=True, type=Path)
     parser.add_argument("--rate-sweep", required=True, type=Path)
+    parser.add_argument("--runtime-qualification", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed-cache", type=Path)
     return parser.parse_args()
@@ -2567,20 +3320,10 @@ def main() -> None:
         raise FileNotFoundError(args.base_model)
     if args.output.resolve() == args.base_model.resolve():
         raise ValueError("output must not alias base_model")
-    source_roots = (
-        Path(__file__).resolve().parents[1],
-        args.exllamav3_root,
-        args.b12x_root,
-        args.vllm_root,
-    )
-    for source_root in source_roots:
-        _require_clean_source(source_root)
     calibration = FruitCalibrationStore(
         args.calibration,
         authority=authority,
     )
-    if _git_revision(args.exllamav3_root) != EXLLAMAV3_REVISION:
-        raise ValueError("ExLlamaV3 source revision does not match the pinned encoder")
     producer = _producer_provenance(
         exllamav3_root=args.exllamav3_root,
         b12x_root=args.b12x_root,
@@ -2676,6 +3419,18 @@ def main() -> None:
         vllm_root=args.vllm_root,
         calibration=calibration,
     )
+    runtime_qualification = (
+        _validate_runtime_qualification(
+            args.runtime_qualification,
+            output=args.output,
+            variant=args.variant,
+            publication=publication,
+            producer=producer,
+            source_evidence=source_evidence,
+        )
+        if args.runtime_qualification is not None
+        else None
+    )
     _write_package_manifests(
         args.output,
         source_evidence=source_evidence,
@@ -2685,6 +3440,7 @@ def main() -> None:
         rate_sweep=rate_sweep,
         layers=layers,
         publication=publication,
+        runtime_qualification=runtime_qualification,
     )
     _validate_output_package(
         args.output,
@@ -2693,6 +3449,7 @@ def main() -> None:
         producer=producer,
         rate_sweep=rate_sweep,
         require_complete=False,
+        runtime_qualification=runtime_qualification,
         spec=spec,
     )
     staged_cache = _stage_part_cache(args.output)
@@ -2710,6 +3467,7 @@ def main() -> None:
             producer=producer,
             rate_sweep=rate_sweep,
             require_complete=True,
+            runtime_qualification=runtime_qualification,
             spec=spec,
         )
     except BaseException:
