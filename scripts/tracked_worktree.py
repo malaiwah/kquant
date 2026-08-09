@@ -12,6 +12,12 @@ from typing import Self
 
 _FINGERPRINT_PREFIX = b"kquant-tracked-worktree-sha256-v1\0"
 GIT_EXECUTABLE = "/usr/bin/git"
+_GIT_CONFIG_OVERRIDES = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+)
 
 _READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
@@ -19,10 +25,15 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 
 def _git_output(root: Path, *args: str) -> bytes:
     try:
+        environment = dict(os.environ)
+        environment["GIT_CONFIG_GLOBAL"] = os.devnull
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_TERMINAL_PROMPT"] = "0"
         return subprocess.run(
-            (GIT_EXECUTABLE, "-C", str(root), *args),
+            (GIT_EXECUTABLE, *_GIT_CONFIG_OVERRIDES, "-C", str(root), *args),
             check=True,
             capture_output=True,
+            env=environment,
         ).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"cannot inspect source tree: {root}") from exc

@@ -12,6 +12,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -3167,20 +3168,31 @@ def _strip_routed_experts(
     target: Path,
     expected_sha256: str,
 ) -> tuple[set[str], int]:
-    _assert_authenticated_file(source, expected_sha256)
-    with safe_open(source, framework="pt", device="cpu") as handle:
-        metadata = handle.metadata()
-        names = handle.keys()
-        expert_names = {name for name in names if ".mlp.experts." in name}
-        if len(expert_names) != 3 * EXPERTS:
-            raise ValueError(
-                f"expected {3 * EXPERTS} routed-expert tensors in {source}, "
-                f"got {len(expert_names)}"
-            )
-        removed_bytes = sum(_tensor_nbytes(handle, name) for name in expert_names)
-        kept = {
-            name: handle.get_tensor(name) for name in names if name not in expert_names
-        }
+    with tempfile.TemporaryDirectory(prefix="kquant-base-shard-") as temporary:
+        snapshot = Path(temporary) / source.name
+        _copy_authenticated(source, snapshot, expected_sha256)
+        snapshot_stat = snapshot.stat()
+        if (
+            not stat.S_ISREG(snapshot_stat.st_mode)
+            or snapshot_stat.st_nlink != 1
+            or snapshot_stat.st_size == 0
+        ):
+            raise ValueError(f"cannot securely snapshot Fruit BF16 shard: {source}")
+        with safe_open(snapshot, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+            names = handle.keys()
+            expert_names = {name for name in names if ".mlp.experts." in name}
+            if len(expert_names) != 3 * EXPERTS:
+                raise ValueError(
+                    f"expected {3 * EXPERTS} routed-expert tensors in {source}, "
+                    f"got {len(expert_names)}"
+                )
+            removed_bytes = sum(_tensor_nbytes(handle, name) for name in expert_names)
+            kept = {
+                name: handle.get_tensor(name)
+                for name in names
+                if name not in expert_names
+            }
     _assert_authenticated_file(source, expected_sha256)
     _atomic_safetensors(target, kept, metadata)
     _assert_authenticated_file(source, expected_sha256)

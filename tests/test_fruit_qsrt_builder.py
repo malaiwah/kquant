@@ -62,6 +62,32 @@ def test_tracked_worktree_sha256_is_deterministic_for_clean_checkout(
     assert all(character in "0123456789abcdef" for character in first)
 
 
+def test_tracked_worktree_disables_repository_fsmonitor_hook(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "package" / "codec.py"
+    source.parent.mkdir()
+    source.write_text("CODEBOOK = 1\n", encoding="utf-8")
+    _commit_test_checkout(tmp_path)
+    marker = tmp_path.parent / f"{tmp_path.name}-fsmonitor-executed"
+    hook = tmp_path.parent / f"{tmp_path.name}-fsmonitor-hook"
+    hook.write_text(
+        f"#!/bin/sh\n/usr/bin/touch -- {marker!s}\nexit 0\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    subprocess.run(
+        ("git", "config", "core.fsmonitor", str(hook)),
+        cwd=tmp_path,
+        check=True,
+    )
+
+    digest = builder.tracked_worktree_sha256(tmp_path)
+
+    assert len(digest) == 64
+    assert not marker.exists()
+
+
 def test_tracked_worktree_snapshot_is_private_and_immutable_from_original(
     tmp_path: Path,
 ) -> None:
@@ -1747,6 +1773,70 @@ def test_copy_authenticated_breaks_third_party_hardlink(tmp_path: Path) -> None:
 
     assert not target.samefile(external)
     assert target.read_bytes() == content
+
+
+def test_strip_routed_experts_reads_private_authenticated_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(builder, "EXPERTS", 1)
+    source = tmp_path / "model-layer-003.safetensors"
+    target = tmp_path / "filtered.safetensors"
+    alternate = tmp_path / "alternate.safetensors"
+    prefix = "model.layers.3.mlp.experts.0"
+    original_tensors = {
+        f"{prefix}.{projection}.weight": builder.torch.tensor([1.0])
+        for projection in ("down_proj", "gate_proj", "up_proj")
+    }
+    original_tensors["model.layers.3.input_layernorm.weight"] = builder.torch.tensor(
+        [1.0]
+    )
+    altered_tensors = {
+        name: builder.torch.full_like(tensor, 9.0)
+        for name, tensor in original_tensors.items()
+    }
+    builder.save_file(original_tensors, source)
+    builder.save_file(altered_tensors, alternate)
+    original_bytes = source.read_bytes()
+    altered_bytes = alternate.read_bytes()
+    expected_sha256 = hashlib.sha256(original_bytes).hexdigest()
+    real_safe_open = builder.safe_open
+
+    class SwappingSafeOpen:
+        def __init__(self, path: Path, *args: object, **kwargs: object) -> None:
+            self.path = path
+            self.args = args
+            self.kwargs = kwargs
+            self.inner = None
+
+        def __enter__(self):
+            source.write_bytes(altered_bytes)
+            self.inner = real_safe_open(self.path, *self.args, **self.kwargs)
+            return self.inner.__enter__()
+
+        def __exit__(self, *args: object) -> object:
+            assert self.inner is not None
+            try:
+                return self.inner.__exit__(*args)
+            finally:
+                source.write_bytes(original_bytes)
+
+    monkeypatch.setattr(builder, "safe_open", SwappingSafeOpen)
+
+    removed, _ = builder._strip_routed_experts(
+        source,
+        target,
+        expected_sha256,
+    )
+
+    assert removed == {
+        f"{prefix}.down_proj.weight",
+        f"{prefix}.gate_proj.weight",
+        f"{prefix}.up_proj.weight",
+    }
+    with real_safe_open(target, framework="pt", device="cpu") as handle:
+        kept = handle.get_tensor("model.layers.3.input_layernorm.weight")
+    builder.torch.testing.assert_close(kept, builder.torch.tensor([1.0]))
 
 
 def test_materialize_base_model_reauthenticates_index(tmp_path: Path) -> None:
