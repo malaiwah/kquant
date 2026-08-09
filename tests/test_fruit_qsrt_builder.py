@@ -11,6 +11,7 @@ import pytest
 
 import scripts.build_fruit_qsrt_model as builder
 import scripts.encode_fruit_qsrt as encoder
+from kquant import fruit_calibration as calibration_module
 from scripts.tracked_worktree import snapshot_tracked_worktree
 
 
@@ -123,6 +124,40 @@ def test_tracked_worktree_sha256_rejects_hidden_assume_unchanged_file(
         builder.tracked_worktree_sha256(tmp_path)
 
 
+def test_calibration_snapshot_binds_layer_bytes_before_loading(tmp_path: Path) -> None:
+    source = tmp_path / "calibration"
+    source.mkdir()
+    layer_bytes = b"authenticated calibration layer"
+    layer = source / "layer-003.safetensors"
+    layer.write_bytes(layer_bytes)
+    manifest = {
+        "layers": {
+            "3": {
+                "bytes": len(layer_bytes),
+                "file": layer.name,
+                "sha256": hashlib.sha256(layer_bytes).hexdigest(),
+            }
+        }
+    }
+    manifest_path = source / "calibration-manifest.json"
+    manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    manifest_path.write_bytes(manifest_bytes)
+
+    snapshot, snapshot_root, captured_manifest = (
+        calibration_module._snapshot_calibration_source(
+            source,
+            expected_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        )
+    )
+    try:
+        layer.write_bytes(b"post-authentication mutation")
+        assert captured_manifest == manifest_bytes
+        assert (snapshot_root / layer.name).read_bytes() == layer_bytes
+        assert snapshot_root != source
+    finally:
+        snapshot.cleanup()
+
+
 def test_current_encoder_provenance_uses_process_lifetime_source_snapshot(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -179,6 +214,11 @@ def test_encoder_fingerprint_binds_source_revisions() -> None:
         "calibration_fingerprint": "5" * 64,
         "calibration_capture_id": "6" * 64,
         "calibration_manifest_sha256": "7" * 64,
+        "encoding_runtime": {
+            "schema": "test-bootstrap",
+            "runtime": {"external_oci_image_id": "sha256:" + "8" * 64},
+        },
+        "fingerprint_schema": builder._ENCODER_FINGERPRINT_SCHEMA,
     }
 
     first = hashlib.sha256(
@@ -194,6 +234,17 @@ def test_encoder_fingerprint_binds_source_revisions() -> None:
     ).hexdigest()
 
     assert first != second
+    encoder["kquant_revision"] = "1" * 40
+    encoder["encoding_runtime"]["runtime"]["external_oci_image_id"] = (
+        "sha256:" + "9" * 64
+    )
+    third = hashlib.sha256(
+        builder._canonical_json(builder._encoder_fingerprint_payload(encoder)).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+    assert first != third
 
 
 def test_encoder_run_manifests_are_isolated_by_shard_and_assignment(
@@ -387,6 +438,8 @@ def _runtime_qualification_fixture(
     output = tmp_path / "candidate"
     output.mkdir()
     (output / "config.json").write_text("{}\n", encoding="utf-8")
+    (output / "qsrt-manifest.json").write_text("{}\n", encoding="utf-8")
+    (output / "MANIFEST.sha256").write_text("fixture\n", encoding="utf-8")
     (output / "model.safetensors.index.json").write_text("{}\n", encoding="utf-8")
     (output / "model.safetensors").write_bytes(b"candidate tensors")
     revisions = {
@@ -426,15 +479,7 @@ def _runtime_qualification_fixture(
                 "fastsafetensors",
             ],
         }
-        runtime_revisions = (
-            revisions
-            if arm == "qsrt"
-            else {
-                "vllm_revision": "8" * 40,
-                "b12x_revision": "9" * 40,
-                "kquant_revision": "a" * 40,
-            }
-        )
+        runtime_revisions = revisions
         argv = [
             "vllm",
             "serve",
@@ -478,17 +523,13 @@ def _runtime_qualification_fixture(
         ]
         return {
             "runtime": {
-                "image": (
-                    f"registry.invalid/fruit-final@sha256:{'f' * 64}"
-                    if arm == "qsrt"
-                    else f"registry.invalid/fruit-r28@sha256:{'e' * 64}"
-                ),
+                "image": f"registry.invalid/fruit-final@sha256:{'f' * 64}",
                 **runtime_revisions,
                 "argv": argv,
                 "environment": dict(builder._FIXED_RUNTIME_ENVIRONMENT),
                 "software": {
                     "cuda": "13.2.1",
-                    "torch": "2.12.0" if arm == "qsrt" else "2.8.0",
+                    "torch": "2.12.0",
                 },
                 "compilation_backend": "inductor",
                 "cudagraph_mode": "FULL_AND_PIECEWISE",
@@ -554,8 +595,15 @@ def _runtime_qualification_fixture(
     ).hexdigest()
     index_sha256 = builder._sha256(output / "model.safetensors.index.json")
     config_sha256 = builder._sha256(output / "config.json")
+    qsrt_manifest_sha256 = builder._sha256(output / "qsrt-manifest.json")
+    checksum_manifest_sha256 = builder._sha256(output / "MANIFEST.sha256")
     (output / builder._CANDIDATE_MARKER_NAME).write_text(
-        builder._canonical_json({"schema": "kquant_qsrt_candidate_v1"}),
+        builder._canonical_json(
+            {
+                "schema": "kquant_qsrt_candidate_v1",
+                "checksum_manifest_sha256": checksum_manifest_sha256,
+            }
+        ),
         encoding="utf-8",
     )
     candidate_marker_sha256 = builder._sha256(output / builder._CANDIDATE_MARKER_NAME)
@@ -566,7 +614,7 @@ def _runtime_qualification_fixture(
         return {
             "repository": builder.fruit_publication_spec("instruct").repository,
             "revision": "4" * 40,
-            "manifest_sha256": "5" * 64,
+            "manifest_sha256": qsrt_manifest_sha256,
             "config_sha256": config_sha256,
             "model_index_sha256": index_sha256,
             "safetensors_bytes": (output / "model.safetensors").stat().st_size,
@@ -662,7 +710,7 @@ def _runtime_qualification_fixture(
         "fidelity": {
             "full_vocabulary": True,
             "positions": [0, 1],
-            "vocab_size": 128,
+            "vocab_size": builder._FRUIT_VOCAB_SIZE,
             "candidates": {"siq": fidelity(0.2), "qsrt": fidelity(0.1)},
         },
     }
@@ -676,9 +724,12 @@ def _validate_runtime_fixture(
     output: Path,
     producer: dict[str, object],
     source: dict[str, object],
+    *,
+    expected_sha256: str | None = None,
 ) -> dict[str, object]:
     return builder._validate_runtime_qualification(
         path,
+        expected_sha256=expected_sha256 or builder._sha256(path),
         output=output,
         variant="instruct",
         publication=builder.fruit_publication_spec("instruct"),
@@ -703,14 +754,43 @@ def test_runtime_qualification_validates_seals_and_renders(tmp_path: Path) -> No
         "| QSRT | 7.00 | 0.875x | 1.000 | `inductor` / `FULL_AND_PIECEWISE` |"
         in section
     )
-    assert "not identical software" in section
-    assert "spanning instruction following" in section
-    assert "not a standardized leaderboard benchmark" in section
+    assert "same immutable image, software stack" in section
+    assert "spanning instruction following" not in section
+    assert "targeted prompts across BF16" in section
     assert "non-representative" not in section
     assert builder._RUNTIME_QUALIFICATION_NAME in (
         builder._expected_package_inventory({"files": {}})
     )
     assert payload == validated
+
+
+def test_runtime_qualification_requires_external_digest_authority(
+    tmp_path: Path,
+) -> None:
+    path, output, payload, producer, source = _runtime_qualification_fixture(tmp_path)
+    authorized_sha256 = builder._sha256(path)
+    payload["complete"] = False
+    path.write_text(builder._canonical_json(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="external SHA-256 authority"):
+        _validate_runtime_fixture(
+            path,
+            output,
+            producer,
+            source,
+            expected_sha256=authorized_sha256,
+        )
+
+
+def test_runtime_qualification_rejects_cross_arm_runtime_drift(
+    tmp_path: Path,
+) -> None:
+    path, output, payload, producer, source = _runtime_qualification_fixture(tmp_path)
+    payload["loaders"]["siq"]["runtime"]["software"]["torch"] = "different"
+    path.write_text(builder._canonical_json(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="same immutable runtime identity"):
+        _validate_runtime_fixture(path, output, producer, source)
 
 
 def test_runtime_qualification_copy_and_manifests(monkeypatch, tmp_path: Path) -> None:
@@ -820,6 +900,7 @@ def test_candidate_seal_precedes_and_binds_runtime_qualification(
         base_provenance=base,
         producer=producer,
         runtime_qualification=receipt,
+        runtime_qualification_sha256=builder._sha256(qualification_path),
     )
     assert complete["schema"] == "kquant_qsrt_complete_v3"
     assert complete["qualified_candidate_sha256"] == marker_digest
@@ -837,6 +918,79 @@ def test_candidate_seal_precedes_and_binds_runtime_qualification(
             publication=publication,
             allow_part_cache=False,
         )
+
+
+def test_completion_failure_restores_entire_candidate_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "candidate"
+    candidate_files = {
+        "README.md": b"candidate card\n",
+        "qsrt-manifest.json": b'{"candidate":true}\n',
+        "MANIFEST.sha256": b"candidate checksums\n",
+        builder._CANDIDATE_MARKER_NAME: b'{"candidate":"marker"}\n',
+        builder._RATE_SWEEP_NAME: b'{"rates":"sealed"}\n',
+    }
+    for relative, content in candidate_files.items():
+        path = output / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    expected = builder._snapshot_candidate_metadata(output)
+
+    def write_completion_metadata(root: Path, **_kwargs: object) -> None:
+        builder.shutil.rmtree(root / "evaluation")
+        (root / "evaluation").mkdir()
+        (root / builder._RATE_SWEEP_NAME).write_text("final rates\n")
+        (root / builder._RUNTIME_QUALIFICATION_NAME).write_text("receipt\n")
+        (root / "README.md").write_text("final card\n")
+        (root / "qsrt-manifest.json").write_text("final manifest\n")
+        (root / "MANIFEST.sha256").write_text("final checksums\n")
+
+    def fail_complete_marker(root: Path, **_kwargs: object) -> None:
+        (root / builder._COMPLETE_MARKER_NAME).write_text("partial marker\n")
+        raise OSError("injected complete-marker failure")
+
+    monkeypatch.setattr(builder, "_write_package_manifests", write_completion_metadata)
+    monkeypatch.setattr(builder, "_validate_output_package", lambda *_a, **_k: None)
+    monkeypatch.setattr(builder, "_write_complete_marker", fail_complete_marker)
+
+    with pytest.raises(OSError, match="injected complete-marker failure"):
+        builder._complete_candidate_package(
+            output,
+            source_evidence={},
+            base_provenance={},
+            producer={},
+            calibration=SimpleNamespace(),
+            rate_sweep={},
+            layers={},
+            publication=builder.fruit_publication_spec("instruct"),
+            runtime_qualification={},
+            runtime_qualification_sha256="a" * 64,
+            spec=SimpleNamespace(),
+        )
+
+    assert builder._snapshot_candidate_metadata(output) == expected
+    assert not (output / builder._COMPLETE_MARKER_NAME).exists()
+    assert not (output / builder._RUNTIME_QUALIFICATION_NAME).exists()
+
+
+def test_atomic_text_failure_removes_temporary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "metadata.json"
+    temporary = path.with_name(f".{path.name}.tmp-{builder.os.getpid()}")
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("injected atomic replace failure")
+
+    monkeypatch.setattr(builder.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected atomic replace failure"):
+        builder._atomic_text(path, "{}\n")
+
+    assert not path.exists()
+    assert not temporary.exists()
 
 
 def test_runtime_qualification_requires_canonical_receipt(tmp_path: Path) -> None:
@@ -884,6 +1038,7 @@ def test_runtime_qualification_rejects_stale_build_identities(tmp_path: Path) ->
         lambda value: value["candidate"]["safetensors_sha256"].update(
             {"model.safetensors": "0" * 64}
         ),
+        lambda value: value["fidelity"].update({"vocab_size": 11}),
         lambda value: value["candidate"].pop("marker_sha256"),
         lambda value: value["models"]["siq"].pop("manifest_sha256"),
         lambda value: value["models"]["bf16"].update(
@@ -893,6 +1048,7 @@ def test_runtime_qualification_rejects_stale_build_identities(tmp_path: Path) ->
         lambda value: value["loaders"]["qsrt"]["runtime"].update(
             {"vllm_revision": "9" * 40}
         ),
+        lambda value: value["models"]["qsrt"].update({"manifest_sha256": "0" * 64}),
     )
     for mutate in mutations:
         malformed = json.loads(builder._canonical_json(payload))
@@ -1154,15 +1310,38 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
         fingerprint=calibration_identity["fingerprint"],
         manifest_sha256=calibration_identity["manifest_sha256"],
     )
-    encoder = {
+    production_encoder = {
+        "kquant_revision": "1" * 40,
+        "kquant_source_sha256": "2" * 64,
+        "exllamav3_revision": "3" * 40,
+        "exllamav3_source_sha256": "4" * 64,
+        "calibration_fingerprint": calibration.fingerprint,
+        "calibration_capture_id": calibration.capture_id,
+        "calibration_manifest_sha256": calibration.manifest_sha256,
+        "encoding_runtime": {"schema": "authenticated-builder"},
         "fingerprint_schema": builder._ENCODER_FINGERPRINT_SCHEMA,
-        "fingerprint": "c" * 64,
     }
-    producer = {"encoder": encoder}
+    production_encoder["fingerprint"] = hashlib.sha256(
+        builder._canonical_json(
+            builder._encoder_fingerprint_payload(production_encoder)
+        ).encode("utf-8")
+    ).hexdigest()
+    sweep_encoder = {
+        name: value
+        for name, value in production_encoder.items()
+        if name not in {"encoding_runtime", "fingerprint"}
+    }
+    sweep_encoder["fingerprint_schema"] = builder._LEGACY_ENCODER_FINGERPRINT_SCHEMA
+    sweep_encoder["fingerprint"] = hashlib.sha256(
+        builder._canonical_json(
+            builder._encoder_fingerprint_payload(sweep_encoder)
+        ).encode("utf-8")
+    ).hexdigest()
+    producer = {"encoder": production_encoder}
     payload = _rate_sweep(
         source=source,
         calibration=calibration_identity,
-        encoder=encoder,
+        encoder=sweep_encoder,
     )
     path = tmp_path / "rates.json"
     path.write_text(builder._canonical_json(payload), encoding="utf-8")
@@ -1170,6 +1349,7 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
     assert (
         builder._validate_rate_sweep(
             path,
+            expected_sha256=builder._sha256(path),
             source_evidence=source,
             calibration=calibration,
             producer=producer,
@@ -1177,25 +1357,83 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
         == payload
     )
 
-    mixed = json.loads(builder._canonical_json(payload))
-    mixed["signature"]["encoder"]["kquant_revision"] = "mixed"
-    path.write_text(builder._canonical_json(mixed), encoding="utf-8")
+    repinned_sweep = json.loads(builder._canonical_json(payload))
+    repinned_encoder = repinned_sweep["signature"]["encoder"]
+    repinned_encoder["kquant_revision"] = "8" * 40
+    repinned_encoder["fingerprint"] = hashlib.sha256(
+        builder._canonical_json(
+            builder._encoder_fingerprint_payload(repinned_encoder)
+        ).encode("utf-8")
+    ).hexdigest()
+    path.write_text(builder._canonical_json(repinned_sweep), encoding="utf-8")
+    assert (
+        builder._validate_rate_sweep(
+            path,
+            expected_sha256=builder._sha256(path),
+            source_evidence=source,
+            calibration=calibration,
+            producer=producer,
+        )
+        == repinned_sweep
+    )
+
+    repinned_encoder["exllamav3_revision"] = "7" * 40
+    repinned_encoder["fingerprint"] = hashlib.sha256(
+        builder._canonical_json(
+            builder._encoder_fingerprint_payload(repinned_encoder)
+        ).encode("utf-8")
+    ).hexdigest()
+    path.write_text(builder._canonical_json(repinned_sweep), encoding="utf-8")
     with pytest.raises(ValueError, match="provenance"):
         builder._validate_rate_sweep(
             path,
+            expected_sha256=builder._sha256(path),
             source_evidence=source,
             calibration=calibration,
             producer=producer,
         )
     path.write_text(builder._canonical_json(payload), encoding="utf-8")
 
-    producer["encoder"] = {
-        "fingerprint_schema": builder._ENCODER_FINGERPRINT_SCHEMA,
-        "fingerprint": "d" * 64,
-    }
+    changed_producer = json.loads(builder._canonical_json(producer))
+    changed_encoder = changed_producer["encoder"]
+    changed_encoder["kquant_revision"] = "9" * 40
+    changed_encoder["fingerprint"] = hashlib.sha256(
+        builder._canonical_json(
+            builder._encoder_fingerprint_payload(changed_encoder)
+        ).encode("utf-8")
+    ).hexdigest()
+    assert (
+        builder._validate_rate_sweep(
+            path,
+            expected_sha256=builder._sha256(path),
+            source_evidence=source,
+            calibration=calibration,
+            producer=changed_producer,
+        )
+        == payload
+    )
+
+    changed_encoder["exllamav3_source_sha256"] = "6" * 64
+    changed_encoder["fingerprint"] = hashlib.sha256(
+        builder._canonical_json(
+            builder._encoder_fingerprint_payload(changed_encoder)
+        ).encode("utf-8")
+    ).hexdigest()
     with pytest.raises(ValueError, match="provenance"):
         builder._validate_rate_sweep(
             path,
+            expected_sha256=builder._sha256(path),
+            source_evidence=source,
+            calibration=calibration,
+            producer=changed_producer,
+        )
+    authorized_sha256 = builder._sha256(path)
+    payload["complete"] = False
+    path.write_text(builder._canonical_json(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="external SHA-256 authority"):
+        builder._validate_rate_sweep(
+            path,
+            expected_sha256=authorized_sha256,
             source_evidence=source,
             calibration=calibration,
             producer=producer,
@@ -1213,10 +1451,6 @@ def test_package_files_reject_resume_cache_before_sealing(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="unexpected Fruit package directory"):
         builder._package_files(tmp_path)
-
-    builder._remove_part_cache(tmp_path)
-    files = builder._package_files(tmp_path)
-    assert set(files) == {"config.json", "evaluation/report.json"}
 
 
 def test_validated_package_files_reject_unknown_top_level_file(
@@ -1244,11 +1478,7 @@ def test_part_cache_rejects_nested_layer_symlink(monkeypatch, tmp_path: Path) ->
     (cache / "layer-003").symlink_to(external, target_is_directory=True)
 
     with pytest.raises(ValueError, match="cache path"):
-        builder._parts_need_encoder(
-            tmp_path,
-            source_sha256="a" * 64,
-            encoder_fingerprint="b" * 64,
-        )
+        builder._validate_part_cache_root(cache, create=False)
 
 
 def test_encoder_cache_allows_only_private_active_temporaries(
@@ -1292,36 +1522,81 @@ def test_prepare_output_root_rejects_symlink(tmp_path: Path) -> None:
     output.symlink_to(target, target_is_directory=True)
 
     with pytest.raises(ValueError, match="package root"):
-        builder._prepare_output_root(output)
+        builder._prepare_fresh_candidate_output(output)
 
 
-def test_staged_part_cache_restores_resume_state(monkeypatch, tmp_path: Path) -> None:
+def test_fresh_candidate_output_rejects_resume_state(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    parts = output / ".qsrt-parts"
+    parts.mkdir(parents=True)
+    with pytest.raises(ValueError, match="fresh empty output"):
+        builder._prepare_fresh_candidate_output(output)
+
+    parts.rmdir()
+    output.rmdir()
+    staged = builder._staged_part_cache_path(output)
+    staged.mkdir()
+    with pytest.raises(ValueError, match="no pre-existing staged part cache"):
+        builder._prepare_fresh_candidate_output(output)
+
+
+def test_finalize_part_cache_removes_active_and_staged_trees(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr(builder, "LAYERS", (3,))
     monkeypatch.setattr(builder, "EXPERTS", 1)
-    output = tmp_path / "output"
-    part = output / ".qsrt-parts" / "layer-003" / "expert-000.json"
-    part.parent.mkdir(parents=True)
-    part.write_text("{}", encoding="utf-8")
+    output = tmp_path / "candidate"
+    layer = output / ".qsrt-parts" / "layer-003"
+    layer.mkdir(parents=True)
 
-    staged = builder._stage_part_cache(output)
-    assert staged is not None and staged.is_dir()
+    builder._finalize_part_cache(output)
+
     assert not (output / ".qsrt-parts").exists()
-
-    builder._restore_staged_part_cache(output, staged)
-    assert part.read_text(encoding="utf-8") == "{}"
+    assert not builder._staged_part_cache_path(output).exists()
 
 
-def test_remove_part_cache_preserves_package_files(tmp_path: Path) -> None:
-    config = tmp_path / "config.json"
-    config.write_text("{}", encoding="utf-8")
-    parts = tmp_path / ".qsrt-parts" / "layer-003"
-    parts.mkdir(parents=True)
-    (parts / "expert-000.safetensors").write_bytes(b"resume")
+def test_empty_layer_assembly_consumes_part_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(builder, "LAYERS", ())
+    output = tmp_path / "candidate"
+    (output / ".qsrt-parts").mkdir(parents=True)
 
-    builder._remove_part_cache(tmp_path)
+    layers = builder._assemble_layers(
+        output,
+        source_sha256="a" * 64,
+        encoder_fingerprint="b" * 64,
+    )
 
-    assert not (tmp_path / ".qsrt-parts").exists()
-    assert config.read_text(encoding="utf-8") == "{}"
+    assert layers == {}
+    assert not (output / ".qsrt-parts").exists()
+    assert not builder._staged_part_cache_path(output).exists()
+    assert not (output / builder._CANDIDATE_MARKER_NAME).exists()
+
+
+def test_finalize_part_cache_failure_is_nonresumable_and_unsealed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(builder, "LAYERS", (3,))
+    monkeypatch.setattr(builder, "EXPERTS", 1)
+    output = tmp_path / "candidate"
+    layer = output / ".qsrt-parts" / "layer-003"
+    layer.mkdir(parents=True)
+    staged = builder._staged_part_cache_path(output)
+
+    def fail_removal(path: Path) -> None:
+        assert path == staged
+        raise OSError("injected staged-cache cleanup failure")
+
+    monkeypatch.setattr(builder.shutil, "rmtree", fail_removal)
+    with pytest.raises(OSError, match="injected staged-cache cleanup failure"):
+        builder._finalize_part_cache(output)
+
+    assert not (output / ".qsrt-parts").exists()
+    assert staged.is_dir()
+    assert not (output / builder._CANDIDATE_MARKER_NAME).exists()
+    with pytest.raises(ValueError, match="no pre-existing staged part cache"):
+        builder._prepare_fresh_candidate_output(output)
 
 
 def test_copy_authenticated_breaks_source_hardlink(tmp_path: Path) -> None:
@@ -1373,7 +1648,7 @@ def test_materialize_base_model_reauthenticates_index(tmp_path: Path) -> None:
         builder._materialize_base_model(base_model, output, provenance)
 
 
-def test_seed_parts_rejects_manifest_format_that_disagrees_with_tensor(
+def test_part_validation_rejects_manifest_format_that_disagrees_with_tensor(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(builder, "LAYERS", (3,))
@@ -1442,62 +1717,3 @@ def test_seed_parts_rejects_manifest_format_that_disagrees_with_tensor(
             encoder_fingerprint=encoder_fingerprint,
             repair=False,
         )
-
-    output = tmp_path / "output"
-    assert (
-        builder._seed_parts(
-            output,
-            seed,
-            source_sha256,
-            encoder_fingerprint,
-        )
-        == 0
-    )
-    assert not (output / ".qsrt-parts/layer-003/expert-000.safetensors").exists()
-
-
-def test_seed_parts_validate_source_read_only_before_copy(
-    monkeypatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(builder, "LAYERS", (3,))
-    monkeypatch.setattr(builder, "EXPERTS", 1)
-    seed = tmp_path / "seed"
-    seed_layer = seed / "layer-003"
-    seed_layer.mkdir(parents=True)
-    source_tensor = seed_layer / "expert-000.safetensors"
-    source_manifest = seed_layer / "expert-000.json"
-    source_tensor.write_bytes(b"authenticated tensor")
-    source_manifest.write_text('{"authenticated": true}', encoding="utf-8")
-    calls = []
-
-    def validate(tensor_path, manifest_path, **kwargs):
-        calls.append((tensor_path, manifest_path, kwargs))
-        return {
-            "status": "valid",
-            "safetensors_sha256": hashlib.sha256(
-                source_tensor.read_bytes()
-            ).hexdigest(),
-        }
-
-    monkeypatch.setattr(builder, "_validate_part", validate)
-    output = tmp_path / "output"
-
-    assert builder._seed_parts(output, seed, "a" * 64, "b" * 64) == 1
-    target_tensor = output / ".qsrt-parts/layer-003/expert-000.safetensors"
-    target_manifest = output / ".qsrt-parts/layer-003/expert-000.json"
-    expected_kwargs = {
-        "layer": 3,
-        "expert": 0,
-        "source_sha256": "a" * 64,
-        "encoder_fingerprint": "b" * 64,
-        "repair": False,
-    }
-    assert calls == [
-        (source_tensor, source_manifest, expected_kwargs),
-        (target_tensor, target_manifest, expected_kwargs),
-    ]
-    assert source_tensor.read_bytes() == b"authenticated tensor"
-    assert source_manifest.read_text(encoding="utf-8") == '{"authenticated": true}'
-    assert (
-        output / ".qsrt-parts/layer-003/expert-000.safetensors"
-    ).read_bytes() == b"authenticated tensor"

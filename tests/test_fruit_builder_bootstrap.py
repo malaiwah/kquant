@@ -103,6 +103,11 @@ def _launch(
     *,
     environment: dict[str, str] | None = None,
     external_oci_image_id: str = "sha256:" + "f" * 64,
+    candidate_only: bool = True,
+    runtime_qualification_sha256: str | None = None,
+    rate_sweep_sha256: str | None = (
+        "95d3cb9f5dc66ec7615497d07ec0e42281594bfb20649e23b2c6dcbff34406f6"
+    ),
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         (
@@ -120,8 +125,26 @@ def _launch(
             bootstrap_sha256,
             "--external-oci-image-id",
             external_oci_image_id,
+            *(
+                ("--rate-sweep-sha256", rate_sweep_sha256)
+                if rate_sweep_sha256 is not None
+                else ()
+            ),
+            *(
+                (
+                    "--runtime-qualification-sha256",
+                    runtime_qualification_sha256,
+                )
+                if runtime_qualification_sha256 is not None
+                else ()
+            ),
             "--",
             str(output),
+            *(
+                ("--candidate-only",)
+                if candidate_only
+                else ("--runtime-qualification", "runtime-qualification.json")
+            ),
         ),
         check=False,
         capture_output=True,
@@ -162,6 +185,84 @@ def test_authenticated_bootstrap_executes_committed_builder_not_restoring_live_c
     assert result.returncode == 0, result.stderr
     assert output.read_text(encoding="utf-8") == "committed snapshot\n"
     assert "malicious live tree" in live_builder.read_text(encoding="utf-8")
+
+
+def test_authenticated_bootstrap_requires_stage_specific_qualification_authority(
+    tmp_path: Path,
+) -> None:
+    checkout, trusted_bootstrap, revision, source_sha256, bootstrap_sha256 = (
+        _bootstrap_fixture(tmp_path)
+    )
+    output = tmp_path / "artifact-write.txt"
+    authority = "a" * 64
+
+    missing_runtime_authority = _launch(
+        trusted_bootstrap,
+        checkout,
+        revision,
+        source_sha256,
+        bootstrap_sha256,
+        output,
+        candidate_only=False,
+    )
+    assert missing_runtime_authority.returncode != 0
+    assert (
+        "requires an external runtime qualification SHA-256"
+        in missing_runtime_authority.stderr
+    )
+    assert not output.exists()
+
+    missing_rate_authority = _launch(
+        trusted_bootstrap,
+        checkout,
+        revision,
+        source_sha256,
+        bootstrap_sha256,
+        output,
+        rate_sweep_sha256=None,
+    )
+    assert missing_rate_authority.returncode != 0
+    assert "requires an external rate-sweep SHA-256" in missing_rate_authority.stderr
+    assert not output.exists()
+
+    wrong_rate_authority = _launch(
+        trusted_bootstrap,
+        checkout,
+        revision,
+        source_sha256,
+        bootstrap_sha256,
+        output,
+        rate_sweep_sha256="c" * 64,
+    )
+    assert wrong_rate_authority.returncode != 0
+    assert "does not match the pinned authority" in wrong_rate_authority.stderr
+    assert not output.exists()
+
+    candidate = _launch(
+        trusted_bootstrap,
+        checkout,
+        revision,
+        source_sha256,
+        bootstrap_sha256,
+        output,
+        runtime_qualification_sha256=authority,
+    )
+    assert candidate.returncode != 0
+    assert "must not accept a runtime qualification anchor" in candidate.stderr
+    assert not output.exists()
+
+    final = _launch(
+        trusted_bootstrap,
+        checkout,
+        revision,
+        source_sha256,
+        bootstrap_sha256,
+        output,
+        candidate_only=False,
+        runtime_qualification_sha256=authority,
+    )
+    assert final.returncode == 0, final.stderr
+    assert output.read_text(encoding="utf-8") == "committed snapshot\n"
 
 
 @pytest.mark.parametrize(

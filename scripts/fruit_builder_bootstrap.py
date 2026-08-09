@@ -24,9 +24,12 @@ import tempfile
 from pathlib import Path
 
 _SOURCE_FINGERPRINT_PREFIX = b"kquant-tracked-worktree-sha256-v1\0"
-_BOOTSTRAP_CONTEXT_ENV = "KQUANT_FRUIT_BUILDER_BOOTSTRAP_V3"
-_CONTEXT_SCHEMA = "kquant_fruit_builder_bootstrap_v3"
+_BOOTSTRAP_CONTEXT_ENV = "KQUANT_FRUIT_BUILDER_BOOTSTRAP_V5"
+_CONTEXT_SCHEMA = "kquant_fruit_builder_bootstrap_v5"
 _RUNTIME_IDENTITY_SCHEMA = "kquant_fruit_builder_external_oci_runtime_v1"
+_RATE_SWEEP_AUTHORITY_SHA256 = (
+    "95d3cb9f5dc66ec7615497d07ec0e42281594bfb20649e23b2c6dcbff34406f6"
+)
 _PYTHON_EXECUTABLE = Path("/opt/venv/bin/python")
 _PYTHON_SITE_PACKAGES = Path("/opt/venv/lib/python3.12/site-packages")
 _GIT_EXECUTABLE = Path("/usr/bin/git")
@@ -306,8 +309,51 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--kquant-source-sha256")
     parser.add_argument("--bootstrap-sha256")
     parser.add_argument("--external-oci-image-id")
+    parser.add_argument("--runtime-qualification-sha256")
+    parser.add_argument("--rate-sweep-sha256")
     parser.add_argument("builder_args", nargs=argparse.REMAINDER)
     return parser
+
+
+def _runtime_qualification_anchor(
+    builder_args: list[str], supplied_sha256: str | None
+) -> str | None:
+    candidate_mode = "--candidate-only" in builder_args
+    completion_mode = any(
+        argument == "--runtime-qualification"
+        or argument.startswith("--runtime-qualification=")
+        for argument in builder_args
+    )
+    if candidate_mode == completion_mode:
+        raise ValueError(
+            "production builder requires exactly one candidate or completion stage"
+        )
+    if candidate_mode:
+        if supplied_sha256 is not None:
+            raise ValueError(
+                "candidate builder must not accept a runtime qualification anchor"
+            )
+        return None
+    if supplied_sha256 is None:
+        raise ValueError(
+            "completion builder requires an external runtime qualification SHA-256"
+        )
+    return _digest(
+        supplied_sha256,
+        length=64,
+        name="runtime qualification SHA-256",
+    )
+
+
+def _rate_sweep_anchor(supplied_sha256: str | None) -> str:
+    if supplied_sha256 is None:
+        raise ValueError("production builder requires an external rate-sweep SHA-256")
+    supplied = _digest(supplied_sha256, length=64, name="rate-sweep SHA-256")
+    if supplied != _RATE_SWEEP_AUTHORITY_SHA256:
+        raise ValueError(
+            "production rate-sweep SHA-256 does not match the pinned authority"
+        )
+    return _RATE_SWEEP_AUTHORITY_SHA256
 
 
 def main() -> None:
@@ -323,6 +369,8 @@ def main() -> None:
                     args.kquant_source_sha256,
                     args.bootstrap_sha256,
                     args.external_oci_image_id,
+                    args.runtime_qualification_sha256,
+                    args.rate_sweep_sha256,
                 )
             )
             or args.builder_args
@@ -377,6 +425,10 @@ def main() -> None:
         raise ValueError(
             "production builder arguments must follow an explicit -- separator"
         )
+    runtime_qualification_sha256 = _runtime_qualification_anchor(
+        builder_args, args.runtime_qualification_sha256
+    )
+    rate_sweep_sha256 = _rate_sweep_anchor(args.rate_sweep_sha256)
 
     snapshot = snapshot_git_revision(
         checkout,
@@ -394,6 +446,8 @@ def main() -> None:
         "builder_sha256": builder_sha256,
         "runtime": runtime_identity,
         "snapshot_root": str(snapshot),
+        "runtime_qualification_sha256": runtime_qualification_sha256,
+        "rate_sweep_sha256": rate_sweep_sha256,
     }
     runtime_root = Path(tempfile.mkdtemp(prefix="kquant-fruit-runtime-", dir="/tmp"))
     private_directories = {

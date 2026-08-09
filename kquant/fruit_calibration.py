@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import tempfile
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, Self
 
 import torch
 from safetensors import safe_open
@@ -19,6 +21,7 @@ from kquant.fruit_source import (
     FRUIT_ANNEALED_SPEC,
     FRUIT_INSTRUCT_SPEC,
     FruitModelSpec,
+    _copy_authenticated_file,
     fruit_model_spec,
 )
 
@@ -99,6 +102,74 @@ def _is_sha256(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _snapshot_calibration_source(
+    source_root: Path,
+    *,
+    expected_manifest_sha256: str,
+) -> tuple[tempfile.TemporaryDirectory[str], Path, bytes]:
+    temporary_directory = tempfile.TemporaryDirectory(
+        prefix="kquant-fruit-calibration-"
+    )
+    snapshot_root = Path(temporary_directory.name)
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    try:
+        source_root_fd = os.open(source_root, directory_flags)
+    except OSError as exc:
+        temporary_directory.cleanup()
+        raise ValueError(
+            f"cannot securely open Fruit calibration root: {source_root}"
+        ) from exc
+    try:
+        manifest_bytes, _ = _copy_authenticated_file(
+            source_root_fd=source_root_fd,
+            filename="calibration-manifest.json",
+            destination=snapshot_root / "calibration-manifest.json",
+            expected_sha256=expected_manifest_sha256,
+            capture_bytes=True,
+        )
+        assert manifest_bytes is not None
+        try:
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("Fruit calibration manifest is malformed") from exc
+        layers = manifest.get("layers") if isinstance(manifest, dict) else None
+        if not isinstance(layers, dict):
+            raise TypeError("Fruit calibration layer ledger is unavailable")
+        copied: set[str] = set()
+        for entry in layers.values():
+            if not isinstance(entry, dict):
+                raise TypeError("Fruit calibration layer ledger entry is invalid")
+            filename = entry.get("file")
+            expected_sha256 = entry.get("sha256")
+            expected_bytes = entry.get("bytes")
+            if (
+                not isinstance(filename, str)
+                or Path(filename).name != filename
+                or filename in copied
+                or not _is_sha256(expected_sha256)
+                or type(expected_bytes) is not int
+                or expected_bytes <= 0
+            ):
+                raise ValueError("Fruit calibration layer ledger entry is invalid")
+            _copy_authenticated_file(
+                source_root_fd=source_root_fd,
+                filename=filename,
+                destination=snapshot_root / filename,
+                expected_sha256=expected_sha256,
+            )
+            if (snapshot_root / filename).stat().st_size != expected_bytes:
+                raise ValueError(
+                    f"Fruit calibration layer byte length mismatch: {filename}"
+                )
+            copied.add(filename)
+    except BaseException:
+        temporary_directory.cleanup()
+        raise
+    finally:
+        os.close(source_root_fd)
+    return temporary_directory, snapshot_root, manifest_bytes
 
 
 @dataclass(frozen=True)
@@ -512,14 +583,16 @@ class FruitCalibrationStore:
         *,
         authority: FruitCalibrationAuthority = FRUIT_ANNEALED_CALIBRATION_AUTHORITY,
     ) -> None:
-        self.root = Path(root)
-        manifest_path = self.root / "calibration-manifest.json"
-        if not manifest_path.is_file():
-            raise FileNotFoundError(manifest_path)
-        manifest_bytes = manifest_path.read_bytes()
+        source_root = Path(root)
+        (
+            self._snapshot,
+            self.root,
+            manifest_bytes,
+        ) = _snapshot_calibration_source(
+            source_root,
+            expected_manifest_sha256=authority.manifest_sha256,
+        )
         actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-        if actual_manifest_sha256 != authority.manifest_sha256:
-            raise ValueError("Fruit calibration manifest SHA-256 mismatch")
         manifest = json.loads(manifest_bytes.decode("utf-8"))
         if not isinstance(manifest, dict):
             raise TypeError("Fruit calibration manifest must be a JSON object")
@@ -755,7 +828,7 @@ class FruitCalibrationStore:
         }:
             raise ValueError("Fruit calibration layer ledger is incomplete")
         self.manifest = manifest
-        self.manifest_sha256 = _sha256(manifest_path)
+        self.manifest_sha256 = actual_manifest_sha256
         self.fingerprint = fingerprint
         self.capture_id = capture_id
         self.routed_scale = float(routed_scale)
@@ -809,6 +882,17 @@ class FruitCalibrationStore:
             global_h13=tensors["global_h13"],
             routed_scale=self.routed_scale,
         )
+
+    def close(self) -> None:
+        """Remove the process-private calibration snapshot."""
+
+        self._snapshot.cleanup()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 __all__ = [
