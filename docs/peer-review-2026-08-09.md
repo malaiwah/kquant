@@ -9,15 +9,19 @@ GPU, no model weights, no CUDA extension build. Ruff was run across `F`, `E9`,
 `B`, `PLE`, `PLW`, `RUF` and the `S` security rules on every tree.
 
 Reviewed at fork `79461d3`, upstream `104dd92`. Nine worktrees, nine suites,
-ten findings.
+fifteen findings across two passes.
 
 - **Two branch heads are red**: `feat/fruit-logical-adapter` (F1, head of open
   upstream PR #4) and `codex/kimi-k3-tp16-local-exl3-onegrid-20260801` (F2).
 - Upstream `master` is otherwise in good shape: 341 tests green, invariants
   asserted at import time, and the TP-independence rewrite deleted seven
   scripts without leaving a single dangling reference in code or docs.
+- The **second pass** (F11–F15, at the end of this document) covers what the
+  first pass explicitly skipped: the CUDA/C++ kernels, the codec's algorithmic
+  core, and the GLM recipe's verification logic. It also records three areas
+  that were probed hard and came back clean, with executable evidence.
 
-Each finding below carries a ready-to-file issue title, label and body, so it
+Findings F1–F10 each carry a ready-to-file issue title, label and body, so they
 can be pasted into either repository verbatim.
 
 ---
@@ -77,6 +81,15 @@ results say nothing about compatibility with current `master` — see F4.
 | F8 | Quality | upstream `master` | `x4t.py:291` annotation names a type never bound at module scope |
 | F9 | Quality | `codex/exl3-tp16-1m` | `n_keep == 0` inverts the keep mask; `os.link` has no cross-device fallback |
 | F10 | Quality | `dev/gg-k3-4p05` | Revision provenance derived two different ways in one commit |
+| F11 | Correctness | upstream `master` (CUDA) | Batch bound derived from `temp_costs`, but the kernel indexes `temp_edges`, whose leading dim is unchecked |
+| F12 | Efficiency | upstream `master` (CUDA) | `temp_costs` global buffer is unreachable for every supported `K`; ~28 MiB dead VRAM per GPU |
+| F13 | Correctness | upstream `master` (CUDA) | Output and scratch tensors never checked for device or contiguity in either entry point |
+| F14 | Security | `feat/glm52-…` (PR #1) | Only 3 of N bundle files hash-verified, whole bundle copied, result reported as "verified" |
+| F15 | Resource | upstream `master` | Process-local LUT caches are never evicted |
+
+F11–F15 are written up in the **Second pass** section at the end of this
+document rather than here, because their evidence is longer than a paste-ready
+issue body and three of them share one fix site.
 
 ---
 
@@ -1077,3 +1090,253 @@ tree.
   the `record_pair < spec.mode_id` test;
 - `args.revision` on the `rank` subcommand resolves via the top-level parser at
   `kquant/cli.py:221`, so `dev/gg-k3-4p05` does not crash there.
+
+---
+
+# Second pass — 2026-08-09
+
+The first pass explicitly left four areas uncovered: the CUDA/C++ kernels (never
+compiled or read), the codec's algorithmic core, the large Fruit modules, and
+the GLM recipe's verification logic. This pass covers them, with executable
+proof where the claim admits it.
+
+Five new findings, F11–F15. Three areas were probed hard and came back **clean**
+— those negative results are recorded too, because "we checked and it holds" is
+worth as much here as a defect.
+
+## Verified clean (executable evidence)
+
+**Atom storage round-trips are bit-exact.** A harness built against the real
+`QSRTTrellisDescriptor` geometry exercised `pack_matrix_atoms` /
+`unpack_matrix_atoms` for both rate axes (`n` = w1/w3, `k` = w2) across all
+three modes R0/R1/R2 on random int16 payloads, plus
+`pack_local_scale_atoms` / `unpack_local_scale_atoms`:
+
+```
+matrix round-trip OK  axis=n mode=0/1/2   atoms.shape=(96, 21504)
+matrix round-trip OK  axis=k mode=0/1/2   atoms.shape=(96, 21504)
+scale round-trip: OK
+=== ALL ROUND-TRIPS EXACT ===
+```
+
+`rotate_expert_atoms`/`unrotate_expert_atoms` invert exactly, and
+`physical_atom_slot`/`logical_atom_for_slot` are mutual inverses forming a true
+permutation of all 96 slots, for layers {1, 46, 92} × experts {0, 5, 100, 895}.
+`balanced_atom_partition` covers every atom exactly once for shard counts
+{1,2,3,5,7,8,12,16,24,32,48,96}, including the non-divisor cases.
+
+**The Fruit production-build trust chain closes.** `kquant_import_guard`
+format-validates `bootstrap_sha256` and `kquant_source_sha256` without
+recomputing them, which looks like a gap but is not: `fruit_builder_bootstrap`
+verifies its own installed hash against the external anchor
+(`fruit_builder_bootstrap.py:392`) and verifies the snapshot content through
+`snapshot_git_revision(..., expected_revision=..., expected_sha256=...)`
+*before* the context is constructed, and the guard independently re-hashes the
+builder it is about to execute (`kquant_import_guard.py:279`). Enforcement is
+upstream, not missing.
+
+**The GLM byte-savings claim is arithmetically exact.** README asserts
+`705,024,000` bytes / `672.36 MiB` removed. That reconstructs precisely as
+75 layers (3–77) × 3 shared vectors × 255 deduplicated expert copies × 6,144
+hidden channels × 2 bytes = 705,024,000, and 705,024,000 / 1,048,576 = 672.36.
+
+## F11 — CUDA — the batch bound is derived from a buffer the kernel never touches
+
+`kquant/csrc/sqg_quantize.cu:225` (and `:308` for the procedural entry point):
+
+```cpp
+const int max_batch = min(
+    static_cast<int>(temp_costs.size(0)), 3 * multiprocessors);
+```
+
+The kernel gives each block its own slice of `temp_edges`, indexed by
+`blockIdx.x`, which runs to `batch = min(max_batch, tiles - start)`
+(`qsrt_quantize_tiles_kernel.cuh:55`):
+
+```cpp
+const int tile_idx = blockIdx.x;
+uint8_t* temp_edges = temp_edges_ptr + 256 * decisions_per_row * tile_idx;
+```
+
+So the tensor that must have at least `max_batch` rows is `temp_edges` — and
+`temp_edges.size(0)` is never validated. Only `size(1)` and `size(2)` are
+checked. The batch is instead bounded by `temp_costs.size(0)`, a *different*
+tensor, which (see F12) the kernel does not use at all.
+
+A caller passing `temp_edges` with fewer leading rows than `temp_costs` gets an
+out-of-bounds global write from every block with `blockIdx.x >= temp_edges.size(0)`.
+
+**Scope, stated honestly:** no in-tree caller triggers this.
+`kquant/sqg_quantizer.py:_sqg_temp_buffers` allocates both buffers with the same
+`max_batch`, so the two always agree today. But `quantize_tiles_sqg` and
+`quantize_tiles_procedural` are exported pybind11 entry points
+(`sqg_quantize.cpp:24-33`) with no Python-level wrapper enforcing the pairing,
+and the checks around them are otherwise thorough — this is the one hole.
+
+Fix: bound the batch by the buffer that is actually indexed, and assert the pair
+agrees.
+
+```cpp
+TORCH_CHECK(temp_edges.size(0) == temp_costs.size(0),
+            "temp_edges and temp_costs must share a leading dimension");
+const int max_batch = min(
+    static_cast<int>(temp_edges.size(0)), 3 * multiprocessors);
+```
+
+## F12 — CUDA — the `temp_costs` global buffer is dead for every supported rate
+
+`temp_costs_ptr` occurs exactly twice in the kernel — as a parameter, and here
+(`qsrt_quantize_tiles_kernel.cuh:62`):
+
+```cpp
+half* temp_costs = K >= 2 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+```
+
+The host constrains `K` to 2–4 (`TORCH_CHECK(K >= 2 && K <= 4, …)`), so the
+`temp_costs_ptr` branch is unreachable for every rate the extension accepts. The
+kernel always uses shared memory. The buffer is allocated, shape-validated,
+passed across the ABI, and never read or written.
+
+It is not free. `_sqg_temp_buffers` allocates it with `torch.zeros` (so it also
+pays a memset):
+
+| K | edges | `costs` bytes at `max_batch`=256 |
+| --- | --- | --- |
+| 2 | 16,384 | 16 MiB |
+| 3 | 8,192 | 8 MiB |
+| 4 | 4,096 | 4 MiB |
+
+`_sqg_temp_buffers` is `lru_cache`d per `(device, bits)`, so a run touching all
+three rates holds ~28 MiB of dead VRAM per GPU for the life of the process —
+roughly 336 MiB across a TP12 encode. Worse, the `affordable` heuristic that
+sizes `max_batch` counts only `decision_bytes_per_tile` (the traceback) and does
+not account for the costs buffer at all, so the allocator's own budget is wrong
+by that amount.
+
+Fix: drop the parameter and the allocation, or — if the `K < 2` path is meant to
+return one day — keep it and say so, but stop sizing the batch from it (F11).
+
+## F13 — CUDA — output and scratch tensors are never checked for device or contiguity
+
+Across all 342 lines and both exported entry points, `is_contiguous()` is called
+exactly once, on `codebook`; `is_cuda()` is called on `input_tiles` and
+`codebook` only:
+
+```
+175:    const at::cuda::OptionalCUDAGuard guard(input_tiles.device());
+178:    TORCH_CHECK(input_tiles.is_cuda(), "input_tiles must be CUDA");
+193:    TORCH_CHECK(codebook.is_cuda() && codebook.device() == input_tiles.device(), …);
+197:    TORCH_CHECK(codebook.is_contiguous(), "codebook must be contiguous");
+271:    const at::cuda::OptionalCUDAGuard guard(input_tiles.device());
+274:    TORCH_CHECK(input_tiles.is_cuda(), "input_tiles must be CUDA");
+```
+
+`output_tiles`, `output_indices`, `temp_costs` and `temp_edges` get shape and
+dtype checks and nothing else, then are handed to the kernel as raw
+`data_ptr<T>()` and indexed with linear offsets that assume row-major contiguity.
+Two reachable consequences:
+
+- **Wrong device or CPU tensor.** A `output_tiles` on a second CUDA device, or a
+  plain CPU tensor of the right shape and dtype, passes every check.
+  `data_ptr<float>()` then yields a pointer the guarded device cannot address and
+  the kernel faults. For a project whose whole deployment story is TP12
+  multi-GPU, passing a tensor from the wrong device is an ordinary operator slip
+  that deserves a named error, not an illegal-access abort.
+- **Non-contiguous view.** `big[:, :256]` on a wider tensor satisfies
+  `dim() == 2 && size(1) == 256`, is CUDA, is float — and then the kernel reads
+  the wrong elements via `input_tiles_ptr + 256 * tile_idx`, silently corrupting
+  every encoded tile with no error at all.
+
+Fix: one `TORCH_CHECK` per tensor, in both entry points.
+
+```cpp
+for (const auto& t : {output_tiles, output_indices, temp_costs, temp_edges}) {
+    TORCH_CHECK(t.is_cuda() && t.device() == input_tiles.device(),
+                "all tensors must share the input CUDA device");
+    TORCH_CHECK(t.is_contiguous(), "all tensors must be contiguous");
+}
+TORCH_CHECK(input_tiles.is_contiguous(), "input_tiles must be contiguous");
+```
+
+## F14 — GLM recipe — only three files are hash-verified, but the whole bundle is copied and reported as verified
+
+`recipes/glm52_exl3_shared_h/prepare_shared_h_encoder.py` is built around hash
+pinning, and the parts it pins it does well: it verifies the three declared
+inputs, applies the patches, verifies the patched **outputs** against
+`OUTPUT_SHA256`, and `py_compile`s them. That output check is the thing most
+recipes get wrong, and this one gets it right.
+
+The gap is what happens in between. `verify_files` only walks the keys it is
+given:
+
+```python
+def verify_files(root: Path, expected: dict[str, str], label: str) -> None:
+    for relative, digest in expected.items():
+        ...
+```
+
+but `prepare` copies the bundle wholesale:
+
+```python
+verify_files(bundle, INPUT_SHA256, "input bundle")   # 3 files
+...
+for source in bundle.iterdir():                      # everything
+    if source.is_dir():
+        shutil.copytree(source, destination)
+    else:
+        shutil.copy2(source, destination)
+```
+
+`INPUT_SHA256` pins `encode_tr3_v31.py`, `encode_b300.py` and
+`calibration/reap_recall_calib.jsonl`. Every other file in the published
+`calibration_encoder` bundle — any helper module the two encoders import, any
+other file under `calibration/` — is copied into the output unverified, and
+`OUTPUT_SHA256` re-checks only the two patched `.py` files. The script then
+prints:
+
+```
+Prepared verified shared-H encoder: <output>
+```
+
+So the word "verified" covers 3 of N inputs and 2 of N outputs. Since the two
+pinned encoders are `py_compile`d but not executed in isolation, an altered
+sibling module they import would flow straight into a production encode with the
+recipe reporting success. For a recipe whose entire value proposition is
+byte-reproducibility from a pinned upstream bundle, that is the wrong guarantee.
+
+Neither of the recipe's two tests
+(`test_recipe_patches_reproduce_pinned_encoder`,
+`test_shared_h_algebra_seed_and_artifact_contract`) covers the passthrough.
+
+Fix: hash every file in the bundle. Either pin a complete manifest, or compute a
+digest over the full recursive tree and pin that single value — then the claim
+the script prints is the claim it checked.
+
+## F15 — Encoder — process-local LUT caches are never evicted
+
+`kquant/sqg_quantizer.py:148`. `install_sqg_quantizer` closes over `device_luts`
+and `transposed_sqg_luts`; neither is ever evicted. `transposed_sqg_luts` stores
+`(codebook, transposed_lut)` and deliberately retains a reference to the full
+64 KiB source codebook so its identity guard (`cached[0] is not codebook`) stays
+sound — which means every distinct codebook plus its transpose stays alive for
+the life of the process.
+
+This is a leak, not a correctness bug: the identity guard is correct and no
+stale entry is ever returned. But a rate-curve sweep that pushes many distinct
+`sqg_e4m3_lut` tensors through `quantize_tiles` grows both dicts without bound,
+pinning device memory monotonically until OOM.
+
+Fix: an LRU bound, or key on a content digest so repeated codebooks collapse.
+
+## Second-pass method
+
+Worktrees from pass 1 were reused, so every branch was read at the same commit
+reported above. The round-trip, inverse and partition results in *Verified
+clean* were produced by executing the real modules under the project's own
+geometry, not by inspection. The CUDA findings are static reads — the extension
+cannot be compiled here (no nvcc, no GPU), so F11–F13 are argued from the source
+and the exported ABI rather than from a crash.
+
+Still not covered, and still worth someone's time: the numerical quality claims
+in `docs/qsrt-technical-brief.md`, anything requiring the Kimi-K3 checkpoint or a
+real capture, and end-to-end execution of the Fruit builder.
