@@ -25,17 +25,24 @@ if __name__ == "__main__":
         _KQUANT_IMPORT_IDENTITY,
         _KQUANT_IMPORT_SOURCE_ROOT,
         _KQUANT_BOOTSTRAP_IDENTITY,
+        _RUNTIME_QUALIFICATION_AUTHORITY_SHA256,
+        _RATE_SWEEP_AUTHORITY_SHA256,
     ) = authenticate_production_builder(Path(__file__))
 else:
     _KQUANT_IMPORT_IDENTITY = None
     _KQUANT_IMPORT_SOURCE_ROOT = Path(__file__).resolve().parents[1]
     _KQUANT_BOOTSTRAP_IDENTITY = None
+    _RUNTIME_QUALIFICATION_AUTHORITY_SHA256 = None
+    _RATE_SWEEP_AUTHORITY_SHA256 = None
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from scripts.tracked_worktree import tracked_worktree_sha256  # isort: skip
+from scripts.tracked_worktree import (  # isort: skip
+    GIT_EXECUTABLE,
+    tracked_worktree_sha256,
+)
 
 from kquant.exl3_loader import exllamav3_source_identity, load_qsrt_encoder
 from kquant.fruit_calibration import (
@@ -517,7 +524,9 @@ _RUNTIME_OPTION_ORDER = (
     "--reasoning-parser",
     "--generation-config",
 )
-_ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v3"
+_ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v4"
+_LEGACY_ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v3"
+_FRUIT_VOCAB_SIZE = 154_880
 _DTYPE_BYTES = {
     "BOOL": 1,
     "U8": 1,
@@ -548,7 +557,7 @@ def _sha256(path: Path) -> str:
 def _git_revision(root: Path) -> str:
     try:
         result = subprocess.run(
-            ("git", "-C", str(root), "rev-parse", "HEAD"),
+            (GIT_EXECUTABLE, "-C", str(root), "rev-parse", "HEAD"),
             check=True,
             capture_output=True,
             text=True,
@@ -564,8 +573,14 @@ def _git_revision(root: Path) -> str:
 
 
 def _encoder_fingerprint_payload(encoder: dict[str, object]) -> dict[str, object]:
-    return {
-        "schema": _ENCODER_FINGERPRINT_SCHEMA,
+    schema = encoder["fingerprint_schema"]
+    if schema not in {
+        _LEGACY_ENCODER_FINGERPRINT_SCHEMA,
+        _ENCODER_FINGERPRINT_SCHEMA,
+    }:
+        raise ValueError(f"unsupported Fruit encoder fingerprint schema: {schema!r}")
+    payload = {
+        "schema": schema,
         "kquant_revision": encoder["kquant_revision"],
         "kquant_source_sha256": encoder["kquant_source_sha256"],
         "exllamav3_source_sha256": encoder["exllamav3_source_sha256"],
@@ -573,6 +588,55 @@ def _encoder_fingerprint_payload(encoder: dict[str, object]) -> dict[str, object
         "calibration_fingerprint": encoder["calibration_fingerprint"],
         "calibration_capture_id": encoder["calibration_capture_id"],
         "calibration_manifest_sha256": encoder["calibration_manifest_sha256"],
+    }
+    if schema == _ENCODER_FINGERPRINT_SCHEMA:
+        payload["encoding_runtime"] = encoder["encoding_runtime"]
+    return payload
+
+
+def _rate_sweep_encoder_core(encoder: object) -> dict[str, object]:
+    common_fields = {
+        "kquant_revision",
+        "kquant_source_sha256",
+        "exllamav3_revision",
+        "exllamav3_source_sha256",
+        "calibration_fingerprint",
+        "calibration_capture_id",
+        "calibration_manifest_sha256",
+        "fingerprint_schema",
+        "fingerprint",
+    }
+    if not isinstance(encoder, dict):
+        raise TypeError("Fruit rate sweep encoder identity is malformed")
+    schema = encoder.get("fingerprint_schema")
+    fields = (
+        common_fields | {"encoding_runtime"}
+        if schema == _ENCODER_FINGERPRINT_SCHEMA
+        else common_fields
+    )
+    if (
+        schema
+        not in {
+            _LEGACY_ENCODER_FINGERPRINT_SCHEMA,
+            _ENCODER_FINGERPRINT_SCHEMA,
+        }
+        or set(encoder) != fields
+    ):
+        raise TypeError("Fruit rate sweep encoder identity is malformed")
+    expected_fingerprint = hashlib.sha256(
+        _canonical_json(_encoder_fingerprint_payload(encoder)).encode("utf-8")
+    ).hexdigest()
+    if encoder["fingerprint"] != expected_fingerprint:
+        raise ValueError("Fruit rate sweep encoder fingerprint is invalid")
+    return {
+        name: encoder[name]
+        for name in (
+            "exllamav3_revision",
+            "exllamav3_source_sha256",
+            "calibration_fingerprint",
+            "calibration_capture_id",
+            "calibration_manifest_sha256",
+        )
     }
 
 
@@ -621,6 +685,11 @@ def current_encoder_provenance(
         "calibration_fingerprint": calibration.fingerprint,
         "calibration_capture_id": calibration.capture_id,
         "calibration_manifest_sha256": calibration.manifest_sha256,
+        "encoding_runtime": (
+            dict(_KQUANT_BOOTSTRAP_IDENTITY)
+            if _KQUANT_BOOTSTRAP_IDENTITY is not None
+            else None
+        ),
         "fingerprint_schema": _ENCODER_FINGERPRINT_SCHEMA,
     }
     encoder["fingerprint"] = hashlib.sha256(
@@ -681,14 +750,22 @@ def _rate_number(value: object, *, name: str, positive: bool = False) -> float:
 def _validate_rate_sweep(
     path: Path,
     *,
+    expected_sha256: str,
     source_evidence: dict[str, object],
     calibration: FruitCalibrationStore,
     producer: dict[str, object],
 ) -> dict[str, object]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        sweep_bytes = path.read_bytes()
+        payload = json.loads(sweep_bytes)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(f"cannot read Fruit rate sweep: {path}") from exc
+    if hashlib.sha256(sweep_bytes).hexdigest() != expected_sha256:
+        raise ValueError(
+            "Fruit rate sweep does not match its external SHA-256 authority"
+        )
+    if sweep_bytes != _canonical_json(payload).encode("utf-8"):
+        raise ValueError("Fruit rate sweep is not canonical JSON")
     if (
         not isinstance(payload, dict)
         or payload.get("schema") != _RATE_SWEEP_SCHEMA
@@ -706,13 +783,13 @@ def _validate_rate_sweep(
     }
     measured_encoder = signature.get("encoder")
     expected_encoder = producer.get("encoder")
-    if not isinstance(measured_encoder, dict) or not isinstance(expected_encoder, dict):
-        raise TypeError("Fruit rate sweep omits its encoder identity")
+    measured_encoder_core = _rate_sweep_encoder_core(measured_encoder)
+    expected_encoder_core = _rate_sweep_encoder_core(expected_encoder)
     if (
         signature.get("schema") != _RATE_SWEEP_SCHEMA
         or signature.get("source") != source_evidence
         or signature.get("calibration") != expected_calibration
-        or measured_encoder != expected_encoder
+        or measured_encoder_core != expected_encoder_core
         or signature.get("rates") != [2, 3, 4]
     ):
         raise ValueError("Fruit rate-sweep provenance does not match this build")
@@ -1262,6 +1339,7 @@ def _validate_sealed_runtime_qualification(
 def _validate_runtime_qualification(
     path: Path,
     *,
+    expected_sha256: str,
     output: Path,
     variant: str,
     publication: FruitPublicationSpec,
@@ -1273,6 +1351,11 @@ def _validate_runtime_qualification(
         payload = json.loads(receipt_bytes)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(f"cannot read Fruit runtime qualification: {path}") from exc
+    if hashlib.sha256(receipt_bytes).hexdigest() != expected_sha256:
+        raise ValueError(
+            "Fruit runtime qualification receipt does not match its external "
+            "SHA-256 authority"
+        )
     if receipt_bytes != _canonical_json(payload).encode("utf-8"):
         raise ValueError("Fruit runtime qualification receipt is not canonical JSON")
     payload = _qualification_object(
@@ -1339,12 +1422,23 @@ def _validate_runtime_qualification(
         candidate["marker_sha256"], name="candidate.marker_sha256"
     )
     candidate_marker_path = output / _CANDIDATE_MARKER_NAME
-    if not candidate_marker_path.is_file() or measured_candidate_marker != _sha256(
-        candidate_marker_path
-    ):
+    try:
+        candidate_marker_bytes = candidate_marker_path.read_bytes()
+        candidate_marker = json.loads(candidate_marker_bytes)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            "Fruit runtime qualification candidate marker is invalid"
+        ) from exc
+    if measured_candidate_marker != hashlib.sha256(candidate_marker_bytes).hexdigest():
         raise ValueError(
             "Fruit runtime qualification candidate marker does not match output"
         )
+    if not isinstance(candidate_marker, dict):
+        raise TypeError("Fruit runtime qualification candidate marker is malformed")
+    _qualification_digest(
+        candidate_marker.get("checksum_manifest_sha256"),
+        name="candidate.checksum_manifest_sha256",
+    )
     measured_index = _qualification_digest(
         candidate["model_index_sha256"], name="candidate.model_index_sha256"
     )
@@ -1419,6 +1513,7 @@ def _validate_runtime_qualification(
         qsrt_model["repository"] != publication.repository
         or qsrt_model["model_index_sha256"] != measured_index
         or qsrt_model["config_sha256"] != _sha256(output / "config.json")
+        or qsrt_model["manifest_sha256"] != _sha256(output / "qsrt-manifest.json")
         or qsrt_model["safetensors_bytes"] != actual_tensor_bytes
         or qsrt_model["safetensors_sha256"] != actual_tensor_set_sha256
     ):
@@ -1485,6 +1580,7 @@ def _validate_runtime_qualification(
     if not isinstance(producer_runtime, dict) or not isinstance(producer_encoder, dict):
         raise TypeError("Fruit runtime qualification producer identity is malformed")
     normalized_runtime_argv: tuple[str, ...] | None = None
+    matched_runtime_identity: dict[str, object] | None = None
     for arm in _RUNTIME_ARMS:
         loader = _qualification_object(
             loaders[arm],
@@ -1529,13 +1625,14 @@ def _validate_runtime_qualification(
         _qualification_digest(image_digest, name=f"loaders.{arm}.runtime.image_digest")
         for key in ("vllm_revision", "b12x_revision", "kquant_revision"):
             _qualification_revision(runtime[key], name=f"loaders.{arm}.runtime.{key}")
-        if arm == "qsrt" and (
+        if (
             runtime["vllm_revision"] != producer_runtime.get("vllm_revision")
             or runtime["b12x_revision"] != producer_runtime.get("b12x_revision")
             or runtime["kquant_revision"] != producer_encoder.get("kquant_revision")
         ):
             raise ValueError(
-                "Fruit runtime qualification QSRT runtime does not match producer"
+                f"Fruit runtime qualification {arm.upper()} runtime does not "
+                "match producer"
             )
         argv = runtime["argv"]
         if (
@@ -1572,6 +1669,20 @@ def _validate_runtime_qualification(
         ):
             raise TypeError(
                 f"Fruit runtime qualification loaders.{arm} software is invalid"
+            )
+        measured_runtime_identity = {
+            "image": image,
+            "vllm_revision": runtime["vllm_revision"],
+            "b12x_revision": runtime["b12x_revision"],
+            "kquant_revision": runtime["kquant_revision"],
+            "software": software,
+        }
+        if matched_runtime_identity is None:
+            matched_runtime_identity = measured_runtime_identity
+        elif measured_runtime_identity != matched_runtime_identity:
+            raise ValueError(
+                "Fruit runtime qualification arms do not use the same immutable "
+                "runtime identity"
             )
         compilation_backend = _qualification_string(
             runtime["compilation_backend"],
@@ -1794,8 +1905,7 @@ def _validate_runtime_qualification(
         or not positions
         or any(type(position) is not int or position < 0 for position in positions)
         or len(set(positions)) != len(positions)
-        or type(fidelity["vocab_size"]) is not int
-        or int(fidelity["vocab_size"]) <= 10
+        or fidelity["vocab_size"] != _FRUIT_VOCAB_SIZE
     ):
         raise ValueError("Fruit runtime qualification fidelity geometry is invalid")
     candidates = _qualification_object(
@@ -1909,8 +2019,9 @@ def _runtime_qualification_section(payload: dict[str, object]) -> str:
     return f"""## Runtime and quality qualification
 
 The sealed receipt [`{_RUNTIME_QUALIFICATION_NAME}`]({_RUNTIME_QUALIFICATION_NAME})
-records the exact BF16, SIQ, and QSRT model identities, candidate tensors,
-producer, GPU and driver, per-arm immutable runtime images, exact launch argv,
+records the exact BF16 reference, legacy SIQ comparator, and QSRT model
+identities, candidate tensors, producer, GPU and driver, per-arm immutable
+runtime images, exact launch argv,
 environment and software revisions, parsed loader memory fields, decode runs,
 generation outputs, and full-vocabulary fidelity rows. Under its fixed
 hardware, prompt tokens, generation settings, recorded launch order, TP1, and
@@ -1920,22 +2031,20 @@ hardware, prompt tokens, generation settings, recorded launch order, TP1, and
 |---|---:|---:|---:|---|
 {runtime_rows}
 
-The legacy SIQ comparator uses its recorded compatible runtime rather than the
-QSRT clean-cutover runtime. The derived ratios therefore compare observed
-end-to-end runs on identical hardware and inputs, not identical software.
-These rates include request and serving overhead; they are not decode-only
-kernel rates, an apples-to-apples software comparison, or a general throughput
-benchmark.
+All three arms use the same immutable image, software stack, non-eager
+compilation backend, CUDA-graph mode, and fixed launcher contract; only the
+model identity, served name, port, and model-specific quantization/load options
+differ. The rates include request and serving overhead, so they are not
+decode-only kernel rates or a general throughput benchmark.
 
 | Candidate relative to BF16 | Mean forward KL | Max forward KL | Top-1 agreement | Top-10 agreement |
 |---|---:|---:|---:|---:|
 {fidelity_rows}
 
 The raw generation section covers {len(payload["generation"]["prompts"])} matched
-targeted prompts across BF16, SIQ, and QSRT spanning instruction following,
-structured output, code, reasoning, safety, and debugging. This focused
-live-runtime suite complements the full-vocabulary fidelity measurement; it is
-not a standardized leaderboard benchmark."""
+targeted prompts across BF16, SIQ, and QSRT. This focused live-runtime suite
+complements the full-vocabulary fidelity measurement; it is not a standardized
+leaderboard benchmark."""
 
 
 def _render_model_card(
@@ -2036,11 +2145,14 @@ def _render_model_card(
 
 def _atomic_text(path: Path, content: str) -> None:
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    with temporary.open("x", encoding="utf-8") as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _atomic_safetensors(
@@ -2049,10 +2161,13 @@ def _atomic_safetensors(
     metadata: dict[str, str] | None,
 ) -> None:
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    save_file(tensors, temporary, metadata=metadata)
-    with temporary.open("rb") as handle:
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    try:
+        save_file(tensors, temporary, metadata=metadata)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _is_encoder_temporary(path: Path) -> bool:
@@ -2461,111 +2576,6 @@ def _write_part(
     return manifest
 
 
-def _seed_parts(
-    output: Path,
-    seed: Path | None,
-    source_sha256: str,
-    encoder_fingerprint: str,
-) -> int:
-    if seed is None:
-        return 0
-    if seed.is_symlink() or not seed.is_dir():
-        raise ValueError(f"Fruit QSRT seed cache must be a real directory: {seed}")
-    _validate_part_cache_root(
-        seed,
-        create=False,
-        allow_run_manifests=True,
-    )
-    _validate_part_cache_root(output / ".qsrt-parts", create=True)
-    copied = 0
-    for layer in LAYERS:
-        for expert in range(EXPERTS):
-            source_tensor = (
-                seed / f"layer-{layer:03d}" / f"expert-{expert:03d}.safetensors"
-            )
-            source_manifest = seed / f"layer-{layer:03d}" / f"expert-{expert:03d}.json"
-            if not source_tensor.is_file() and not source_manifest.is_file():
-                continue
-            target_tensor, target_manifest = _part_paths(output, layer, expert)
-            if target_tensor.exists() or target_manifest.exists():
-                continue
-            if not source_tensor.is_file() or not source_manifest.is_file():
-                continue
-            try:
-                valid = _validate_part(
-                    source_tensor,
-                    source_manifest,
-                    layer=layer,
-                    expert=expert,
-                    source_sha256=source_sha256,
-                    encoder_fingerprint=encoder_fingerprint,
-                    repair=False,
-                )
-            except (OSError, TypeError, ValueError):
-                valid = None
-            if valid is None:
-                continue
-            _prepare_part_layer(output, layer)
-            try:
-                tensor_sha256 = valid.get("safetensors_sha256")
-                if not isinstance(tensor_sha256, str):
-                    raise TypeError("Fruit QSRT part digest must be a string")
-                _copy_authenticated(source_tensor, target_tensor, tensor_sha256)
-                _copy_authenticated(
-                    source_manifest,
-                    target_manifest,
-                    _sha256(source_manifest),
-                )
-                if (
-                    _validate_part(
-                        target_tensor,
-                        target_manifest,
-                        layer=layer,
-                        expert=expert,
-                        source_sha256=source_sha256,
-                        encoder_fingerprint=encoder_fingerprint,
-                        repair=False,
-                    )
-                    is None
-                ):
-                    raise ValueError("copied Fruit QSRT part failed validation")
-            except (OSError, TypeError, ValueError):
-                for target in (target_tensor, target_manifest):
-                    if target.is_file() and not target.is_symlink():
-                        target.unlink()
-                continue
-            copied += 1
-    return copied
-
-
-def _parts_need_encoder(
-    output: Path,
-    *,
-    source_sha256: str,
-    encoder_fingerprint: str,
-) -> bool:
-    _validate_part_cache_root(output / ".qsrt-parts", create=True)
-    expected = {
-        "source_sha256": source_sha256,
-        "encoder_fingerprint": encoder_fingerprint,
-    }
-    for layer in LAYERS:
-        for expert in range(EXPERTS):
-            tensor_path, manifest_path = _part_paths(output, layer, expert)
-            if not tensor_path.is_file() or not manifest_path.is_file():
-                return True
-            try:
-                value = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                return True
-            if not isinstance(value, dict) or any(
-                value.get(name) != expected_value
-                for name, expected_value in expected.items()
-            ):
-                return True
-    return False
-
-
 def _validate_source_evidence(
     value: object,
     *,
@@ -2950,7 +2960,30 @@ def _assemble_layers(
             f"layer {layer}: assembled {tensor_path.stat().st_size / (1 << 20):.2f} MiB",
             flush=True,
         )
+    _finalize_part_cache(output)
     return results
+
+
+def _load_candidate_layers(
+    output: Path,
+    *,
+    source_sha256: str,
+    encoder_fingerprint: str,
+) -> dict[str, dict[str, object]]:
+    layers: dict[str, dict[str, object]] = {}
+    for layer in LAYERS:
+        tensor_path, manifest_path = _layer_paths(output, layer)
+        value = _validate_layer(
+            tensor_path,
+            manifest_path,
+            layer=layer,
+            source_sha256=source_sha256,
+            encoder_fingerprint=encoder_fingerprint,
+        )
+        if value is None:
+            raise ValueError(f"Fruit candidate is missing assembled layer {layer}")
+        layers[str(layer)] = value
+    return layers
 
 
 def _authenticate_base_model(
@@ -3033,7 +3066,7 @@ def _authenticate_base_model(
         "n_routed_experts": spec.num_experts,
         "num_experts_per_tok": 8,
         "num_hidden_layers": spec.mtp_layer,
-        "vocab_size": 154_880,
+        "vocab_size": _FRUIT_VOCAB_SIZE,
     }
     if any(config.get(name) != value for name, value in expected_config.items()):
         raise ValueError("Fruit BF16 base model geometry mismatch")
@@ -3269,67 +3302,53 @@ def _write_config(
     _atomic_text(output / "config.json", _canonical_json(config))
 
 
-def _prepare_output_root(output: Path) -> None:
+def _prepare_fresh_candidate_output(output: Path) -> None:
     if output.is_symlink():
         raise ValueError(f"Fruit package root must not be a symbolic link: {output}")
+    staged = _staged_part_cache_path(output)
+    if staged.exists() or staged.is_symlink():
+        raise ValueError(
+            "Fruit candidate build requires no pre-existing staged part cache"
+        )
     if output.exists():
         if not output.is_dir():
             raise ValueError(f"Fruit package root must be a directory: {output}")
+        if next(output.iterdir(), None) is not None:
+            raise ValueError(
+                "Fruit candidate build requires a fresh empty output directory"
+            )
     else:
         output.mkdir(parents=True)
-    _recover_staged_part_cache(output)
 
 
-def _remove_part_cache(output: Path) -> None:
+def _validate_candidate_output_root(output: Path) -> None:
+    if output.is_symlink() or not output.is_dir():
+        raise ValueError("Fruit completion requires a real candidate directory")
     parts = output / ".qsrt-parts"
-    _validate_part_cache_root(parts, create=False)
-    if parts.exists():
-        shutil.rmtree(parts)
+    if parts.exists() or parts.is_symlink():
+        raise ValueError("Fruit completion rejects an active resume part cache")
+    staged = _staged_part_cache_path(output)
+    if staged.exists() or staged.is_symlink():
+        raise ValueError("Fruit completion rejects a staged resume part cache")
 
 
 def _staged_part_cache_path(output: Path) -> Path:
     return output.with_name(f".{output.name}.qsrt-parts-finalizing")
 
 
-def _recover_staged_part_cache(output: Path) -> None:
-    staged = _staged_part_cache_path(output)
-    if staged.is_symlink():
-        raise ValueError(f"staged Fruit QSRT cache must not be symbolic: {staged}")
-    if not staged.exists():
-        return
-    _validate_part_cache_root(staged, create=False)
+def _finalize_part_cache(output: Path) -> None:
     parts = output / ".qsrt-parts"
-    if parts.exists() or parts.is_symlink():
-        raise ValueError("both active and staged Fruit QSRT caches exist")
-    os.replace(staged, parts)
-
-
-def _stage_part_cache(output: Path) -> Path | None:
-    parts = output / ".qsrt-parts"
-    _validate_part_cache_root(parts, create=False)
-    if not parts.exists():
-        return None
     staged = _staged_part_cache_path(output)
     if staged.exists() or staged.is_symlink():
-        raise ValueError(f"staged Fruit QSRT cache already exists: {staged}")
+        raise ValueError("Fruit candidate finalization found a staged part cache")
+    _validate_part_cache_root(
+        parts,
+        create=False,
+        allow_run_manifests=True,
+    )
+    if parts.is_symlink() or not parts.is_dir():
+        raise ValueError("Fruit candidate finalization requires an active part cache")
     os.replace(parts, staged)
-    return staged
-
-
-def _restore_staged_part_cache(output: Path, staged: Path | None) -> None:
-    if staged is None:
-        return
-    _validate_part_cache_root(staged, create=False)
-    parts = output / ".qsrt-parts"
-    if parts.exists() or parts.is_symlink():
-        raise ValueError("cannot restore Fruit QSRT cache over an existing path")
-    os.replace(staged, parts)
-
-
-def _discard_staged_part_cache(staged: Path | None) -> None:
-    if staged is None:
-        return
-    _validate_part_cache_root(staged, create=False)
     shutil.rmtree(staged)
 
 
@@ -3693,6 +3712,117 @@ def _validate_candidate_package(
     )
 
 
+def _snapshot_candidate_metadata(output: Path) -> dict[Path, bytes]:
+    relative_paths = [
+        Path("README.md"),
+        Path("qsrt-manifest.json"),
+        Path("MANIFEST.sha256"),
+        Path(_CANDIDATE_MARKER_NAME),
+    ]
+    evaluation = output / "evaluation"
+    for path in sorted(evaluation.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            if path.is_dir() and not path.is_symlink():
+                continue
+            raise ValueError(f"Fruit candidate metadata path is invalid: {path}")
+        relative_paths.append(path.relative_to(output))
+    snapshot: dict[Path, bytes] = {}
+    for relative in relative_paths:
+        path = output / relative
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"Fruit candidate metadata file is invalid: {path}")
+        snapshot[relative] = path.read_bytes()
+    return snapshot
+
+
+def _restore_candidate_metadata(output: Path, snapshot: dict[Path, bytes]) -> None:
+    evaluation = output / "evaluation"
+    if evaluation.is_symlink() or evaluation.is_file():
+        evaluation.unlink()
+    elif evaluation.exists():
+        shutil.rmtree(evaluation)
+    for name in (
+        "README.md",
+        "qsrt-manifest.json",
+        "MANIFEST.sha256",
+        _CANDIDATE_MARKER_NAME,
+        _COMPLETE_MARKER_NAME,
+    ):
+        path = output / name
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+    for relative, content in sorted(
+        snapshot.items(), key=lambda item: item[0].as_posix()
+    ):
+        path = output / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_text(path, content.decode("utf-8"))
+
+
+def _complete_candidate_package(
+    output: Path,
+    *,
+    source_evidence: dict[str, object],
+    base_provenance: dict[str, object],
+    producer: dict[str, object],
+    calibration: FruitCalibrationStore,
+    rate_sweep: dict[str, object],
+    layers: dict[str, dict[str, object]],
+    publication: FruitPublicationSpec,
+    runtime_qualification: dict[str, object],
+    runtime_qualification_sha256: str,
+    spec: FruitModelSpec,
+) -> None:
+    snapshot = _snapshot_candidate_metadata(output)
+    try:
+        _write_package_manifests(
+            output,
+            source_evidence=source_evidence,
+            base_provenance=base_provenance,
+            producer=producer,
+            calibration=calibration,
+            rate_sweep=rate_sweep,
+            layers=layers,
+            publication=publication,
+            runtime_qualification=runtime_qualification,
+        )
+        _validate_output_package(
+            output,
+            source_evidence=source_evidence,
+            base_provenance=base_provenance,
+            producer=producer,
+            rate_sweep=rate_sweep,
+            require_complete=False,
+            runtime_qualification=runtime_qualification,
+            spec=spec,
+        )
+        (output / _CANDIDATE_MARKER_NAME).unlink()
+        _write_complete_marker(
+            output,
+            source_evidence=source_evidence,
+            base_provenance=base_provenance,
+            producer=producer,
+            runtime_qualification=runtime_qualification,
+            runtime_qualification_sha256=runtime_qualification_sha256,
+        )
+        _validate_output_package(
+            output,
+            source_evidence=source_evidence,
+            base_provenance=base_provenance,
+            producer=producer,
+            rate_sweep=rate_sweep,
+            require_complete=True,
+            runtime_qualification=runtime_qualification,
+            runtime_qualification_sha256=runtime_qualification_sha256,
+            spec=spec,
+        )
+    except BaseException:
+        _restore_candidate_metadata(output, snapshot)
+        raise
+
+
 def _completion_record(
     output: Path,
     *,
@@ -3700,10 +3830,16 @@ def _completion_record(
     base_provenance: dict[str, object],
     producer: dict[str, object],
     runtime_qualification: dict[str, object],
+    runtime_qualification_sha256: str,
 ) -> dict[str, object]:
     candidate = runtime_qualification["candidate"]
     if not isinstance(candidate, dict):
         raise TypeError("Fruit runtime qualification candidate is malformed")
+    measured_qualification_sha256 = _sha256(output / _RUNTIME_QUALIFICATION_NAME)
+    if measured_qualification_sha256 != runtime_qualification_sha256:
+        raise ValueError(
+            "Fruit runtime qualification changed after external authorization"
+        )
     return {
         "schema": "kquant_qsrt_complete_v3",
         "publication": {
@@ -3711,7 +3847,7 @@ def _completion_record(
             "repository": fruit_publication_spec("instruct").repository,
         },
         "qualified_candidate_sha256": candidate["marker_sha256"],
-        "runtime_qualification_sha256": _sha256(output / _RUNTIME_QUALIFICATION_NAME),
+        "runtime_qualification_sha256": runtime_qualification_sha256,
         "package_manifest_sha256": _sha256(output / "qsrt-manifest.json"),
         "checksum_manifest_sha256": _sha256(output / "MANIFEST.sha256"),
         "model_index_sha256": _sha256(output / "model.safetensors.index.json"),
@@ -3777,6 +3913,7 @@ def _validate_output_package(
     rate_sweep: dict[str, object],
     require_complete: bool,
     runtime_qualification: dict[str, object],
+    runtime_qualification_sha256: str | None = None,
     spec: FruitModelSpec = FRUIT_INSTRUCT_SPEC,
 ) -> None:
     manifest_path = output / "qsrt-manifest.json"
@@ -3918,6 +4055,7 @@ def _validate_output_package(
             base_provenance=base_provenance,
             producer=producer,
             runtime_qualification=runtime_qualification,
+            runtime_qualification_sha256=runtime_qualification_sha256,
         ):
             raise ValueError("Fruit QSRT completion marker mismatch")
         if (output / _CANDIDATE_MARKER_NAME).exists():
@@ -3935,6 +4073,7 @@ def _write_complete_marker(
     base_provenance: dict[str, object],
     producer: dict[str, object],
     runtime_qualification: dict[str, object],
+    runtime_qualification_sha256: str,
 ) -> None:
     _validate_sealed_runtime_qualification(output, runtime_qualification)
     _atomic_text(
@@ -3946,6 +4085,7 @@ def _write_complete_marker(
                 base_provenance=base_provenance,
                 producer=producer,
                 runtime_qualification=runtime_qualification,
+                runtime_qualification_sha256=runtime_qualification_sha256,
             )
         ),
     )
@@ -3965,7 +4105,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration", required=True, type=Path)
     parser.add_argument("--rate-sweep", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--seed-cache", type=Path)
     return parser.parse_args()
 
 
@@ -3989,6 +4128,22 @@ def _assert_producer_unchanged(
 
 def main() -> None:
     args = parse_args()
+    runtime_qualification_sha256 = _RUNTIME_QUALIFICATION_AUTHORITY_SHA256
+    rate_sweep_sha256 = _RATE_SWEEP_AUTHORITY_SHA256
+    if rate_sweep_sha256 is None:
+        raise ValueError(
+            "Fruit build requires an externally authenticated rate-sweep SHA-256"
+        )
+    if args.candidate_only:
+        if runtime_qualification_sha256 is not None:
+            raise ValueError(
+                "Fruit candidate build received a runtime qualification authority"
+            )
+    elif runtime_qualification_sha256 is None:
+        raise ValueError(
+            "Fruit completion build requires an externally authenticated runtime "
+            "qualification SHA-256"
+        )
     authority = fruit_calibration_authority(args.variant)
     spec = authority.spec
     publication = fruit_publication_spec(args.variant)
@@ -4029,10 +4184,15 @@ def main() -> None:
             calibration=calibration,
             producer=producer,
             encoder_fingerprint=encoder_fingerprint,
+            runtime_qualification_sha256=runtime_qualification_sha256,
+            rate_sweep_sha256=rate_sweep_sha256,
             store=store,
         )
     finally:
-        store.close()
+        try:
+            store.close()
+        finally:
+            calibration.close()
 
 
 def _build_from_snapshot(
@@ -4044,6 +4204,8 @@ def _build_from_snapshot(
     calibration: FruitCalibrationStore,
     producer: dict[str, object],
     encoder_fingerprint: str,
+    runtime_qualification_sha256: str | None,
+    rate_sweep_sha256: str,
     store: FruitSafetensorsStore,
 ) -> None:
     base_provenance = _authenticate_base_model(store.path, spec=spec)
@@ -4057,37 +4219,76 @@ def _build_from_snapshot(
         raise TypeError("Fruit source evidence has no authenticated source digest")
     rate_sweep = _validate_rate_sweep(
         args.rate_sweep,
+        expected_sha256=rate_sweep_sha256,
         source_evidence=source_evidence,
         calibration=calibration,
         producer=producer,
     )
+
+    if not args.candidate_only:
+        if runtime_qualification_sha256 is None:
+            raise RuntimeError(
+                "Fruit completion lost its runtime qualification authority"
+            )
+        _validate_candidate_output_root(args.output)
+        runtime_qualification = _validate_runtime_qualification(
+            args.runtime_qualification,
+            expected_sha256=runtime_qualification_sha256,
+            output=args.output,
+            variant=args.variant,
+            publication=publication,
+            producer=producer,
+            source_evidence=source_evidence,
+        )
+        layers = _load_candidate_layers(
+            args.output,
+            source_sha256=source_sha256,
+            encoder_fingerprint=encoder_fingerprint,
+        )
+        _validate_candidate_package(
+            args.output,
+            source_evidence=source_evidence,
+            base_provenance=base_provenance,
+            producer=producer,
+            rate_sweep=rate_sweep,
+            layers=layers,
+            publication=publication,
+            allow_part_cache=False,
+        )
+        _assert_producer_unchanged(
+            producer,
+            exllamav3_root=args.exllamav3_root,
+            b12x_root=args.b12x_root,
+            vllm_root=args.vllm_root,
+            calibration=calibration,
+        )
+        _complete_candidate_package(
+            args.output,
+            source_evidence=source_evidence,
+            base_provenance=base_provenance,
+            producer=producer,
+            calibration=calibration,
+            rate_sweep=rate_sweep,
+            layers=layers,
+            publication=publication,
+            runtime_qualification=runtime_qualification,
+            runtime_qualification_sha256=runtime_qualification_sha256,
+            spec=spec,
+        )
+        print(f"complete Fruit QSRT model: {args.output}", flush=True)
+        return
+
+    _prepare_fresh_candidate_output(args.output)
     torch.cuda.set_device(device)
     torch.empty(0, device=device)
-    _prepare_output_root(args.output)
-    (args.output / _COMPLETE_MARKER_NAME).unlink(missing_ok=True)
     _write_source_evidence_seal(
         args.output,
         source_evidence,
         producer,
         spec=spec,
     )
-    seeded = _seed_parts(
-        args.output,
-        args.seed_cache,
-        source_sha256,
-        encoder_fingerprint,
-    )
-    if seeded:
-        print(f"seeded {seeded} authenticated expert parts", flush=True)
-    needs_encoder = _parts_need_encoder(
-        args.output,
-        source_sha256=source_sha256,
-        encoder_fingerprint=encoder_fingerprint,
-    )
-    quantizer_module = None
-    if needs_encoder:
-        quantizer_module = load_qsrt_encoder(args.exllamav3_root)
-        install_sqg_quantizer(quantizer_module)
+    quantizer_module = load_qsrt_encoder(args.exllamav3_root)
+    install_sqg_quantizer(quantizer_module)
     _encode_parts(
         args.output,
         store,
@@ -4124,8 +4325,17 @@ def _build_from_snapshot(
         vllm_root=args.vllm_root,
         calibration=calibration,
     )
-    if args.candidate_only:
-        _write_candidate_package(
+    _write_candidate_package(
+        args.output,
+        source_evidence=source_evidence,
+        base_provenance=base_provenance,
+        producer=producer,
+        rate_sweep=rate_sweep,
+        layers=layers,
+        publication=publication,
+    )
+    try:
+        _validate_candidate_package(
             args.output,
             source_evidence=source_evidence,
             base_provenance=base_provenance,
@@ -4133,97 +4343,12 @@ def _build_from_snapshot(
             rate_sweep=rate_sweep,
             layers=layers,
             publication=publication,
-        )
-        staged_cache = _stage_part_cache(args.output)
-        try:
-            _validate_candidate_package(
-                args.output,
-                source_evidence=source_evidence,
-                base_provenance=base_provenance,
-                producer=producer,
-                rate_sweep=rate_sweep,
-                layers=layers,
-                publication=publication,
-                allow_part_cache=False,
-            )
-        except BaseException:
-            (args.output / _CANDIDATE_MARKER_NAME).unlink(missing_ok=True)
-            _restore_staged_part_cache(args.output, staged_cache)
-            raise
-        print(
-            f"sealed Fruit QSRT qualification candidate: {args.output}",
-            flush=True,
-        )
-        return
-
-    _validate_candidate_package(
-        args.output,
-        source_evidence=source_evidence,
-        base_provenance=base_provenance,
-        producer=producer,
-        rate_sweep=rate_sweep,
-        layers=layers,
-        publication=publication,
-        allow_part_cache=True,
-    )
-    runtime_qualification = _validate_runtime_qualification(
-        args.runtime_qualification,
-        output=args.output,
-        variant=args.variant,
-        publication=publication,
-        producer=producer,
-        source_evidence=source_evidence,
-    )
-    _write_package_manifests(
-        args.output,
-        source_evidence=source_evidence,
-        base_provenance=base_provenance,
-        producer=producer,
-        calibration=calibration,
-        rate_sweep=rate_sweep,
-        layers=layers,
-        publication=publication,
-        runtime_qualification=runtime_qualification,
-    )
-    _validate_output_package(
-        args.output,
-        source_evidence=source_evidence,
-        base_provenance=base_provenance,
-        producer=producer,
-        rate_sweep=rate_sweep,
-        require_complete=False,
-        runtime_qualification=runtime_qualification,
-        spec=spec,
-    )
-    staged_cache = _stage_part_cache(args.output)
-    candidate_marker_path = args.output / _CANDIDATE_MARKER_NAME
-    candidate_marker_bytes = candidate_marker_path.read_bytes()
-    candidate_marker_path.unlink()
-    try:
-        _write_complete_marker(
-            args.output,
-            source_evidence=source_evidence,
-            base_provenance=base_provenance,
-            producer=producer,
-            runtime_qualification=runtime_qualification,
-        )
-        _validate_output_package(
-            args.output,
-            source_evidence=source_evidence,
-            base_provenance=base_provenance,
-            producer=producer,
-            rate_sweep=rate_sweep,
-            require_complete=True,
-            runtime_qualification=runtime_qualification,
-            spec=spec,
+            allow_part_cache=False,
         )
     except BaseException:
-        (args.output / _COMPLETE_MARKER_NAME).unlink(missing_ok=True)
-        _atomic_text(candidate_marker_path, candidate_marker_bytes.decode("utf-8"))
-        _restore_staged_part_cache(args.output, staged_cache)
+        (args.output / _CANDIDATE_MARKER_NAME).unlink(missing_ok=True)
         raise
-    _discard_staged_part_cache(staged_cache)
-    print(f"complete Fruit QSRT model: {args.output}", flush=True)
+    print(f"sealed Fruit QSRT qualification candidate: {args.output}", flush=True)
 
 
 if __name__ == "__main__":

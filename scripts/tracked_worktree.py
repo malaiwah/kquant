@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Self
 
 _FINGERPRINT_PREFIX = b"kquant-tracked-worktree-sha256-v1\0"
+GIT_EXECUTABLE = "/usr/bin/git"
 
 _READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
@@ -19,7 +20,7 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 def _git_output(root: Path, *args: str) -> bytes:
     try:
         return subprocess.run(
-            ("git", "-C", str(root), *args),
+            (GIT_EXECUTABLE, "-C", str(root), *args),
             check=True,
             capture_output=True,
         ).stdout

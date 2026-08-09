@@ -9,8 +9,8 @@ import stat
 import sys
 from pathlib import Path
 
-_BOOTSTRAP_CONTEXT_ENV = "KQUANT_FRUIT_BUILDER_BOOTSTRAP_V3"
-_CONTEXT_SCHEMA = "kquant_fruit_builder_bootstrap_v3"
+_BOOTSTRAP_CONTEXT_ENV = "KQUANT_FRUIT_BUILDER_BOOTSTRAP_V5"
+_CONTEXT_SCHEMA = "kquant_fruit_builder_bootstrap_v5"
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -140,7 +140,7 @@ def _runtime_identity(value: object) -> dict[str, object]:
 
 def authenticate_production_builder(
     builder_file: Path,
-) -> tuple[tuple[str, str], Path, dict[str, object]]:
+) -> tuple[tuple[str, str], Path, dict[str, object], str | None, str]:
     """Validate the trusted-launch context before any KQuant module is imported."""
 
     already_imported = sorted(
@@ -169,6 +169,8 @@ def authenticate_production_builder(
         "builder_sha256",
         "runtime",
         "snapshot_root",
+        "runtime_qualification_sha256",
+        "rate_sweep_sha256",
     }
     if not isinstance(context, dict) or set(context) != expected_keys:
         raise ValueError("Fruit builder bootstrap context has an invalid schema")
@@ -187,6 +189,18 @@ def authenticate_production_builder(
     )
     builder_sha256 = _digest(
         context.get("builder_sha256"), length=64, name="builder SHA-256"
+    )
+    runtime_qualification_sha256 = context.get("runtime_qualification_sha256")
+    if runtime_qualification_sha256 is not None:
+        runtime_qualification_sha256 = _digest(
+            runtime_qualification_sha256,
+            length=64,
+            name="runtime qualification SHA-256",
+        )
+    rate_sweep_sha256 = _digest(
+        context.get("rate_sweep_sha256"),
+        length=64,
+        name="rate-sweep SHA-256",
     )
     runtime = _runtime_identity(context.get("runtime"))
     python = runtime["python"]
@@ -267,14 +281,22 @@ def authenticate_production_builder(
             "Fruit production builder does not match its bootstrap identity"
         )
     bootstrap = {
-        "schema": "kquant_fruit_builder_bootstrap_identity_v3",
+        "schema": "kquant_fruit_builder_bootstrap_identity_v5",
         "bootstrap_sha256": bootstrap_sha256,
         "builder_sha256": builder_sha256,
         "kquant_revision": revision,
         "kquant_source_sha256": source_sha256,
+        "rate_sweep_authority": "external_sha256",
+        "runtime_qualification_authority": "external_sha256",
         "runtime": runtime,
     }
-    return (revision, source_sha256), snapshot_root, bootstrap
+    return (
+        (revision, source_sha256),
+        snapshot_root,
+        bootstrap,
+        runtime_qualification_sha256,
+        rate_sweep_sha256,
+    )
 
 
 def _capture_legacy_import_snapshot() -> tuple[tuple[str, str], object, Path]:
