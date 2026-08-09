@@ -506,7 +506,7 @@ def _runtime_qualification_fixture(
             "--compilation-config",
             json.dumps(builder._FIXED_COMPILATION_CONFIG, separators=(",", ":")),
             "--speculative-config",
-            '{"method":"mtp","num_speculative_tokens":1}',
+            json.dumps(builder._FIXED_SPECULATIVE_CONFIG, separators=(",", ":")),
             "--gpu-memory-utilization",
             "0.80",
             "--max-model-len",
@@ -1087,6 +1087,13 @@ def test_runtime_qualification_rejects_argv_contradictions_and_omissions(
     argv = wrong_backend["loaders"]["qsrt"]["runtime"]["argv"]
     argv[argv.index("--moe-backend") + 1] = "torch"
     malformed_values.append(wrong_backend)
+    wrong_draft_backend = json.loads(builder._canonical_json(payload))
+    argv = wrong_draft_backend["loaders"]["qsrt"]["runtime"]["argv"]
+    option_index = argv.index("--speculative-config")
+    speculative = json.loads(argv[option_index + 1])
+    speculative["attention_backend"] = "TRITON_MLA"
+    argv[option_index + 1] = json.dumps(speculative, separators=(",", ":"))
+    malformed_values.append(wrong_draft_backend)
 
     forged_graph = json.loads(builder._canonical_json(payload))
 
