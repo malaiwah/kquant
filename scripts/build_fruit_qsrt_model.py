@@ -16,14 +16,25 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+if __name__ == "__main__":
+    from scripts.kquant_import_guard import (  # isort: skip
+        authenticate_production_builder,
+    )
+
+    (
+        _KQUANT_IMPORT_IDENTITY,
+        _KQUANT_IMPORT_SOURCE_ROOT,
+        _KQUANT_BOOTSTRAP_IDENTITY,
+    ) = authenticate_production_builder(Path(__file__))
+else:
+    _KQUANT_IMPORT_IDENTITY = None
+    _KQUANT_IMPORT_SOURCE_ROOT = Path(__file__).resolve().parents[1]
+    _KQUANT_BOOTSTRAP_IDENTITY = None
+
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from scripts.kquant_import_guard import (  # isort: skip
-    KQUANT_IMPORT_IDENTITY as _KQUANT_IMPORT_IDENTITY,
-    KQUANT_IMPORT_SOURCE_ROOT as _KQUANT_IMPORT_SOURCE_ROOT,
-)
 from scripts.tracked_worktree import tracked_worktree_sha256  # isort: skip
 
 from kquant.exl3_loader import exllamav3_source_identity, load_qsrt_encoder
@@ -123,7 +134,6 @@ def fruit_publication_spec(variant: str) -> FruitPublicationSpec:
 EXLLAMAV3_REVISION = "791c83073f7f90c44f765a0ceeab7a05fa15b96b"
 _COMPLETE_MARKER_NAME = "QSRT_COMPLETE.json"
 _CANDIDATE_MARKER_NAME = "QSRT_CANDIDATE.json"
-_KQUANT_SNAPSHOT_CLEAN_VERIFIED = False
 MODEL_CARD_TEMPLATE = r"""---
 license: mit
 library_name: vllm
@@ -395,12 +405,115 @@ _FIXED_COMPILATION_CONFIG = {
 }
 _FIXED_RUNTIME_OPTIONS = {
     "--attention-backend": "B12X_MLA_SPARSE",
+    "--generation-config": "vllm",
+    "--gpu-memory-utilization": "0.80",
     "--moe-backend": "b12x",
     "--kv-cache-dtype": "nvfp4_ds_mla",
+    "--reasoning-parser": "glm45",
+    "--tool-call-parser": "glm47",
+}
+_MODEL_RUNTIME_CONTRACT = {
+    "bf16": {"--load-format": "fastsafetensors"},
+    "siq": {"--load-format": "fastsafetensors"},
+    "qsrt": {
+        "--quantization": "kquant_hybrid",
+        "--load-format": "fastsafetensors",
+    },
+}
+_MODEL_RUNTIME_OPTIONS = frozenset({"--quantization", "--load-format"})
+_FIXED_RUNTIME_ENVIRONMENT = {
+    "B12X_COMPILE_CACHE_DIR": "<PRIVATE_ROOT>/cache/b12x/compile",
+    "B12X_CUTE_COMPILE_CACHE_DIR": "<PRIVATE_ROOT>/cache/b12x-cute",
+    "B12X_ROOT": "<PRIVATE_ROOT>/runtime/b12x-source",
+    "CUDA_CACHE_PATH": "<PRIVATE_ROOT>/cache/cuda",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "32",
+    "CUDA_VISIBLE_DEVICES": "0",
+    "CUPY_CACHE_DIR": "<PRIVATE_ROOT>/cache/cupy",
+    "CUTE_DSL_ARCH": "sm_120a",
+    "CUTE_DSL_CACHE_DIR": "<PRIVATE_ROOT>/cache/cute-dsl",
+    "DG_JIT_CACHE_DIR": "<PRIVATE_ROOT>/cache/deep-gemm",
+    "FLASHINFER_WORKSPACE_BASE": "<PRIVATE_ROOT>/cache/flashinfer",
+    "FRUIT_QSRT_AUTHENTICATED_MODEL_ROOT": "<PRIVATE_ROOT>/model",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "HF_DATASETS_CACHE": "<PRIVATE_ROOT>/cache/huggingface/datasets",
+    "HF_DATASETS_OFFLINE": "1",
+    "HF_HOME": "<PRIVATE_ROOT>/cache/huggingface",
+    "HF_HUB_OFFLINE": "1",
+    "HOME": "<PRIVATE_ROOT>/home",
+    "HUGGINGFACE_HUB_CACHE": "<PRIVATE_ROOT>/cache/huggingface/hub",
+    "LD_LIBRARY_PATH": (
+        "/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+    ),
+    "LOCAL_INFERENCE_CACHE_FINGERPRINT": "<PRIVATE_ROOT_ID>",
+    "MINFER_FMHA_CACHE_DIR": "<PRIVATE_ROOT>/cache/minfer/fmha",
+    "MM_SPARSE_ATTN_AOT_CACHE": "<PRIVATE_ROOT>/cache/minfer/mm-sparse-attn",
+    "NUMBA_CACHE_DIR": "<PRIVATE_ROOT>/cache/numba",
+    "PATH": (
+        "/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:"
+        "/usr/sbin:/usr/bin:/sbin:/bin"
+    ),
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONPATH": (
+        "<PRIVATE_ROOT>/runtime/vllm-source:<PRIVATE_ROOT>/runtime/b12x-source"
+    ),
+    "PYTHONSAFEPATH": "1",
+    "SAFETENSORS_FAST_GPU": "1",
+    "SPARKINFER_COMPILE_CACHE_DIR": "<PRIVATE_ROOT>/cache/b12x/compile",
+    "TEMP": "<PRIVATE_ROOT>/tmp",
+    "TILELANG_CACHE_DIR": "<PRIVATE_ROOT>/cache/tilelang",
+    "TILELANG_TMP_DIR": "<PRIVATE_ROOT>/cache/tilelang/tmp",
+    "TMP": "<PRIVATE_ROOT>/tmp",
+    "TMPDIR": "<PRIVATE_ROOT>/tmp",
+    "TORCHINDUCTOR_CACHE_DIR": "<PRIVATE_ROOT>/cache/torchinductor",
+    "TORCH_EXTENSIONS_DIR": "<PRIVATE_ROOT>/cache/torch-extensions",
+    "TORCH_HOME": "<PRIVATE_ROOT>/cache/torch",
+    "TRANSFORMERS_CACHE": "<PRIVATE_ROOT>/cache/huggingface/transformers",
+    "TRANSFORMERS_OFFLINE": "1",
+    "TRITON_CACHE_DIR": "<PRIVATE_ROOT>/cache/triton",
+    "TVM_CACHE_DIR": "<PRIVATE_ROOT>/cache/tvm",
+    "TVM_FFI_CACHE_DIR": "<PRIVATE_ROOT>/cache/tvm-ffi",
+    "VLLM_CACHE_DIR": "<PRIVATE_ROOT>/cache/vllm",
+    "VLLM_CACHE_ROOT": "<PRIVATE_ROOT>/cache/vllm",
+    "VLLM_EXL3_ONLINE_CACHE_DIR": "<PRIVATE_ROOT>/cache/exl3-online",
+    "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": ("<PRIVATE_ROOT>/cache/flashinfer-autotune"),
+    "VLLM_PLUGINS": "",
+    "VLLM_USE_B12X_MOE": "1",
+    "VLLM_USE_B12X_SPARSE_INDEXER": "1",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "XDG_CACHE_HOME": "<PRIVATE_ROOT>/cache",
+}
+_VARIABLE_RUNTIME_OPTIONS = {
+    "--served-model-name": "<MODEL>",
+    "--host": "<HOST>",
+    "--port": "<PORT>",
 }
 _FIXED_RUNTIME_SWITCHES = (
+    "--enable-auto-tool-choice",
     "--enable-chunked-prefill",
     "--enable-prefix-caching",
+)
+_RUNTIME_OPTION_ORDER = (
+    "--served-model-name",
+    "--host",
+    "--port",
+    "--tensor-parallel-size",
+    "--pipeline-parallel-size",
+    "--attention-backend",
+    "--moe-backend",
+    "--kv-cache-dtype",
+    "--enable-chunked-prefill",
+    "--enable-prefix-caching",
+    "--compilation-config",
+    "--speculative-config",
+    "--gpu-memory-utilization",
+    "--max-model-len",
+    "--max-num-batched-tokens",
+    "--max-num-seqs",
+    "--tool-call-parser",
+    "--enable-auto-tool-choice",
+    "--reasoning-parser",
+    "--generation-config",
 )
 _ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v3"
 _DTYPE_BYTES = {
@@ -467,20 +580,11 @@ def current_encoder_provenance(
     calibration: FruitCalibrationStore,
     kquant_root: Path | None = None,
 ) -> dict[str, object]:
-    global _KQUANT_SNAPSHOT_CLEAN_VERIFIED
     if kquant_root is None:
         if _KQUANT_IMPORT_IDENTITY is None:
-            raise RuntimeError("KQuant source snapshot identity is unavailable")
-        if not _KQUANT_SNAPSHOT_CLEAN_VERIFIED:
-            clean_identity = (
-                _git_revision(_KQUANT_IMPORT_SOURCE_ROOT),
-                tracked_worktree_sha256(_KQUANT_IMPORT_SOURCE_ROOT),
+            raise RuntimeError(
+                "KQuant source identity requires the authenticated production bootstrap"
             )
-            if clean_identity != _KQUANT_IMPORT_IDENTITY:
-                raise ValueError(
-                    "KQuant source snapshot does not match the clean committed tree"
-                )
-            _KQUANT_SNAPSHOT_CLEAN_VERIFIED = True
         kquant_revision, kquant_source_sha256 = _KQUANT_IMPORT_IDENTITY
     else:
         kquant_checkout = kquant_root.resolve(strict=True)
@@ -514,6 +618,10 @@ def _producer_provenance(
     vllm_root: Path,
     calibration: FruitCalibrationStore,
 ) -> dict[str, object]:
+    if _KQUANT_BOOTSTRAP_IDENTITY is None:
+        raise RuntimeError(
+            "Fruit producer provenance requires the authenticated production bootstrap"
+        )
     encoder = current_encoder_provenance(
         exllamav3_root=exllamav3_root,
         calibration=calibration,
@@ -525,7 +633,8 @@ def _producer_provenance(
         "vllm_source_sha256": tracked_worktree_sha256(vllm_root),
     }
     provenance: dict[str, object] = {
-        "schema": "kquant_fruit_qsrt_producer_v1",
+        "schema": "kquant_fruit_qsrt_producer_v2",
+        "bootstrap": dict(_KQUANT_BOOTSTRAP_IDENTITY),
         "encoder": encoder,
         "runtime": runtime,
     }
@@ -818,27 +927,84 @@ def _qualification_revision(value: object, *, name: str) -> str:
     return revision
 
 
-def _runtime_argv_option(argv: list[str], flag: str) -> str:
-    values: list[str] = []
-    prefix = f"{flag}="
-    for index, argument in enumerate(argv):
-        if argument.startswith(prefix):
-            values.append(argument[len(prefix) :])
-        elif argument == flag:
-            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+def _runtime_argv_options(
+    argv: list[str],
+) -> tuple[str, dict[str, str], set[str]]:
+    if (
+        len(argv) < 3
+        or argv[:2] != ["vllm", "serve"]
+        or not argv[2]
+        or argv[2].startswith("-")
+    ):
+        raise ValueError("Fruit runtime qualification argv is not vllm serve MODEL")
+
+    required_value_flags = (
+        set(_FIXED_RUNTIME_OPTIONS)
+        | set(_VARIABLE_RUNTIME_OPTIONS)
+        | {
+            "--tensor-parallel-size",
+            "--pipeline-parallel-size",
+            "--max-num-seqs",
+            "--max-model-len",
+            "--max-num-batched-tokens",
+            "--compilation-config",
+            "--speculative-config",
+        }
+    )
+    value_flags = required_value_flags | set(_MODEL_RUNTIME_OPTIONS)
+    switch_flags = set(_FIXED_RUNTIME_SWITCHES)
+    values: dict[str, str] = {}
+    switches: set[str] = set()
+    index = 3
+    while index < len(argv):
+        argument = argv[index]
+        if not argument.startswith("--"):
+            raise ValueError(
+                "Fruit runtime qualification argv contains an extra positional argument"
+            )
+        flag, separator, inline_value = argument.partition("=")
+        if flag not in value_flags and flag not in switch_flags:
+            raise ValueError(
+                f"Fruit runtime qualification argv option {flag} is not allowed"
+            )
+        if flag in values or flag in switches:
+            raise ValueError(
+                f"Fruit runtime qualification argv contains duplicate option {flag}"
+            )
+        if flag in switch_flags:
+            if separator:
+                raise ValueError(
+                    f"Fruit runtime qualification argv switch {flag} takes no value"
+                )
+            switches.add(flag)
+            index += 1
+            continue
+        if separator:
+            value = inline_value
+        else:
+            index += 1
+            if index >= len(argv) or argv[index].startswith("--"):
                 raise ValueError(
                     f"Fruit runtime qualification argv option {flag} has no value"
                 )
-            values.append(argv[index + 1])
-    if len(values) != 1 or not values[0]:
+            value = argv[index]
+        if not value:
+            raise ValueError(
+                f"Fruit runtime qualification argv option {flag} has no value"
+            )
+        values[flag] = value
+        index += 1
+
+    missing = (required_value_flags - set(values)) | (switch_flags - switches)
+    if missing:
         raise ValueError(
-            f"Fruit runtime qualification argv must contain exactly one {flag}"
+            "Fruit runtime qualification argv is missing required options "
+            f"{sorted(missing)}"
         )
-    return values[0]
+    return argv[2], values, switches
 
 
-def _runtime_argv_json(argv: list[str], flag: str) -> dict[str, object]:
-    raw_value = _runtime_argv_option(argv, flag)
+def _runtime_argv_json(raw_value: str, flag: str) -> dict[str, object]:
     try:
         value = json.loads(raw_value)
     except json.JSONDecodeError as exc:
@@ -852,30 +1018,6 @@ def _runtime_argv_json(argv: list[str], flag: str) -> dict[str, object]:
     return value
 
 
-def _normalized_runtime_argv(argv: list[str]) -> tuple[str, ...]:
-    if len(argv) < 3 or argv[:2] != ["vllm", "serve"] or argv[2].startswith("-"):
-        raise ValueError("Fruit runtime qualification argv is not vllm serve MODEL")
-    normalized = list(argv)
-    normalized[2] = "<MODEL>"
-    variable_options = {
-        "--model": "<MODEL>",
-        "--served-model-name": "<MODEL>",
-        "--port": "<PORT>",
-        "--download-dir": "<PATH>",
-    }
-    for index, argument in enumerate(normalized):
-        for flag, replacement in variable_options.items():
-            if argument == flag:
-                if index + 1 >= len(normalized):
-                    raise ValueError(
-                        f"Fruit runtime qualification argv option {flag} has no value"
-                    )
-                normalized[index + 1] = replacement
-            elif argument.startswith(f"{flag}="):
-                normalized[index] = f"{flag}={replacement}"
-    return tuple(normalized)
-
-
 def _validate_runtime_argv(
     argv: list[str],
     *,
@@ -884,8 +1026,7 @@ def _validate_runtime_argv(
     compilation_backend: str,
     cudagraph_mode: object,
 ) -> tuple[str, ...]:
-    if "--enforce-eager" in argv:
-        raise ValueError("Fruit runtime qualification argv may not force eager mode")
+    _model, values, switches = _runtime_argv_options(argv)
     expected_integers = {
         "--tensor-parallel-size": int(protocol["tensor_parallel_size"]),
         "--pipeline-parallel-size": 1,
@@ -894,7 +1035,7 @@ def _validate_runtime_argv(
         "--max-num-batched-tokens": 4096,
     }
     for flag, expected in expected_integers.items():
-        raw_value = _runtime_argv_option(argv, flag)
+        raw_value = values[flag]
         try:
             measured = int(raw_value)
         except ValueError as exc:
@@ -905,48 +1046,63 @@ def _validate_runtime_argv(
             raise ValueError(
                 f"Fruit runtime qualification argv option {flag} is not {expected}"
             )
+    try:
+        port = int(values["--port"])
+    except ValueError as exc:
+        raise ValueError(
+            "Fruit runtime qualification argv option --port is not an integer"
+        ) from exc
+    if str(port) != values["--port"] or not 1 <= port <= 65535:
+        raise ValueError("Fruit runtime qualification argv option --port is invalid")
 
     if compilation_backend != "inductor" or cudagraph_mode != "FULL_AND_PIECEWISE":
         raise ValueError(
             f"Fruit runtime qualification loaders.{arm} must use non-eager "
             "inductor FULL_AND_PIECEWISE"
         )
-    compilation = _runtime_argv_json(argv, "--compilation-config")
+    compilation = _runtime_argv_json(
+        values["--compilation-config"], "--compilation-config"
+    )
     if compilation != _FIXED_COMPILATION_CONFIG:
         raise ValueError(
             f"Fruit runtime qualification loaders.{arm} compilation config "
             "is not the fixed deployment contract"
         )
-    speculative = _runtime_argv_json(argv, "--speculative-config")
+    speculative = _runtime_argv_json(
+        values["--speculative-config"], "--speculative-config"
+    )
     if speculative != {"method": "mtp", "num_speculative_tokens": 1}:
         raise ValueError(
             f"Fruit runtime qualification loaders.{arm} MTP argv is not qualified"
         )
     for flag, expected in _FIXED_RUNTIME_OPTIONS.items():
-        if _runtime_argv_option(argv, flag) != expected:
+        if values[flag] != expected:
             raise ValueError(
                 f"Fruit runtime qualification loaders.{arm} argv option {flag} "
                 f"is not {expected}"
             )
-    for flag in _FIXED_RUNTIME_SWITCHES:
-        if argv.count(flag) != 1 or any(
-            argument.startswith(f"{flag}=") for argument in argv
-        ):
-            raise ValueError(
-                f"Fruit runtime qualification loaders.{arm} argv must contain "
-                f"exactly one {flag}"
-            )
-
-    for flag, expected in {
-        "--quantization": "kquant_hybrid",
-        "--load-format": "fastsafetensors",
-    }.items():
-        if _runtime_argv_option(argv, flag) != expected:
-            raise ValueError(
-                f"Fruit runtime qualification loaders.{arm} argv option {flag} "
-                f"is not {expected}"
-            )
-    return _normalized_runtime_argv(argv)
+    measured_model_options = {
+        flag: values[flag] for flag in _MODEL_RUNTIME_OPTIONS if flag in values
+    }
+    if measured_model_options != _MODEL_RUNTIME_CONTRACT[arm]:
+        raise ValueError(
+            f"Fruit runtime qualification loaders.{arm} does not use its "
+            "qualified model-specific quantization and load format"
+        )
+    normalized_values = {
+        **values,
+        **_VARIABLE_RUNTIME_OPTIONS,
+        "--compilation-config": json.dumps(
+            _FIXED_COMPILATION_CONFIG, separators=(",", ":"), sort_keys=True
+        ),
+        "--speculative-config": '{"method":"mtp","num_speculative_tokens":1}',
+    }
+    normalized = ["vllm", "serve", "<MODEL>"]
+    for flag in _RUNTIME_OPTION_ORDER:
+        normalized.append(flag)
+        if flag not in switches:
+            normalized.append(normalized_values[flag])
+    return tuple(normalized)
 
 
 def _positive_runtime_count(value: object, *, name: str) -> None:
@@ -1403,6 +1559,10 @@ def _validate_runtime_qualification(
             runtime["compilation_backend"],
             name=f"loaders.{arm}.runtime.compilation_backend",
         )
+        _qualification_string(
+            runtime["cudagraph_mode"],
+            name=f"loaders.{arm}.runtime.cudagraph_mode",
+        )
         if (
             compilation_backend != "inductor"
             or runtime["cudagraph_mode"] != "FULL_AND_PIECEWISE"
@@ -1418,6 +1578,11 @@ def _validate_runtime_qualification(
             compilation_backend=compilation_backend,
             cudagraph_mode=runtime["cudagraph_mode"],
         )
+        if runtime_environment != _FIXED_RUNTIME_ENVIRONMENT:
+            raise ValueError(
+                f"Fruit runtime qualification loaders.{arm} environment does "
+                "not match the sanitized production environment contract"
+            )
         if normalized_runtime_argv is None:
             normalized_runtime_argv = measured_runtime_argv
         elif measured_runtime_argv != normalized_runtime_argv:
