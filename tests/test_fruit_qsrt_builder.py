@@ -340,6 +340,9 @@ def test_model_card_uses_sealed_calibration_and_layer_evidence(
     assert "Adjacent-rate evidence" in card
     assert "1 of 1 predeclared assignments" in card
     assert "The sealed receipt" in card
+    assert "trained for conversational instruction following" in card
+    assert "targeted\nassistant behavior" in card
+    assert "Not assistant-quality" not in card
     assert 'sha256sum -- "${MODEL_DIR}/QSRT_COMPLETE.json"' not in card
     assert (
         '--env FRUIT_QSRT_EXPECTED_COMPLETE_SHA256="${FRUIT_QSRT_EXPECTED_COMPLETE_SHA256}"'
@@ -357,9 +360,9 @@ def test_instruct_publication_uses_variant_specific_repositories() -> None:
     assert "Fruit Instruct BF16" in publication.fruit_audit_rows
     assert "GLM-5.2-SIQ-Fruit-Instruct/tree/48452ef3" in publication.fruit_audit_rows
     assert "GLM-5.2-QSRT-Fruit/tree/c1a0c62d" not in publication.fruit_audit_rows
-    assert "Not assistant-quality" in publication.quality_limitations
+    assert "Compact proxy, not the 754B teacher" in publication.quality_limitations
+    assert "Not assistant-quality" not in publication.quality_limitations
     assert "four-prompt" not in publication.quality_limitations
-    assert "63.54" not in publication.quality_limitations
 
 
 def test_only_instruct_is_a_production_publication() -> None:
@@ -701,6 +704,9 @@ def test_runtime_qualification_validates_seals_and_renders(tmp_path: Path) -> No
         in section
     )
     assert "not identical software" in section
+    assert "spanning instruction following" in section
+    assert "not a standardized leaderboard benchmark" in section
+    assert "non-representative" not in section
     assert builder._RUNTIME_QUALIFICATION_NAME in (
         builder._expected_package_inventory({"files": {}})
     )
