@@ -415,7 +415,7 @@ def main() -> None:
         ),
         "CC": str(_CC_EXECUTABLE),
         "CUDA_CACHE_PATH": str(private_directories["cuda-cache"]),
-        "CUDA_HOME": str(_CUDA_HOME),
+        "CUDA_HOME": runtime_identity["cuda_home"],
         "CXX": str(_CXX_EXECUTABLE),
         "LC_ALL": "C.UTF-8",
         "HF_HUB_OFFLINE": "1",
