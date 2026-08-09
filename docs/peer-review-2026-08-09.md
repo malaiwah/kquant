@@ -21,8 +21,11 @@ fifteen findings across two passes.
   core, and the GLM recipe's verification logic. It also records three areas
   that were probed hard and came back clean, with executable evidence.
 
-Findings F1–F10 each carry a ready-to-file issue title, label and body, so they
-can be pasted into either repository verbatim.
+All fifteen findings are also stored as individual, directly filable issue files
+in [`peer-review-issues/`](peer-review-issues/), one per finding, with a filing
+script. That directory is the actionable extract; this document is the reasoning
+and evidence behind it. The F1–F10 bodies there were extracted mechanically from
+the `<details>` blocks below, so the two agree as committed.
 
 ---
 
