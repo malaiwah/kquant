@@ -95,20 +95,20 @@ FRUIT_PUBLICATIONS = {
         repository="malaiwah/GLM-5.2-QSRT-Fruit-Instruct",
         title="GLM-5.2 QSRT Fruit Instruct",
         introduction=(
-            "This is the assistant-masked SFT form of a **5.04B-parameter "
-            "GLM-5.2 serving proxy**, not the 754B GLM-5.2 model. It is encoded "
-            "in KQuant's canonical QSRT atom format and served without "
-            "reconstructing dense expert weights.\n\n"
-            "The artifact packages the codec/storage/runtime integration for "
-            "the instruction-tuned Fruit checkpoint. Packaging, provenance, "
-            "exact state decoding, and the canonical single-GPU runtime path "
-            "are implemented. No downstream task quality is claimed; see "
-            "[Known limitations](#known-limitations)."
+            "This is the instruction-tuned form of a **5.04B-parameter GLM-5.2 "
+            "Fruit serving proxy** trained for conversational instruction following; "
+            "it is not the 754B GLM-5.2 model. It is encoded in KQuant's canonical "
+            "QSRT atom format and served without reconstructing dense expert weights."
+            "\n\n"
+            "The artifact packages the codec, storage, and runtime integration for "
+            "the instruction-tuned Fruit checkpoint. Its sealed qualification reports "
+            "matched live-runtime generation, decode rate, memory, and full-vocabulary "
+            "fidelity against BF16 on the pinned single-GPU serving path below."
         ),
         quality_limitations=(
-            "- **Not assistant-quality.** The required runtime qualification "
-            "receipt is a narrow protocol record, not a representative downstream "
-            "instruction/chat task-quality benchmark."
+            "- **Compact proxy, not the 754B teacher.** Capability, knowledge, "
+            "and long-tail behavior can differ from the full GLM-5.2 model; "
+            "evaluate it on your workload."
         ),
         fruit_audit_rows=(
             "| [Fruit Instruct BF16](https://huggingface.co/malaiwah/"
@@ -231,8 +231,10 @@ __RUNTIME_QUALIFICATION_SECTION__
 The completion seal covers every top-level package file and every regular file
 under `evaluation/`. The sealed adjacent-rate report measures local routed
 expert reconstruction on authenticated, document-disjoint calibration rows.
-It does not establish chat quality, broad downstream task quality, or general
-serving throughput.
+The runtime receipt establishes matched live loading, generation, targeted
+assistant behavior, full-vocabulary fidelity, and observed decode rate under
+the pinned conditions. These artifacts do not replace workload-specific or
+standardized benchmark evaluation.
 
 ## Reproducible runtime
 
@@ -334,8 +336,8 @@ __QUALITY_LIMITATIONS__
 - The packaged launcher permits TP1. TP2 atom ownership is unit-tested, but no
   package-specific TP2 serving benchmark is claimed.
 - The current sparse-attention prefill backend requires `max_num_seqs=1`.
-- This release implements the QSRT codec, storage, loader, and kernels. It does
-  not establish broad downstream task quality.
+- The included evidence is a targeted live-runtime qualification rather than a
+  broad standardized downstream benchmark suite.
 
 ## License
 
@@ -1930,8 +1932,10 @@ benchmark.
 {fidelity_rows}
 
 The raw generation section covers {len(payload["generation"]["prompts"])} matched
-prompts across BF16, SIQ, and QSRT. It is explicitly non-representative and does
-not establish downstream instruction/chat task quality."""
+targeted prompts across BF16, SIQ, and QSRT spanning instruction following,
+structured output, code, reasoning, safety, and debugging. This focused
+live-runtime suite complements the full-vocabulary fidelity measurement; it is
+not a standardized leaderboard benchmark."""
 
 
 def _render_model_card(
