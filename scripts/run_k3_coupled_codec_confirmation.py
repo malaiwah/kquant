@@ -25,6 +25,7 @@ from kquant.capture import index_cached_layer_samples
 from kquant.coupled_expert_study import (
     CoupledTriplet,
     RoutedOutputMetric,
+    apply_w3_w2_sign_draw,
     encode_coupled_block_hadamard,
     execute_coupled_block_hadamard,
     expert_hidden,
@@ -39,7 +40,7 @@ from kquant.sqg_quantizer import install_sqg_quantizer
 
 
 KIND = "kquant_k3_coupled_uniform_codec_confirmation"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_CACHE = Path(
     "/data/kquant/captures/k3-codec-diverse-validation-v3-128k-input-v1.kqsamples"
 )
@@ -56,6 +57,24 @@ def _parse_names(value: str) -> tuple[str, ...]:
     result = tuple(item.strip() for item in value.split(",") if item.strip())
     if not result or len(set(result)) != len(result):
         raise argparse.ArgumentTypeError("expected a nonempty list of unique names")
+    return result
+
+
+def _parse_expert_draws(value: str) -> dict[int, int]:
+    result: dict[int, int] = {}
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        expert_text, separator, draw_text = item.partition(":")
+        if not separator or not expert_text.isdecimal() or not draw_text.isdecimal():
+            raise argparse.ArgumentTypeError(
+                "expected comma-separated expert:draw pairs"
+            )
+        expert = int(expert_text)
+        draw = int(draw_text)
+        if expert in result:
+            raise argparse.ArgumentTypeError("expert draw keys must be unique")
+        result[expert] = draw
     return result
 
 
@@ -101,30 +120,78 @@ def _rows(samples: Any, expert: int, maximum: int) -> dict[str, torch.Tensor]:
     if locations.numel() == 0:
         raise ValueError(f"expert {expert} has no validation rows")
     if locations.shape[0] > maximum:
-        indices = torch.linspace(0, locations.shape[0] - 1, maximum).round().long()
-        locations = locations.index_select(0, indices)
+        location_splits = samples.input_split.index_select(0, locations[:, 0])
+
+        def evenly(group: torch.Tensor, count: int) -> torch.Tensor:
+            if count <= 0:
+                return group[:0]
+            if group.shape[0] <= count:
+                return group
+            indices = torch.linspace(0, group.shape[0] - 1, count).round().long()
+            return group.index_select(0, indices)
+
+        fit = locations[location_splits == 0]
+        confirmation = locations[location_splits == 1]
+        fit_count = min(fit.shape[0], maximum // 2)
+        confirmation_count = min(confirmation.shape[0], maximum - fit_count)
+        remaining = maximum - fit_count - confirmation_count
+        if remaining:
+            fit_count += min(fit.shape[0] - fit_count, remaining)
+            remaining = maximum - fit_count - confirmation_count
+        if remaining:
+            confirmation_count += min(
+                confirmation.shape[0] - confirmation_count, remaining
+            )
+        locations = torch.cat(
+            (evenly(fit, fit_count), evenly(confirmation, confirmation_count))
+        )
+        locations = locations.index_select(0, torch.argsort(locations[:, 0]))
     rows, slots = locations[:, 0], locations[:, 1]
     return {
         "inputs": samples.input_values.index_select(0, rows).float(),
         "gates": samples.input_gates[rows, slots].float(),
         "aggregate": samples.routed_latent.index_select(0, rows).float(),
+        "split": samples.input_split.index_select(0, rows),
         "documents": torch.bitwise_right_shift(
             samples.input_observations.index_select(0, rows), 32
         ),
     }
 
 
-def _external_transform(source: CoupledTriplet) -> CoupledTriplet:
-    return encode_coupled_block_hadamard(source, block_size=512)
+def _external_transform(
+    source: CoupledTriplet,
+    *,
+    residual_draw: int,
+    intermediate_draw: int,
+    sign_draw: int,
+) -> CoupledTriplet:
+    gauged = apply_w3_w2_sign_draw(source, draw=sign_draw)
+    return encode_coupled_block_hadamard(
+        gauged,
+        block_size=512,
+        residual_rotation_draw=residual_draw,
+        intermediate_rotation_draw=intermediate_draw,
+    )
 
 
-def _execute_arm(inputs: torch.Tensor, reconstruction: CoupledTriplet, arm: str) -> torch.Tensor:
+def _execute_arm(
+    inputs: torch.Tensor,
+    reconstruction: CoupledTriplet,
+    arm: str,
+    *,
+    residual_draw: int,
+    intermediate_draw: int,
+) -> torch.Tensor:
     if arm == "baseline":
         return expert_hidden(inputs, reconstruction) @ reconstruction.down.T
     if arm != "coupled_hadamard":
         raise ValueError(f"unknown confirmation arm {arm!r}")
     return execute_coupled_block_hadamard(
-        inputs, reconstruction, block_size=512
+        inputs,
+        reconstruction,
+        block_size=512,
+        residual_rotation_draw=residual_draw,
+        intermediate_rotation_draw=intermediate_draw,
     )
 
 
@@ -171,12 +238,41 @@ def _score(
     output_metric: RoutedOutputMetric,
     arm: str,
     evidence: list[dict[str, Any]],
+    residual_draw: int,
+    intermediate_draw: int,
 ) -> dict[str, Any]:
     source_output = expert_hidden(rows["inputs"], source) @ source.down.T
-    output = _execute_arm(rows["inputs"], reconstruction, arm)
+    output = _execute_arm(
+        rows["inputs"],
+        reconstruction,
+        arm,
+        residual_draw=residual_draw,
+        intermediate_draw=intermediate_draw,
+    )
     error = output - source_output
-    routed_error = rows["gates"][:, None] * error
-    exact = output_metric.exact_delta(rows["aggregate"], routed_error)
+
+    def score_rows(mask: torch.Tensor) -> dict[str, Any]:
+        selected_error = error[mask]
+        selected_source = source_output[mask]
+        routed_error = rows["gates"][mask, None] * selected_error
+        exact = output_metric.exact_delta(rows["aggregate"][mask], routed_error)
+        return {
+            "expert_output_nmse": float(
+                selected_error.double().square().sum()
+                / selected_source.double().square().sum().clamp_min(1e-30)
+            ),
+            "post_projection_sse": float(exact.double().square().sum()),
+            "rows": int(mask.sum()),
+            "documents": int(torch.unique(rows["documents"][mask]).numel()),
+        }
+
+    all_rows = torch.ones(error.shape[0], dtype=torch.bool)
+    fit_rows = rows["split"] == 0
+    confirmation_rows = rows["split"] == 1
+    if not bool(fit_rows.any()) or not bool(confirmation_rows.any()):
+        fit_rows = torch.arange(error.shape[0]) % 2 == 0
+        confirmation_rows = ~fit_rows
+    routed_scores = score_rows(all_rows)
     weight_sse = sum(
         float((candidate.double() - target.double()).square().sum())
         for candidate, target in zip(
@@ -190,13 +286,9 @@ def _score(
     scale_bits = sum(int(item["scale_bytes"]) * 8 for item in evidence)
     return {
         "weight_nmse": weight_sse / weight_energy,
-        "expert_output_nmse": float(
-            error.double().square().sum()
-            / source_output.double().square().sum().clamp_min(1e-30)
-        ),
-        "post_projection_sse": float(exact.double().square().sum()),
-        "rows": int(rows["inputs"].shape[0]),
-        "documents": int(torch.unique(rows["documents"]).numel()),
+        **routed_scores,
+        "fit": score_rows(fit_rows),
+        "confirmation": score_rows(confirmation_rows),
         "trellis_bpw": payload_bits / source.numel,
         "scale_bpw": scale_bits / source.numel,
         "all_in_bpw": (payload_bits + scale_bits) / source.numel,
@@ -219,6 +311,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--validation-cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--maximum-rows", type=int, default=64)
+    parser.add_argument(
+        "--coupled-residual-draw",
+        type=int,
+        default=0,
+        help="one residual-side signed-Hadamard draw shared by the layer",
+    )
+    parser.add_argument(
+        "--coupled-intermediate-draws",
+        type=_parse_expert_draws,
+        default={},
+        help="expert:draw overrides for coupled intermediate rotations",
+    )
+    parser.add_argument(
+        "--w3-w2-sign-draws",
+        type=_parse_expert_draws,
+        default={},
+        help="expert:draw overrides for exact baked W3/W2 sign gauges",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--exllamav3-root", type=Path, default=Path("/home/luke/projects/exllamav3"))
     parser.add_argument("--official-revision", default=C.REVISION)
@@ -238,6 +348,20 @@ def parse_args() -> argparse.Namespace:
         parser.error("--arms supports baseline and coupled_hadamard")
     if args.maximum_rows <= 0:
         parser.error("--maximum-rows must be positive")
+    if args.coupled_residual_draw < 0:
+        parser.error("--coupled-residual-draw must be nonnegative")
+    if any(
+        expert not in args.experts or not 0 <= draw
+        for expert, draw in args.coupled_intermediate_draws.items()
+    ):
+        parser.error(
+            "coupled intermediate draws must be nonnegative and name selected experts"
+        )
+    if any(
+        expert not in args.experts or not 0 <= draw
+        for expert, draw in args.w3_w2_sign_draws.items()
+    ):
+        parser.error("W3/W2 sign draws must be nonnegative and name selected experts")
     return args
 
 
@@ -256,6 +380,19 @@ def main() -> None:
         "validation_cache": str(args.validation_cache.resolve()),
         "validation_manifest_sha256": _sha256(args.validation_cache / "manifest.json"),
         "maximum_rows": args.maximum_rows,
+        "coupled_rotations": {
+            "residual_layer_shared": args.coupled_residual_draw,
+            "intermediate_by_expert": {
+                str(expert): draw
+                for expert, draw in sorted(
+                    args.coupled_intermediate_draws.items()
+                )
+            },
+        },
+        "w3_w2_sign_gauge_by_expert": {
+            str(expert): draw
+            for expert, draw in sorted(args.w3_w2_sign_draws.items())
+        },
         "ldlq_tf32": args.ldlq_tf32,
         "no_qat": True,
         "writes_checkpoint_payloads": False,
@@ -292,9 +429,16 @@ def main() -> None:
                 layer_store.load_matrix(args.layer, expert, "w3"),
                 layer_store.load_matrix(args.layer, expert, "w2"),
             )
+        intermediate_draw = args.coupled_intermediate_draws.get(expert, 0)
+        sign_draw = args.w3_w2_sign_draws.get(expert, 0)
         arm_sources = {
             "baseline": source,
-            "coupled_hadamard": _external_transform(source),
+            "coupled_hadamard": _external_transform(
+                source,
+                residual_draw=args.coupled_residual_draw,
+                intermediate_draw=intermediate_draw,
+                sign_draw=sign_draw,
+            ),
         }
         results: dict[str, Any] = {}
         for codebook in args.codebooks:
@@ -319,6 +463,8 @@ def main() -> None:
                     output_metric,
                     arm,
                     evidence,
+                    args.coupled_residual_draw,
+                    intermediate_draw,
                 )
                 print(
                     f"layer {args.layer} expert {expert} {codebook} {arm}: "
@@ -346,6 +492,11 @@ def main() -> None:
                 }
         payload["results"][key] = {
             "expert": expert,
+            "coupled_rotations": {
+                "residual_draw": args.coupled_residual_draw,
+                "intermediate_draw": intermediate_draw,
+            },
+            "w3_w2_sign_gauge_draw": sign_draw,
             "candidates": results,
             "comparisons": comparisons,
             "seconds": time.time() - started,

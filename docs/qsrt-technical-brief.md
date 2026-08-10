@@ -830,12 +830,32 @@ following mechanisms remain distinct research candidates; a negative result
 for one parameterization does not remove the underlying symmetry or coding
 degree of freedom.
 
+The coupled boundary transform has two rotation scopes. Residual-side signs
+are selected once per layer and shared by all experts: they act on the
+`w1`/`w3` input boundary and the `w2` output boundary. Intermediate-side signs
+may be selected per expert, but the selected draw is coupled across the
+interleaved gate/up preactivation boundary and the matching post-SiTU `w2`
+input boundary. This preserves layer-level reuse at the residual boundary
+without forcing one intermediate rotation on all 896 experts.
+
+The real K2 draw screen uses eight deterministic intermediate rotations. For
+each expert, the three lowest-SSE draws on 128 fit documents from the 4M
+capture are shortlisted, and 128 disjoint confirmation documents choose among
+them. The resulting expert-static draws were then evaluated on up to 256 rows
+per expert from the separate 128K corpus. Across 28 experts and seven layers,
+the selected rotations reduced external routed post-projection SSE by 1.308%
+pooled and 0.447% at the expert median, with 17/28 wins. The expert-mean
+bootstrap interval was 0.364% to 1.864%. A single global draw lost, and a
+layer-shared draw recovered only 0.030% pooled, so the useful degree of freedom
+is expert-private. Three bits per expert identify one of eight deterministic
+draws; the sign vectors themselves need not be stored.
+
 | Mechanism | Mathematical role | Current evidence | Qualification |
 | --- | --- | --- | --- |
-| Coupled gate/up/down boundary Hadamard | Exact change of basis before the coordinatewise activation boundary | Fresh uniform-K2 SQG re-encodes improved routed error on 22/24 experts; pooled routed SSE fell 3.052% | Numerically promising; requires fused-transform latency and broader layer confirmation |
+| Coupled gate/up/down boundary Hadamard | Exact change of basis before the coordinatewise activation boundary | Fresh uniform-K2 SQG re-encodes improved routed error on 22/24 experts; pooled routed SSE fell 3.052%. Eight-draw expert-private selection on the 4M capture transferred to a separate 128K corpus: 1.308% pooled and 0.447% median routed improvement, with 17/28 wins. A single global draw lost and layer-shared selection recovered only 0.030% pooled | Keep the coupled transform and expert-private intermediate draw. Broaden the external panel, then search a small layer-shared residual-draw set and measure fused-transform latency |
 | Activation-metric W1/W3 pair code | Uses the local 2-by-2 SiTU metric so gate/up errors can cancel | 24/28 isolated pair-codebook wins; median functional metric improvement 4.90% | Codebook oracle; needs a joint vector trellis, decoded-payload scoring, and full-expert validation |
-| W3/W2 sign gauge | Exact symmetry from the odd up activation | Zero payload and runtime cost after baking signs into both matrices | Retain for real SQG path search; symmetric scalar proxies cannot measure its trellis-path value |
-| Positive W3/W2 scale gauge | Approximate symmetry while the up branch is linear | Across 28 routed experts, median route-weighted mass with $g'(u)\ge0.99$ is 99.9986%; the worst expert remains 97.7792%. A four-expert baked-gauge check changed full-precision expert SSE by only $1.39\times10^{-11}$, but naive RMS balancing worsened the 2-bit proxy by 0.283% median | Symmetry is valid; RMS balancing is a negative heuristic, not a rejection of activation-aware scale fitting |
+| W3/W2 sign gauge | Exact symmetry from the odd up activation | Eight deterministic sign representatives were searched with real K2 SQG. The fit/confirmation-selected gauge transferred by 0.393% pooled and 0.302% median on 7,168 untouched routed rows, with 14/28 wins. Combining it mechanically with the selected Hadamard draw reduced the Hadamard gain from 1.308% to 0.448% | Retain as an expert-static alternative to the selected intermediate rotation, not an automatically stacked transform. Baking matched signs into W3 rows and W2 columns costs no payload or runtime work |
+| Positive W3/W2 scale gauge | Approximate symmetry while the up branch is linear | Across 28 routed experts, median route-weighted mass with $g'(u)\ge0.99$ is 99.9986%; the worst expert remains 97.7792%. A balanced fit/confirmation screen selected a W2-oriented gauge for 18/28 experts and retained identity for 10/28; median applied confirmation gain was 0.83% and pooled gain was 1.42%. The largest accepted full-precision relative SSE was $3.06\times10^{-5}$ | Retain identity as an expert-static fallback and qualify only confirmed gauges through actual K2 SQG re-encoding and untouched final validation |
 | Co-routing-aware candidate phase | Chooses among near-equal expert errors to reduce top-16 cross terms | A 32-row layer-24 audit measured a positive cross term equal to 0.929% of diagonal mapped SSE; the linear metric matched exact post-projection SSE within 0.458% | Plausible sub-percent headroom; requires two or more retained trellis candidates per expert and document-disjoint selection |
 | Aligned per-neuron shared bases | Stores a small number of layer bases and quantizes only expert residuals | In 32-expert coordinate sketches, rank-four excess capture over an energy-matched isotropic null was 1.18, 1.74, 0.09, and 0.39 percentage points at layers 1, 24, 64, and 92. Global expert coefficients were weaker | Track as a low-rate oracle, but the signal is not stable through depth; require full-coordinate/all-expert factorization and residual K2 encoding before implementation work |
 | Reconstructed-activation W2 refit | Compensates upstream quantization before the final K2 encode | Dense refit won 20/28 experts with 1.55% median routed improvement | Upper bound only; the dense fitted matrix must be distilled into a cheap structured correction or used solely as the next W2 encoding target |

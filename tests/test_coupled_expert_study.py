@@ -14,6 +14,7 @@ from kquant.coupled_expert_study import (
     apply_output_rotation,
     apply_permutation_sign_gauge,
     apply_postactivation_scale,
+    apply_w3_w2_sign_draw,
     block_hadamard,
     blockwise_codebook_quantize,
     conditional_entropy_bits,
@@ -198,13 +199,25 @@ def test_temperature_and_two_sided_closures() -> None:
 def test_coupled_block_hadamard_closes_across_activation() -> None:
     triplet = _triplet(seed=101, hidden=16, intermediate=16)
     inputs = torch.randn(7, 16, generator=torch.Generator().manual_seed(102))
-    encoded = encode_coupled_block_hadamard(triplet, block_size=8)
-    torch.testing.assert_close(
-        execute_coupled_block_hadamard(inputs, encoded, block_size=8),
-        expert_output(inputs, triplet),
-        rtol=3e-5,
-        atol=3e-5,
-    )
+    for residual_draw, intermediate_draw in ((0, 0), (1, 0), (0, 7), (2, 5)):
+        encoded = encode_coupled_block_hadamard(
+            triplet,
+            block_size=8,
+            residual_rotation_draw=residual_draw,
+            intermediate_rotation_draw=intermediate_draw,
+        )
+        torch.testing.assert_close(
+            execute_coupled_block_hadamard(
+                inputs,
+                encoded,
+                block_size=8,
+                residual_rotation_draw=residual_draw,
+                intermediate_rotation_draw=intermediate_draw,
+            ),
+            expert_output(inputs, triplet),
+            rtol=3e-5,
+            atol=3e-5,
+        )
 
 
 def test_coupled_block_hadamard_closes_with_distinct_boundary_widths() -> None:
@@ -228,6 +241,20 @@ def test_coupled_block_hadamard_closes_with_distinct_boundary_widths() -> None:
         rtol=3e-5,
         atol=3e-5,
     )
+
+
+def test_w3_w2_sign_draw_is_exact_and_deterministic() -> None:
+    triplet = _triplet(seed=117, hidden=16, intermediate=8)
+    inputs = torch.randn(5, 16, generator=torch.Generator().manual_seed(118))
+    expected = expert_output(inputs, triplet)
+    first = apply_w3_w2_sign_draw(triplet, draw=3)
+    second = apply_w3_w2_sign_draw(triplet, draw=3)
+    assert torch.equal(first.up, second.up)
+    assert torch.equal(first.down, second.down)
+    torch.testing.assert_close(expert_output(inputs, first), expected)
+    identity = apply_w3_w2_sign_draw(triplet, draw=0)
+    assert torch.equal(identity.up, triplet.up)
+    assert torch.equal(identity.down, triplet.down)
 
 
 def test_pair_metric_and_residual_cross_term() -> None:

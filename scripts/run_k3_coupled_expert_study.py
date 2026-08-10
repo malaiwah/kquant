@@ -203,13 +203,56 @@ def _expert_occurrences(
     expert: int,
     *,
     maximum: int,
+    balance_splits: bool = False,
 ) -> dict[str, torch.Tensor]:
     locations = torch.nonzero(samples.input_experts == expert, as_tuple=False)
     if locations.numel() == 0:
         raise ValueError(f"expert {expert} has no routed rows in the selected cache")
     if locations.shape[0] > maximum:
-        positions = torch.linspace(0, locations.shape[0] - 1, maximum).round().long()
-        locations = locations.index_select(0, positions)
+        if balance_splits:
+            location_splits = samples.input_split.index_select(
+                0, locations[:, 0]
+            )
+
+            def evenly(group: torch.Tensor, count: int) -> torch.Tensor:
+                if count <= 0:
+                    return group[:0]
+                if group.shape[0] <= count:
+                    return group
+                positions = (
+                    torch.linspace(0, group.shape[0] - 1, count)
+                    .round()
+                    .long()
+                )
+                return group.index_select(0, positions)
+
+            fit = locations[location_splits == 0]
+            confirmation = locations[location_splits == 1]
+            fit_count = min(fit.shape[0], maximum // 2)
+            confirmation_count = min(
+                confirmation.shape[0], maximum - fit_count
+            )
+            remaining = maximum - fit_count - confirmation_count
+            if remaining:
+                fit_count += min(fit.shape[0] - fit_count, remaining)
+                remaining = maximum - fit_count - confirmation_count
+            if remaining:
+                confirmation_count += min(
+                    confirmation.shape[0] - confirmation_count, remaining
+                )
+            locations = torch.cat(
+                (evenly(fit, fit_count), evenly(confirmation, confirmation_count))
+            )
+            locations = locations.index_select(
+                0, torch.argsort(locations[:, 0])
+            )
+        else:
+            positions = (
+                torch.linspace(0, locations.shape[0] - 1, maximum)
+                .round()
+                .long()
+            )
+            locations = locations.index_select(0, positions)
     rows = locations[:, 0]
     slots = locations[:, 1]
     observations = samples.input_observations.index_select(0, rows)
@@ -431,16 +474,36 @@ def _two_bit_transform_proxy(
     gates: torch.Tensor,
     aggregate: torch.Tensor,
     output_metric: RoutedOutputMetric,
+    row_split: torch.Tensor,
 ) -> dict[str, Any]:
     """Compare exact reparameterizations under one generic 2-bit quantizer."""
 
-    def score(output: torch.Tensor) -> dict[str, float]:
-        error = output - source_output
-        exact = output_metric.exact_delta(aggregate, gates[:, None] * error)
+    if row_split.shape != (inputs.shape[0],):
+        raise ValueError("2-bit proxy split does not align with routed rows")
+    fit_mask = row_split == 0
+    confirmation_mask = row_split == 1
+    if not bool(fit_mask.any()) or not bool(confirmation_mask.any()):
+        indices = torch.arange(inputs.shape[0])
+        fit_mask = indices % 2 == 0
+        confirmation_mask = ~fit_mask
+
+    def score_rows(output: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
+        error = output[mask] - source_output[mask]
+        exact = output_metric.exact_delta(
+            aggregate[mask], gates[mask, None] * error
+        )
         expert_sse = error.double().square().sum()
         return {
+            "rows": int(mask.sum()),
             "expert_sse": float(expert_sse),
             "post_projection_sse": float(exact.double().square().sum()),
+        }
+
+    def score(output: torch.Tensor) -> dict[str, Any]:
+        return {
+            **score_rows(output, torch.ones(inputs.shape[0], dtype=torch.bool)),
+            "fit": score_rows(output, fit_mask),
+            "confirmation": score_rows(output, confirmation_mask),
         }
 
     q_gate = blockwise_codebook_quantize(source.gate)
@@ -501,71 +564,156 @@ def _two_bit_transform_proxy(
     # q(u) = 25*tanh(u/25) is almost linear on the routed Kimi rows.  In that
     # regime, scaling each W3 row by c and the matching W2 column by 1/c is an
     # approximately function-preserving gauge that can be baked into stored
-    # weights.  Balance the two per-neuron RMS values, but retain a small
-    # strength grid so the full nonlinear expert remains the authority.
+    # weights.  Scalar quantization of a complete W3 row is scale-homogeneous,
+    # while W2 quantization couples groups of adjacent columns.  Compare the
+    # symmetric up/down RMS rule with W2-oriented RMS and absmax rules instead
+    # of treating one arbitrary equilibration policy as the gauge itself.
     up_rms = source.up.float().square().mean(dim=1).sqrt().clamp_min(1e-8)
     down_rms = source.down.float().square().mean(dim=0).sqrt().clamp_min(1e-8)
-    balance = (down_rms / up_rms).sqrt()
-    balance /= balance.log().mean().exp()
+    down_absmax = source.down.float().abs().amax(dim=0).clamp_min(1e-8)
+
+    def normalized_scale(value: torch.Tensor) -> torch.Tensor:
+        return value / value.log().mean().exp()
+
+    scale_gauge_policies = {
+        "up_down_rms": normalized_scale((down_rms / up_rms).sqrt()),
+        "down_rms": normalized_scale(down_rms),
+        "down_absmax": normalized_scale(down_absmax),
+    }
     scale_gauge_arms: dict[str, dict[str, float]] = {}
-    for strength in (0.25, 0.5, 0.75, 1.0):
-        scale = balance.pow(strength).clamp(0.5, 2.0)
-        full_precision_hidden = situ_value(
-            inputs @ source.gate.T,
-            inputs @ (source.up * scale[:, None]).T,
-        )
-        full_precision_output = full_precision_hidden @ (
-            source.down / scale[None, :]
-        ).T
-        quantized_up = blockwise_codebook_quantize(source.up * scale[:, None])
-        quantized_down = blockwise_codebook_quantize(
-            source.down / scale[None, :]
-        )
-        quantized_hidden = situ_value(
-            inputs @ q_gate.T, inputs @ quantized_up.T
-        )
-        arm = score(quantized_hidden @ quantized_down.T)
-        full_precision_error = full_precision_output - source_output
-        arm.update(
-            {
-                "strength": strength,
-                "scale_minimum": float(scale.min()),
-                "scale_maximum": float(scale.max()),
-                "full_precision_expert_relative_sse": float(
-                    full_precision_error.double().square().sum()
-                    / source_output.double().square().sum().clamp_min(1e-30)
-                ),
-                "expert_sse_improvement_vs_baseline": float(
-                    1.0
-                    - arm["expert_sse"] / max(baseline["expert_sse"], 1e-30)
-                ),
-                "post_projection_sse_improvement_vs_baseline": float(
-                    1.0
-                    - arm["post_projection_sse"]
-                    / max(baseline["post_projection_sse"], 1e-30)
-                ),
-            }
-        )
-        scale_gauge_arms[f"{strength:.2f}"] = arm
+    for policy, proposal in scale_gauge_policies.items():
+        for strength in (0.25, 0.5, 0.75, 1.0):
+            scale = proposal.pow(strength).clamp(0.5, 2.0)
+            full_precision_hidden = situ_value(
+                inputs @ source.gate.T,
+                inputs @ (source.up * scale[:, None]).T,
+            )
+            full_precision_output = full_precision_hidden @ (
+                source.down / scale[None, :]
+            ).T
+            quantized_up = blockwise_codebook_quantize(
+                source.up * scale[:, None]
+            )
+            quantized_down = blockwise_codebook_quantize(
+                source.down / scale[None, :]
+            )
+            quantized_hidden = situ_value(
+                inputs @ q_gate.T, inputs @ quantized_up.T
+            )
+            arm = score(quantized_hidden @ quantized_down.T)
+            full_precision_error = full_precision_output - source_output
+            arm.update(
+                {
+                    "policy": policy,
+                    "strength": strength,
+                    "scale_minimum": float(scale.min()),
+                    "scale_maximum": float(scale.max()),
+                    "full_precision_expert_relative_sse": float(
+                        full_precision_error.double().square().sum()
+                        / source_output.double().square().sum().clamp_min(1e-30)
+                    ),
+                    "expert_sse_improvement_vs_baseline": float(
+                        1.0
+                        - arm["expert_sse"]
+                        / max(baseline["expert_sse"], 1e-30)
+                    ),
+                    "post_projection_sse_improvement_vs_baseline": float(
+                        1.0
+                        - arm["post_projection_sse"]
+                        / max(baseline["post_projection_sse"], 1e-30)
+                    ),
+                    "fit_post_projection_sse_improvement_vs_baseline": float(
+                        1.0
+                        - arm["fit"]["post_projection_sse"]
+                        / max(baseline["fit"]["post_projection_sse"], 1e-30)
+                    ),
+                    "confirmation_post_projection_sse_improvement_vs_baseline": float(
+                        1.0
+                        - arm["confirmation"]["post_projection_sse"]
+                        / max(
+                            baseline["confirmation"]["post_projection_sse"],
+                            1e-30,
+                        )
+                    ),
+                }
+            )
+            scale_gauge_arms[f"{policy}:{strength:.2f}"] = arm
+    scale_gauge_arms["identity:0.00"] = {
+        "policy": "identity",
+        "strength": 0.0,
+        "scale_minimum": 1.0,
+        "scale_maximum": 1.0,
+        "full_precision_expert_relative_sse": 0.0,
+        "expert_sse": baseline["expert_sse"],
+        "post_projection_sse": baseline["post_projection_sse"],
+        "fit": baseline["fit"],
+        "confirmation": baseline["confirmation"],
+        "expert_sse_improvement_vs_baseline": 0.0,
+        "post_projection_sse_improvement_vs_baseline": 0.0,
+        "fit_post_projection_sse_improvement_vs_baseline": 0.0,
+        "confirmation_post_projection_sse_improvement_vs_baseline": 0.0,
+    }
     scale_gauge_best = max(
         scale_gauge_arms.values(),
         key=lambda arm: arm["post_projection_sse_improvement_vs_baseline"],
     )
+    scale_gauge_fit_key, scale_gauge_fit_selected = max(
+        scale_gauge_arms.items(),
+        key=lambda item: item[1][
+            "fit_post_projection_sse_improvement_vs_baseline"
+        ],
+    )
+    scale_gauge_confirmation_accepted = (
+        scale_gauge_fit_selected[
+            "confirmation_post_projection_sse_improvement_vs_baseline"
+        ]
+        > 0.0
+    )
 
     # Interleave the two branches before the left transform so each block can
     # exploit their coupled functional geometry, then invert before SiTU.
-    transformed = encode_coupled_block_hadamard(source, block_size=512)
-    transformed = CoupledTriplet(
-        *(blockwise_codebook_quantize(value) for value in transformed.tensors())
-    )
-    explicit_output = execute_coupled_block_hadamard(
-        inputs, transformed, block_size=512
-    )
-    explicit = score(explicit_output)
-    explicit["metadata_bpw"] = 0.0
-    explicit["runtime"] = "four block-512 boundary Hadamards per selected expert"
+    # Draw zero is the plain Walsh-Hadamard transform.  The other draws retain
+    # exactly the same butterfly topology while changing only the two coupled
+    # intermediate-side Rademacher sign streams.  Residual-side signs remain
+    # fixed at layer-shared draw zero in this expert-local screen.
+    hadamard_arms: dict[str, dict[str, Any]] = {}
+    for draw in range(8):
+        transformed = encode_coupled_block_hadamard(
+            source,
+            block_size=512,
+            residual_rotation_draw=0,
+            intermediate_rotation_draw=draw,
+        )
+        transformed = CoupledTriplet(
+            *(
+                blockwise_codebook_quantize(value)
+                for value in transformed.tensors()
+            )
+        )
+        explicit_output = execute_coupled_block_hadamard(
+            inputs,
+            transformed,
+            block_size=512,
+            residual_rotation_draw=0,
+            intermediate_rotation_draw=draw,
+        )
+        arm = score(explicit_output)
+        arm.update(
+            {
+                "residual_rotation_draw": 0,
+                "intermediate_rotation_draw": draw,
+                "metadata_bpw": 0.0,
+                "runtime": "four signed block-512 boundary Hadamards per selected expert",
+            }
+        )
+        hadamard_arms[str(draw)] = arm
 
-    for arm in (input_gauge, postactivation, temperature, explicit):
+    for arm in (
+        input_gauge,
+        postactivation,
+        temperature,
+        *hadamard_arms.values(),
+    ):
         arm["expert_sse_improvement_vs_baseline"] = float(
             1.0 - arm["expert_sse"] / max(baseline["expert_sse"], 1e-30)
         )
@@ -574,6 +722,40 @@ def _two_bit_transform_proxy(
             - arm["post_projection_sse"]
             / max(baseline["post_projection_sse"], 1e-30)
         )
+        arm["fit_post_projection_sse_improvement_vs_baseline"] = float(
+            1.0
+            - arm["fit"]["post_projection_sse"]
+            / max(baseline["fit"]["post_projection_sse"], 1e-30)
+        )
+        arm["confirmation_post_projection_sse_improvement_vs_baseline"] = float(
+            1.0
+            - arm["confirmation"]["post_projection_sse"]
+            / max(baseline["confirmation"]["post_projection_sse"], 1e-30)
+        )
+    hadamard_best = max(
+        hadamard_arms.values(),
+        key=lambda arm: arm["post_projection_sse_improvement_vs_baseline"],
+    )
+    hadamard_fit_key, hadamard_fit_selected = max(
+        hadamard_arms.items(),
+        key=lambda item: item[1][
+            "fit_post_projection_sse_improvement_vs_baseline"
+        ],
+    )
+    hadamard_draw_zero = hadamard_arms["0"]
+    hadamard_confirmation_accepted = (
+        hadamard_fit_selected[
+            "confirmation_post_projection_sse_improvement_vs_baseline"
+        ]
+        >= hadamard_draw_zero[
+            "confirmation_post_projection_sse_improvement_vs_baseline"
+        ]
+    )
+    hadamard_applied = (
+        hadamard_fit_selected
+        if hadamard_confirmation_accepted
+        else hadamard_draw_zero
+    )
     return {
         "quantizer": "four-level symmetric block-32 scalar proxy",
         "payload_bpw": 2.0,
@@ -584,12 +766,53 @@ def _two_bit_transform_proxy(
         "approximate_w3_w2_scale_gauge": {
             "selection_metric": "post_projection_sse_improvement_vs_baseline",
             "best": scale_gauge_best,
+            "fit_selected": {
+                "arm": scale_gauge_fit_key,
+                "confirmation_accepted": scale_gauge_confirmation_accepted,
+                "applied_arm": (
+                    scale_gauge_fit_key
+                    if scale_gauge_confirmation_accepted
+                    else "identity:0.00"
+                ),
+                "applied_confirmation_post_projection_sse_improvement_vs_baseline": (
+                    scale_gauge_fit_selected[
+                        "confirmation_post_projection_sse_improvement_vs_baseline"
+                    ]
+                    if scale_gauge_confirmation_accepted
+                    else 0.0
+                ),
+                **scale_gauge_fit_selected,
+            },
             "arms": scale_gauge_arms,
             "metadata_bpw": 0.0,
             "runtime": "none; transformed weights are baked into the checkpoint",
             "warning": "approximately, not exactly, function preserving because tanh is not homogeneous",
         },
-        "expert_local_two_sided_block_hadamard": explicit,
+        "expert_local_two_sided_block_hadamard": {
+            "selection_metric": "fit post-projection SSE",
+            "rotation_draws": len(hadamard_arms),
+            "best": hadamard_best,
+            "fit_selected": {
+                "arm": hadamard_fit_key,
+                "confirmation_accepted_over_draw_zero": (
+                    hadamard_confirmation_accepted
+                ),
+                "applied_arm": (
+                    hadamard_fit_key
+                    if hadamard_confirmation_accepted
+                    else "0"
+                ),
+                "applied_confirmation_post_projection_sse_improvement_vs_baseline": (
+                    hadamard_applied[
+                        "confirmation_post_projection_sse_improvement_vs_baseline"
+                    ]
+                ),
+                **hadamard_fit_selected,
+            },
+            "arms": hadamard_arms,
+            "metadata_bpw": 0.0,
+            "runtime": "four signed block-512 boundary Hadamards per selected expert",
+        },
         "warning": "proxy ranking only; this is not SQG, MCG, MXFP4, or a serving format",
     }
 
@@ -614,7 +837,12 @@ def functional_report(
     seed: int,
 ) -> dict[str, Any]:
     started = time.time()
-    rows = _expert_occurrences(samples, expert, maximum=maximum_rows)
+    rows = _expert_occurrences(
+        samples,
+        expert,
+        maximum=maximum_rows,
+        balance_splits=two_bit_proxy,
+    )
     inputs = rows["inputs"]
     gates = rows["gates"]
     aggregate = rows["aggregate"]
@@ -800,6 +1028,7 @@ def functional_report(
             gates,
             aggregate,
             output_metric,
+            rows["split"],
         )
         if two_bit_proxy
         else None
@@ -1237,7 +1466,9 @@ def summarize(dest: Path) -> dict[str, Any]:
         "temperature_2bit_improvement": values(("exact_transform_2bit_proxy", "temperature_equilibration", "post_projection_sse_improvement_vs_baseline")),
         "approximate_w3_w2_scale_gauge_2bit_improvement": values(("exact_transform_2bit_proxy", "approximate_w3_w2_scale_gauge", "best", "post_projection_sse_improvement_vs_baseline")),
         "approximate_w3_w2_scale_gauge_full_precision_relative_sse": values(("exact_transform_2bit_proxy", "approximate_w3_w2_scale_gauge", "best", "full_precision_expert_relative_sse")),
-        "expert_local_hadamard_2bit_improvement": values(("exact_transform_2bit_proxy", "expert_local_two_sided_block_hadamard", "post_projection_sse_improvement_vs_baseline")),
+        "approximate_w3_w2_scale_gauge_fit_selected_confirmation_improvement": values(("exact_transform_2bit_proxy", "approximate_w3_w2_scale_gauge", "fit_selected", "applied_confirmation_post_projection_sse_improvement_vs_baseline")),
+        "expert_local_hadamard_2bit_improvement": values(("exact_transform_2bit_proxy", "expert_local_two_sided_block_hadamard", "fit_selected", "applied_confirmation_post_projection_sse_improvement_vs_baseline")),
+        "expert_local_hadamard_2bit_oracle_improvement": values(("exact_transform_2bit_proxy", "expert_local_two_sided_block_hadamard", "best", "post_projection_sse_improvement_vs_baseline")),
     }
     medians = {
         key: float(torch.tensor(value).median()) if value else None

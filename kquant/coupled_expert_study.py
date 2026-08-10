@@ -749,12 +749,89 @@ def block_hadamard(values: Tensor, *, block_size: int, dim: int = -1) -> Tensor:
     return output.contiguous()
 
 
+def _rotation_signs(
+    length: int,
+    *,
+    draw: int,
+    axis: int,
+    device: torch.device,
+) -> Tensor:
+    """Return deterministic Rademacher signs for one Hadamard boundary."""
+
+    if draw < 0:
+        raise ValueError("Hadamard rotation draw must be nonnegative")
+    if draw == 0:
+        return torch.ones(length, dtype=torch.float32, device=device)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(
+        (0x6A09E667F3BCC909 * draw + 0xBB67AE8584CAA73B * axis)
+        & ((1 << 63) - 1)
+    )
+    signs = torch.randint(0, 2, (length,), generator=generator)
+    return signs.mul_(2).sub_(1).float().to(device=device)
+
+
+def apply_w3_w2_sign_draw(
+    triplet: CoupledTriplet,
+    *,
+    draw: int,
+) -> CoupledTriplet:
+    """Apply one deterministic exact W3/W2 sign-gauge representative.
+
+    The Kimi up activation is odd, so multiplying one up row and the matching
+    down column by the same sign preserves the full-precision expert exactly.
+    Draw zero is identity. Nonzero draws require neither stored metadata nor
+    runtime work once the signs are baked into the encoded weights.
+    """
+
+    signs = _rotation_signs(
+        triplet.intermediate,
+        draw=draw,
+        axis=4,
+        device=triplet.up.device,
+    ).to(dtype=triplet.up.dtype)
+    return CoupledTriplet(
+        triplet.gate,
+        (triplet.up * signs[:, None]).contiguous(),
+        (triplet.down * signs[None, :]).contiguous(),
+    )
+
+
+def signed_block_hadamard(
+    values: Tensor,
+    *,
+    block_size: int,
+    signs: Tensor,
+    dim: int = -1,
+    inverse: bool = False,
+) -> Tensor:
+    """Apply a signed block-Hadamard rotation or its exact inverse.
+
+    The forward row-vector operation is ``v D H`` and the inverse is
+    ``v H D``, where ``D`` contains the supplied Rademacher signs and ``H``
+    is the normalized block Hadamard.  Draw zero therefore reduces to the
+    existing self-inverse transform.
+    """
+
+    axis = dim % values.ndim
+    if signs.ndim != 1 or signs.shape[0] != values.shape[axis]:
+        raise ValueError("Hadamard rotation signs do not align with the axis")
+    shape = [1] * values.ndim
+    shape[axis] = signs.shape[0]
+    expanded = signs.to(device=values.device, dtype=torch.float32).reshape(shape)
+    if inverse:
+        return block_hadamard(values, block_size=block_size, dim=axis) * expanded
+    return block_hadamard(values.float() * expanded, block_size=block_size, dim=axis)
+
+
 def encode_coupled_block_hadamard(
     triplet: CoupledTriplet,
     *,
     block_size: int,
     preactivation_block_size: int | None = None,
     postactivation_block_size: int | None = None,
+    residual_rotation_draw: int = 0,
+    intermediate_rotation_draw: int = 0,
 ) -> CoupledTriplet:
     """Apply an exact two-sided block-Hadamard expert reparameterization.
 
@@ -763,6 +840,8 @@ def encode_coupled_block_hadamard(
     for storage; :func:`execute_coupled_block_hadamard` joins them before
     cancelling the transform and evaluating the activation.  The down matrix
     receives the corresponding intermediate- and output-boundary transforms.
+    Residual draws control the shared input/output boundaries; intermediate
+    draws control the coupled preactivation/postactivation boundaries.
     """
 
     pre_block = (
@@ -788,14 +867,50 @@ def encode_coupled_block_hadamard(
     interleaved = torch.stack((triplet.gate, triplet.up), dim=1).reshape(
         2 * triplet.intermediate, triplet.hidden
     )
-    upstream = block_hadamard(
-        block_hadamard(interleaved, block_size=block_size, dim=1),
+    input_signs = _rotation_signs(
+        triplet.hidden,
+        draw=residual_rotation_draw,
+        axis=0,
+        device=interleaved.device,
+    )
+    preactivation_signs = _rotation_signs(
+        2 * triplet.intermediate,
+        draw=intermediate_rotation_draw,
+        axis=1,
+        device=interleaved.device,
+    )
+    postactivation_signs = _rotation_signs(
+        triplet.intermediate,
+        draw=intermediate_rotation_draw,
+        axis=2,
+        device=interleaved.device,
+    )
+    output_signs = _rotation_signs(
+        triplet.hidden,
+        draw=residual_rotation_draw,
+        axis=3,
+        device=interleaved.device,
+    )
+    upstream = signed_block_hadamard(
+        signed_block_hadamard(
+            interleaved,
+            block_size=block_size,
+            signs=input_signs,
+            dim=1,
+        ),
         block_size=pre_block,
+        signs=preactivation_signs,
         dim=0,
     )
-    down = block_hadamard(
-        block_hadamard(triplet.down, block_size=post_block, dim=1),
+    down = signed_block_hadamard(
+        signed_block_hadamard(
+            triplet.down,
+            block_size=post_block,
+            signs=postactivation_signs,
+            dim=1,
+        ),
         block_size=block_size,
+        signs=output_signs,
         dim=0,
     )
     return CoupledTriplet(
@@ -812,6 +927,8 @@ def execute_coupled_block_hadamard(
     block_size: int,
     preactivation_block_size: int | None = None,
     postactivation_block_size: int | None = None,
+    residual_rotation_draw: int = 0,
+    intermediate_rotation_draw: int = 0,
     activation: ActivationLaw = SITU,
 ) -> Tensor:
     """Execute an expert encoded by :func:`encode_coupled_block_hadamard`."""
@@ -828,7 +945,36 @@ def execute_coupled_block_hadamard(
         if postactivation_block_size is None
         else postactivation_block_size
     )
-    transformed_inputs = block_hadamard(inputs, block_size=block_size, dim=1)
+    input_signs = _rotation_signs(
+        encoded.hidden,
+        draw=residual_rotation_draw,
+        axis=0,
+        device=inputs.device,
+    )
+    preactivation_signs = _rotation_signs(
+        2 * encoded.intermediate,
+        draw=intermediate_rotation_draw,
+        axis=1,
+        device=inputs.device,
+    )
+    postactivation_signs = _rotation_signs(
+        encoded.intermediate,
+        draw=intermediate_rotation_draw,
+        axis=2,
+        device=inputs.device,
+    )
+    output_signs = _rotation_signs(
+        encoded.hidden,
+        draw=residual_rotation_draw,
+        axis=3,
+        device=inputs.device,
+    )
+    transformed_inputs = signed_block_hadamard(
+        inputs,
+        block_size=block_size,
+        signs=input_signs,
+        dim=1,
+    )
     transformed_pre = torch.cat(
         (
             transformed_inputs @ encoded.gate.float().T,
@@ -836,11 +982,28 @@ def execute_coupled_block_hadamard(
         ),
         dim=1,
     )
-    recovered = block_hadamard(transformed_pre, block_size=pre_block, dim=1)
+    recovered = signed_block_hadamard(
+        transformed_pre,
+        block_size=pre_block,
+        signs=preactivation_signs,
+        dim=1,
+        inverse=True,
+    )
     hidden = activation.value(recovered[:, 0::2], recovered[:, 1::2])
-    transformed_hidden = block_hadamard(hidden, block_size=post_block, dim=1)
+    transformed_hidden = signed_block_hadamard(
+        hidden,
+        block_size=post_block,
+        signs=postactivation_signs,
+        dim=1,
+    )
     transformed_output = transformed_hidden @ encoded.down.float().T
-    return block_hadamard(transformed_output, block_size=block_size, dim=1)
+    return signed_block_hadamard(
+        transformed_output,
+        block_size=block_size,
+        signs=output_signs,
+        dim=1,
+        inverse=True,
+    )
 
 
 def blockwise_codebook_quantize(
@@ -1438,6 +1601,7 @@ __all__ = [
     "apply_output_rotation",
     "apply_permutation_sign_gauge",
     "apply_postactivation_scale",
+    "apply_w3_w2_sign_draw",
     "allocate_rate_options",
     "block_hadamard",
     "blockwise_codebook_quantize",
