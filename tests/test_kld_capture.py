@@ -123,14 +123,14 @@ def test_atomic_write_json_replaces_complete_document(tmp_path: Path) -> None:
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-def test_kld_server_environment_is_tp12_capture_only(
+def test_kld_server_environment_is_capture_only_and_sets_tp_size(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("K3_KQUANT_CAPTURE_DIR", "/bad/calibration")
     monkeypatch.setenv("VLLM_KQUANT_CAPTURE_DIR", "/bad/calibration")
     monkeypatch.setenv("B12X_MOE_FORCE_A16", "0")
     monkeypatch.setenv("VLLM_KQUANT_TRELLIS_W4A8", "1")
-    gpus = [f"GPU-{index}" for index in range(12)]
+    gpus = [f"GPU-{index}" for index in range(8)]
 
     env = build_server_environment(
         model=tmp_path / "model",
@@ -138,11 +138,13 @@ def test_kld_server_environment_is_tp12_capture_only(
         capture_dir=tmp_path / "chunks",
         host="127.0.0.1",
         port=8123,
+        tp_size=8,
         selected_gpus=gpus,
     )
 
     assert env["CUDA_VISIBLE_DEVICES"] == ",".join(gpus)
     assert env["K3_KLD_CAPTURE_DIR"] == str(tmp_path / "chunks")
+    assert env["K3_TP_SIZE"] == "8"
     assert env["K3_MAX_NUM_BATCHED_TOKENS"] == "256"
     assert env["K3_DSPARK"] == "0"
     assert env["B12X_MOE_REPEAT_CHECK"] == "1"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture and compare one TP12 Kimi-K3 model on the pinned KLD suite."""
+"""Capture and compare one Kimi-K3 model on the pinned KLD suite."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ from kquant.kld_gate import (
 )
 
 
-TP_SIZE = 12
+DEFAULT_TP_SIZE = 12
 EXPECTED_VOCAB = 163_840
 RUN_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -60,6 +60,7 @@ def _http_health(url: str, *, timeout: float = 3.0) -> None:
 def _wait_ready(
     process: subprocess.Popen[bytes],
     *,
+    tp_size: int,
     health_url: str,
     timeout: float,
     log_path: Path,
@@ -82,7 +83,7 @@ def _wait_ready(
         now = time.monotonic()
         if now - last_report >= 30:
             print(
-                f"booting TP12 KLD server: {int(now - started)}s elapsed, "
+                f"booting TP{tp_size} KLD server: {int(now - started)}s elapsed, "
                 f"pid={process.pid}",
                 flush=True,
             )
@@ -128,6 +129,7 @@ def build_server_environment(
     capture_dir: Path,
     host: str,
     port: int,
+    tp_size: int,
     selected_gpus: list[str],
 ) -> dict[str, str]:
     env = os.environ.copy()
@@ -144,6 +146,7 @@ def build_server_environment(
             "K3_SERVED_MODEL_NAME": served_model_name,
             "K3_HOST": host,
             "K3_PORT": str(port),
+            "K3_TP_SIZE": str(tp_size),
             "K3_DSPARK": "0",
             "K3_KLD_CAPTURE_DIR": str(capture_dir),
             "K3_MAX_NUM_BATCHED_TOKENS": "256",
@@ -190,6 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--served-model-name", default="Kimi-K3")
+    parser.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)
     parser.add_argument("--boot-timeout", type=float, default=3600.0)
     parser.add_argument("--request-timeout", type=float, default=1800.0)
     parser.add_argument("--shutdown-timeout", type=float, default=180.0)
@@ -208,6 +212,8 @@ def main() -> int:
     args = parse_args()
     if not RUN_NAME_RE.fullmatch(args.run_name):
         raise ValueError("run-name may contain only letters, digits, '.', '_', and '-'")
+    if args.tp_size <= 0:
+        raise ValueError("tp-size must be positive")
     model = args.model.resolve()
     reference_root = args.reference_root.resolve()
     output_dir = args.output_dir.resolve()
@@ -224,7 +230,7 @@ def main() -> int:
         reference_root, rehash_payloads=args.rehash_reference
     )
     model_info = model_identity(model)
-    selected = select_gpu_uuids(TP_SIZE, args.gpus)
+    selected = select_gpu_uuids(args.tp_size, args.gpus)
     assert_gpus_idle(selected)
     assert_port_free(args.host, args.port)
 
@@ -247,10 +253,10 @@ def main() -> int:
     }
     runtime: dict[str, Any] = {
         "schema_version": 1,
-        "kind": "kquant_kimi_k3_tp12_kld_capture_runtime",
+        "kind": "kquant_kimi_k3_kld_capture_runtime",
         "run_name": args.run_name,
         "started_at": datetime.now().astimezone().isoformat(),
-        "tp_size": TP_SIZE,
+        "tp_size": args.tp_size,
         "model": model_info,
         "reference": reference,
         "reference_dataset": CANONICAL_REFERENCE_DATASET,
@@ -267,7 +273,7 @@ def main() -> int:
     }
     result: dict[str, Any] = {
         "schema_version": 1,
-        "kind": "kquant_kimi_k3_tp12_kld_capture",
+        "kind": "kquant_kimi_k3_kld_capture",
         "run_name": args.run_name,
         "output_dir": str(output_dir),
         "status": "starting",
@@ -281,6 +287,7 @@ def main() -> int:
         capture_dir=capture_dir,
         host=args.host,
         port=args.port,
+        tp_size=args.tp_size,
         selected_gpus=selected,
     )
     recorded_env_names = (
@@ -289,6 +296,7 @@ def main() -> int:
         "K3_SERVED_MODEL_NAME",
         "K3_HOST",
         "K3_PORT",
+        "K3_TP_SIZE",
         "K3_DSPARK",
         "K3_KLD_CAPTURE_DIR",
         "K3_MAX_NUM_BATCHED_TOKENS",
@@ -322,6 +330,7 @@ def main() -> int:
         atomic_write_json(result_path, result)
         runtime["ready_after_seconds"] = _wait_ready(
             process,
+            tp_size=args.tp_size,
             health_url=f"http://{args.host}:{args.port}/health",
             timeout=args.boot_timeout,
             log_path=server_log_path,
