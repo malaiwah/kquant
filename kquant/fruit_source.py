@@ -15,6 +15,7 @@ import math
 import os
 import re
 import stat
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -200,6 +201,15 @@ def _sha256(path: Path) -> str:
     with path.open("rb") as handle:
         while chunk := handle.read(8 << 20):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_fd(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, 8 << 20):
+        digest.update(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
     return digest.hexdigest()
 
 
@@ -589,9 +599,6 @@ class FruitCheckpointStore:
             raise FileNotFoundError(
                 f"Fruit checkpoint not found: {supplied_path}"
             ) from exc
-        before = resolved.stat()
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError("Fruit checkpoint path must name a regular file")
 
         expected = (
             spec.checkpoint_sha256 if expected_sha256 is None else expected_sha256
@@ -602,44 +609,61 @@ class FruitCheckpointStore:
             raise ValueError(
                 "expected_sha256 does not identify the supplied model spec"
             )
-        actual = _sha256(resolved)
-        if actual != expected:
-            raise ValueError(
-                f"Fruit checkpoint SHA-256 mismatch: got {actual}, expected {expected}"
+        if not sys.platform.startswith("linux") or not Path("/proc/self/fd").is_dir():
+            raise RuntimeError(
+                "Fruit checkpoint authentication requires Linux /proc/self/fd"
             )
 
-        loaded = torch.load(
-            resolved,
-            map_location="cpu",
-            weights_only=True,
-            mmap=True,
-        )
-        after = resolved.stat()
-        identity_before = (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        identity_after = (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        if identity_before != identity_after:
-            raise ValueError(
-                "Fruit checkpoint changed while it was being authenticated"
+        source_fd: int | None = None
+        try:
+            source_fd = os.open(
+                resolved,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             )
+            before = os.fstat(source_fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("Fruit checkpoint path must name a regular file")
+            if before.st_nlink != 1:
+                raise ValueError("Fruit checkpoint path must not have hard links")
+            actual = _sha256_fd(source_fd)
+            if actual != expected:
+                raise ValueError(
+                    f"Fruit checkpoint SHA-256 mismatch: got {actual}, "
+                    f"expected {expected}"
+                )
 
-        state, container = _state_dict(loaded)
-        conventions = _validate_conventions(state, spec)
-        representation, dtypes = _validate_inventory(state, spec)
+            loaded = torch.load(
+                Path(f"/proc/self/fd/{source_fd}"),
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+            after = os.fstat(source_fd)
+            try:
+                path_after = os.stat(resolved, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(
+                    "Fruit checkpoint changed while it was being authenticated"
+                ) from exc
+            identity = _file_identity(before)
+            if identity != _file_identity(after) or identity != _file_identity(
+                path_after
+            ):
+                raise ValueError(
+                    "Fruit checkpoint changed while it was being authenticated"
+                )
+
+            state, container = _state_dict(loaded)
+            conventions = _validate_conventions(state, spec)
+            representation, dtypes = _validate_inventory(state, spec)
+        except BaseException:
+            if source_fd is not None:
+                os.close(source_fd)
+            raise
 
         self.path = resolved
-        self._file_identity = identity_after
+        self._source_fd = source_fd
+        self._file_identity = identity
         self.spec = spec
         self.representation = representation
         self._state = state
@@ -674,20 +698,30 @@ class FruitCheckpointStore:
 
     def _assert_source_unchanged(self) -> None:
         try:
-            current = self.path.stat()
+            descriptor = os.fstat(self._source_fd)
+            current = os.stat(self.path, follow_symlinks=False)
         except OSError as exc:
             raise ValueError(
                 "Fruit checkpoint became unavailable after authentication"
             ) from exc
-        identity = (
-            current.st_dev,
-            current.st_ino,
-            current.st_size,
-            current.st_mtime_ns,
-            current.st_ctime_ns,
-        )
-        if identity != self._file_identity:
+        if (
+            _file_identity(descriptor) != self._file_identity
+            or _file_identity(current) != self._file_identity
+        ):
             raise ValueError("Fruit checkpoint changed after authentication")
+
+    def close(self) -> None:
+        source_fd, self._source_fd = self._source_fd, -1
+        if source_fd >= 0:
+            os.close(source_fd)
+
+    def __del__(self) -> None:
+        source_fd = getattr(self, "_source_fd", -1)
+        if source_fd >= 0:
+            try:
+                os.close(source_fd)
+            except OSError:
+                pass
 
     def load_matrix(
         self,

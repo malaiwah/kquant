@@ -10,6 +10,7 @@ import json
 import os
 import stat
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,7 +40,6 @@ from kquant.fruit_calibration import (
 )
 from kquant.fruit_source import FruitModelSpec
 
-_SMALL_TOKENIZER_FILES = tuple(FRUIT_CALIBRATION_TOKENIZER_FILES)
 
 _BF16_BASE_INDEX = "model.safetensors.index.json"
 _MODEL_MARKER_KEYS = frozenset({"rope_theta_trained", "serve_conv_v"})
@@ -78,6 +78,136 @@ def _atomic_safetensors(
     with temporary.open("rb") as handle:
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def _copy_pinned_input(
+    source: Path,
+    destination: Path,
+    *,
+    expected_sha256: str,
+) -> str:
+    try:
+        resolved = source.resolve(strict=True)
+        source_fd = os.open(
+            resolved,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot securely open calibration input: {source}") from exc
+    destination_fd: int | None = None
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"calibration input is not a regular file: {source}")
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o400,
+        )
+        digest = hashlib.sha256()
+        bytes_read = 0
+        while chunk := os.read(source_fd, 8 << 20):
+            digest.update(chunk)
+            bytes_read += len(chunk)
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_fd, chunk[offset:])
+                if written <= 0:
+                    raise OSError("short write while snapshotting calibration input")
+                offset += written
+        os.fsync(destination_fd)
+        after = os.fstat(source_fd)
+        actual_sha256 = digest.hexdigest()
+        if bytes_read != before.st_size or _stable_file_identity(
+            before
+        ) != _stable_file_identity(after):
+            raise ValueError(f"calibration input changed while copying: {source}")
+        if actual_sha256 != expected_sha256:
+            raise ValueError(f"calibration input identity mismatch: {source}")
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        os.close(source_fd)
+    if _sha256(destination) != expected_sha256:
+        raise ValueError(f"private calibration snapshot is invalid: {source}")
+    return actual_sha256
+
+
+@dataclass
+class _AuthenticatedCalibrationInputs:
+    temporary_directory: tempfile.TemporaryDirectory[str]
+    corpus: Path
+    tokenizer: Path
+    trainer: Path
+    reference: Path
+    tokenizer_hashes: dict[str, str]
+    trainer_hashes: dict[str, str]
+
+    def close(self) -> None:
+        self.temporary_directory.cleanup()
+
+
+def _snapshot_calibration_inputs(
+    args: argparse.Namespace,
+    authority: FruitCalibrationAuthority,
+) -> _AuthenticatedCalibrationInputs:
+    temporary_directory = tempfile.TemporaryDirectory(
+        prefix="kquant-fruit-capture-inputs-"
+    )
+    root = Path(temporary_directory.name)
+    corpus_root = root / "corpus"
+    tokenizer_root = root / "tokenizer"
+    trainer_root = root / "trainer"
+    reference_root = root / "reference"
+    for directory in (corpus_root, tokenizer_root, trainer_root, reference_root):
+        directory.mkdir(mode=0o700)
+    corpus = corpus_root / FRUIT_CALIBRATION_CORPUS["filename"]
+    trainer = trainer_root / args.trainer.name
+    reference = reference_root / args.reference.name
+    try:
+        _copy_pinned_input(
+            args.corpus,
+            corpus,
+            expected_sha256=FRUIT_CALIBRATION_CORPUS["sha256"],
+        )
+        tokenizer_hashes = {}
+        for name, expected_sha256 in FRUIT_CALIBRATION_TOKENIZER_FILES.items():
+            tokenizer_hashes[name] = _copy_pinned_input(
+                args.tokenizer / name,
+                tokenizer_root / name,
+                expected_sha256=expected_sha256,
+            )
+        if args.trainer.name not in FRUIT_CALIBRATION_TRAINER_FILES:
+            raise ValueError("Fruit calibration trainer filename is not pinned")
+        trainer_hashes = {}
+        for name, expected_sha256 in sorted(FRUIT_CALIBRATION_TRAINER_FILES.items()):
+            source = (
+                args.trainer
+                if name == args.trainer.name
+                else args.trainer.parent / name
+            )
+            trainer_hashes[name] = _copy_pinned_input(
+                source,
+                trainer_root / name,
+                expected_sha256=expected_sha256,
+            )
+        _copy_pinned_input(
+            args.reference,
+            reference,
+            expected_sha256=authority.reference_sha256,
+        )
+    except BaseException:
+        temporary_directory.cleanup()
+        raise
+    return _AuthenticatedCalibrationInputs(
+        temporary_directory=temporary_directory,
+        corpus=corpus,
+        tokenizer=tokenizer_root,
+        trainer=trainer,
+        reference=reference,
+        tokenizer_hashes=tokenizer_hashes,
+        trainer_hashes=trainer_hashes,
+    )
 
 
 @dataclass(frozen=True)
@@ -349,13 +479,27 @@ def _load_trainer(
     spec: FruitModelSpec,
 ):
     _configure_trainer_environment(serve_native=serve_native, spec=spec)
-    trainer_root = str(trainer.parent.resolve())
+    trainer_root_path = trainer.parent.resolve()
+    trainer_root = str(trainer_root_path)
     if trainer_root not in sys.path:
         sys.path.insert(0, trainer_root)
-    sys.modules.pop("train_fruit", None)
+    for filename in FRUIT_CALIBRATION_TRAINER_FILES:
+        sys.modules.pop(Path(filename).stem, None)
     module = importlib.import_module("train_fruit")
     if Path(module.__file__).resolve() != trainer.resolve():
         raise RuntimeError("imported the wrong Fruit trainer module")
+    for filename in FRUIT_CALIBRATION_TRAINER_FILES:
+        imported = sys.modules.get(Path(filename).stem)
+        if imported is None:
+            continue
+        imported_path = getattr(imported, "__file__", None)
+        if (
+            not isinstance(imported_path, str)
+            or Path(imported_path).resolve() != trainer_root_path / filename
+        ):
+            raise RuntimeError(
+                f"imported the wrong Fruit trainer dependency: {filename}"
+            )
     expected = {
         "H": spec.hidden_size,
         "NL": spec.mtp_layer,
@@ -521,21 +665,10 @@ class _AuthenticatedBf16Base:
             ) from exc
         identity = _stable_file_identity(status)
         authenticated_identity = self._shard_identities[name]
-        same_authenticated_content = (
-            identity[:3] == authenticated_identity[:3]
-            and identity[4:6] == authenticated_identity[4:6]
-        )
-        changed_without_unlink = (
-            identity[6] != authenticated_identity[6]
-            and identity[3] >= authenticated_identity[3]
-        )
         if (
             not stat.S_ISREG(status.st_mode)
+            or identity != authenticated_identity
             or (expected_identity is not None and identity != expected_identity)
-            or (
-                expected_identity is None
-                and (not same_authenticated_content or changed_without_unlink)
-            )
         ):
             raise ValueError(f"Fruit BF16 shard changed after authentication: {name}")
         return identity
@@ -1101,20 +1234,13 @@ def main() -> None:
     torch.cuda.set_device(device)
 
     source_evidence: dict[str, object]
-    tokenizer_hashes = {
-        name: _sha256(args.tokenizer / name)
-        for name in _SMALL_TOKENIZER_FILES
-        if (args.tokenizer / name).is_file()
-    }
-    if tokenizer_hashes != FRUIT_CALIBRATION_TOKENIZER_FILES:
-        raise ValueError("Fruit calibration tokenizer identity mismatch")
-    trainer_hashes = {args.trainer.name: _sha256(args.trainer)}
-    if trainer_hashes != FRUIT_CALIBRATION_TRAINER_FILES:
-        raise ValueError("Fruit calibration trainer identity mismatch")
+    input_snapshot = _snapshot_calibration_inputs(args, authority)
+    tokenizer_hashes = input_snapshot.tokenizer_hashes
+    trainer_hashes = input_snapshot.trainer_hashes
 
-    tokenizer = _load_tokenizer(args.tokenizer)
+    tokenizer = _load_tokenizer(input_snapshot.tokenizer)
     documents, corpus_sha256 = _sample_documents(
-        args.corpus,
+        input_snapshot.corpus,
         tokenizer,
         documents_per_axis=args.documents_per_axis,
         fit_per_axis=args.fit_per_axis,
@@ -1159,7 +1285,7 @@ def main() -> None:
     )
 
     trainer = _load_trainer(
-        args.trainer,
+        input_snapshot.trainer,
         serve_native=True,
         spec=authority.spec,
     )
@@ -1176,7 +1302,7 @@ def main() -> None:
         source_base.close()
     source_closure = _verify_source_closure(
         model,
-        args.reference,
+        input_snapshot.reference,
         device=device,
         authority=authority,
     )
@@ -1271,6 +1397,7 @@ def main() -> None:
         args.output / "calibration-manifest.json",
         _canonical_json(manifest),
     )
+    input_snapshot.close()
     print(
         f"complete Fruit calibration capture: {args.output} "
         f"fingerprint={manifest['fingerprint']}",

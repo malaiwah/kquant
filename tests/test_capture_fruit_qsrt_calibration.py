@@ -89,7 +89,9 @@ class _TinyFruit(torch.nn.Module):
         self.lm_head = torch.nn.Linear(2, 2, bias=False)
 
 
-def test_authenticated_shard_load_ignores_pathname_replacement(tmp_path: Path) -> None:
+def test_authenticated_shard_load_rejects_pathname_replacement(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "bf16"
     authority = _write_bf16_base(root)
     source = _CAPTURE._authenticate_bf16_base(root, authority)
@@ -103,21 +105,93 @@ def test_authenticated_shard_load_ignores_pathname_replacement(tmp_path: Path) -
     os.replace(replacement, root / shard_name)
 
     try:
-        model = _CAPTURE._load_bf16_model(
-            source,
-            SimpleNamespace(Fruit=_TinyFruit),
-            torch.device("cpu"),
-            authority.spec,
-        )
-        assert torch.equal(
-            model.lm_head.weight,
-            torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16),
-        )
+        with pytest.raises(ValueError, match="changed after authentication"):
+            _CAPTURE._load_bf16_model(
+                source,
+                SimpleNamespace(Fruit=_TinyFruit),
+                torch.device("cpu"),
+                authority.spec,
+            )
     finally:
         source.close()
 
     with pytest.raises(OSError):
         os.fstat(descriptor)
+
+
+def test_calibration_inputs_are_consumed_from_pinned_private_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus = tmp_path / "corpus.jsonl"
+    trainer = tmp_path / "trainer.py"
+    reference = tmp_path / "reference.pt"
+    tokenizer = tmp_path / "tokenizer"
+    tokenizer.mkdir()
+    corpus.write_text('{"axis":"a","source":"s","text":"content"}\n', encoding="utf-8")
+    trainer.write_text("ROUTED_SCALE = 1.0\n", encoding="utf-8")
+    trainer_dependencies = {
+        "dependency.py": b"VALUE = 1\n",
+        trainer.name: trainer.read_bytes(),
+    }
+    (tmp_path / "dependency.py").write_bytes(trainer_dependencies["dependency.py"])
+    reference.write_bytes(b"reference")
+    tokenizer_payloads = {
+        "config.json": b"{}",
+        "tokenizer.json": b'{"version":"1.0"}',
+        "tokenizer_config.json": b"{}",
+    }
+    for name, payload in tokenizer_payloads.items():
+        (tokenizer / name).write_bytes(payload)
+    (tokenizer / "special_tokens_map.json").write_text(
+        '{"additional_special_tokens":["injected"]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        _CAPTURE,
+        "FRUIT_CALIBRATION_CORPUS",
+        {"filename": corpus.name, "sha256": _sha256(corpus)},
+    )
+    monkeypatch.setattr(
+        _CAPTURE,
+        "FRUIT_CALIBRATION_TOKENIZER_FILES",
+        {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in tokenizer_payloads.items()
+        },
+    )
+    monkeypatch.setattr(
+        _CAPTURE,
+        "FRUIT_CALIBRATION_TRAINER_FILES",
+        {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in trainer_dependencies.items()
+        },
+    )
+    inputs = _CAPTURE._snapshot_calibration_inputs(
+        SimpleNamespace(
+            corpus=corpus,
+            tokenizer=tokenizer,
+            trainer=trainer,
+            reference=reference,
+        ),
+        SimpleNamespace(reference_sha256=_sha256(reference)),
+    )
+    try:
+        assert {path.name for path in inputs.tokenizer.iterdir()} == set(
+            tokenizer_payloads
+        )
+        assert not (inputs.tokenizer / "special_tokens_map.json").exists()
+        assert {path.name for path in inputs.trainer.parent.iterdir()} == set(
+            trainer_dependencies
+        )
+        (tmp_path / "dependency.py").write_text("VALUE = 2\n", encoding="utf-8")
+        assert (inputs.trainer.parent / "dependency.py").read_bytes() == (
+            trainer_dependencies["dependency.py"]
+        )
+        corpus.write_text("attacker-controlled\n", encoding="utf-8")
+        assert inputs.corpus.read_text(encoding="utf-8").startswith('{"axis"')
+    finally:
+        inputs.close()
 
 
 def test_authentication_failure_closes_retained_shard_descriptors(

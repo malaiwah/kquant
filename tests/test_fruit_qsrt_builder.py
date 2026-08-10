@@ -1362,17 +1362,7 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
             builder._encoder_fingerprint_payload(production_encoder)
         ).encode("utf-8")
     ).hexdigest()
-    sweep_encoder = {
-        name: value
-        for name, value in production_encoder.items()
-        if name not in {"encoding_runtime", "fingerprint"}
-    }
-    sweep_encoder["fingerprint_schema"] = builder._LEGACY_ENCODER_FINGERPRINT_SCHEMA
-    sweep_encoder["fingerprint"] = hashlib.sha256(
-        builder._canonical_json(
-            builder._encoder_fingerprint_payload(sweep_encoder)
-        ).encode("utf-8")
-    ).hexdigest()
+    sweep_encoder = json.loads(builder._canonical_json(production_encoder))
     producer = {"encoder": production_encoder}
     payload = _rate_sweep(
         source=source,
@@ -1402,7 +1392,7 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
         ).encode("utf-8")
     ).hexdigest()
     path.write_text(builder._canonical_json(repinned_sweep), encoding="utf-8")
-    assert (
+    with pytest.raises(ValueError, match="provenance"):
         builder._validate_rate_sweep(
             path,
             expected_sha256=builder._sha256(path),
@@ -1410,8 +1400,6 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
             calibration=calibration,
             producer=producer,
         )
-        == repinned_sweep
-    )
 
     repinned_encoder["exllamav3_revision"] = "7" * 40
     repinned_encoder["fingerprint"] = hashlib.sha256(
@@ -1438,7 +1426,7 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
             builder._encoder_fingerprint_payload(changed_encoder)
         ).encode("utf-8")
     ).hexdigest()
-    assert (
+    with pytest.raises(ValueError, match="provenance"):
         builder._validate_rate_sweep(
             path,
             expected_sha256=builder._sha256(path),
@@ -1446,8 +1434,6 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
             calibration=calibration,
             producer=changed_producer,
         )
-        == payload
-    )
 
     changed_encoder["exllamav3_source_sha256"] = "6" * 64
     changed_encoder["fingerprint"] = hashlib.sha256(

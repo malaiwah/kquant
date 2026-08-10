@@ -81,15 +81,15 @@ def test_instruct_source_and_calibration_authority_are_publicly_pinned() -> None
     )
     assert (
         authority.capture_id
-        == "24b290abaddb9eff8d7328a2a22f3c33bb7f6f45b77692393b3549ba0fded0a2"
+        == "c25fcecb63d1874018bc7fd2a2b7b20ce4c7783d98e66f24fb779614f0ba67b6"
     )
     assert (
         authority.fingerprint
-        == "3ed144b08b089cb96d030ede5e4a3959f43b4f12c8189e8036efb590fc4dc814"
+        == "56d472c2c1d8856271d534a23a4bee77995cd84fbff968a390cc2a8110f0c749"
     )
     assert (
         authority.manifest_sha256
-        == "be944c8dfc5b550319d26bc2899f0d2ea3f4ca81275ba53034f0cc8ef7b4e9c5"
+        == "f11efd9876fc5f787f1cfb5df9cd606659109ae3cbc3d582ac492da4811c1f3f"
     )
 
 
@@ -259,6 +259,33 @@ def test_stacked_store_maps_w1_and_preserves_output_contract(tmp_path: Path) -> 
     assert result.is_contiguous()
     torch.testing.assert_close(
         result, state["layers.3.mlp.w_gate"][2].float(), rtol=0, atol=0
+    )
+
+
+def test_checkpoint_load_consumes_the_authenticated_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "authenticated.pt"
+    state = _state(_BASE_SPEC, "stacked")
+    spec = _save(path, state)
+    attacker_path = tmp_path / "replacement.pt"
+    attacker_state = _state(_BASE_SPEC, "stacked")
+    attacker_state["layers.3.mlp.w_gate"] += 9_000
+    _save(attacker_path, attacker_state)
+    real_load = torch.load
+
+    def adversarial_load(load_path: Path, *args: object, **kwargs: object) -> object:
+        selected = attacker_path if Path(load_path) == path else load_path
+        return real_load(selected, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", adversarial_load)
+    store = FruitCheckpointStore(path, spec=spec)
+
+    torch.testing.assert_close(
+        store.load_matrix(3, 2, "w1"),
+        state["layers.3.mlp.w_gate"][2].float(),
+        rtol=0,
+        atol=0,
     )
 
 

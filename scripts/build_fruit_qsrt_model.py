@@ -12,6 +12,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from scripts.kquant_import_guard import (  # isort: skip
         authenticate_production_builder,
     )
@@ -51,6 +53,11 @@ from kquant.fruit_calibration import (
     FruitCalibrationStore,
     fruit_calibration_authority,
 )
+from kquant.fruit_rate_evidence import (
+    FRUIT_RATE_SWEEP_SAMPLE_ASSIGNMENTS,
+    FRUIT_UNIFORM_RATE_SWEEP_RATES,
+    run_fruit_uniform_rate_sweep,
+)
 from kquant.fruit_qsrt import (
     FRUIT_QSRT_ARTIFACT_TENSORS,
     FRUIT_QSRT_ATOM_BUNDLE_BYTES,
@@ -81,6 +88,7 @@ from kquant.fruit_source import (
 from kquant.sqg_quantizer import install_sqg_quantizer
 
 LAYERS = (*FRUIT_INSTRUCT_SPEC.layers, FRUIT_INSTRUCT_SPEC.mtp_layer)
+
 EXPERTS = FRUIT_INSTRUCT_SPEC.num_experts
 HIDDEN_SIZE = FRUIT_INSTRUCT_SPEC.hidden_size
 INTERMEDIATE_SIZE = FRUIT_INSTRUCT_SPEC.intermediate_size
@@ -640,16 +648,7 @@ def _rate_sweep_encoder_core(encoder: object) -> dict[str, object]:
     ).hexdigest()
     if encoder["fingerprint"] != expected_fingerprint:
         raise ValueError("Fruit rate sweep encoder fingerprint is invalid")
-    return {
-        name: encoder[name]
-        for name in (
-            "exllamav3_revision",
-            "exllamav3_source_sha256",
-            "calibration_fingerprint",
-            "calibration_capture_id",
-            "calibration_manifest_sha256",
-        )
-    }
+    return dict(encoder)
 
 
 def current_encoder_provenance(
@@ -4135,11 +4134,12 @@ def parse_args() -> argparse.Namespace:
     stage = parser.add_mutually_exclusive_group(required=True)
     stage.add_argument("--candidate-only", action="store_true")
     stage.add_argument("--runtime-qualification", type=Path)
+    stage.add_argument("--rate-sweep-only", action="store_true")
     parser.add_argument("--exllamav3-root", required=True, type=Path)
-    parser.add_argument("--b12x-root", required=True, type=Path)
-    parser.add_argument("--vllm-root", required=True, type=Path)
+    parser.add_argument("--b12x-root", type=Path)
+    parser.add_argument("--vllm-root", type=Path)
     parser.add_argument("--calibration", required=True, type=Path)
-    parser.add_argument("--rate-sweep", required=True, type=Path)
+    parser.add_argument("--rate-sweep", type=Path)
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -4162,8 +4162,83 @@ def _assert_producer_unchanged(
         raise ValueError("Fruit QSRT producer sources changed during the build")
 
 
+def _run_authenticated_rate_sweep(
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+) -> None:
+    if (
+        _RUNTIME_QUALIFICATION_AUTHORITY_SHA256 is not None
+        or _RATE_SWEEP_AUTHORITY_SHA256 is not None
+    ):
+        raise ValueError("Fruit rate-sweep stage received a downstream authority")
+    if any(
+        value is not None for value in (args.b12x_root, args.vllm_root, args.rate_sweep)
+    ):
+        raise ValueError("Fruit rate-sweep stage received build-only inputs")
+    authority = fruit_calibration_authority(args.variant)
+    spec = authority.spec
+    if not args.base_model.is_dir() or spec.safetensors_manifest_sha256 is None:
+        raise ValueError(
+            "Fruit rate-sweep stage requires the authenticated BF16 directory"
+        )
+    calibration = FruitCalibrationStore(
+        args.calibration,
+        authority=authority,
+    )
+    try:
+        encoder = current_encoder_provenance(
+            exllamav3_root=args.exllamav3_root,
+            calibration=calibration,
+        )
+        store = FruitSafetensorsStore(
+            args.base_model,
+            spec=spec,
+            expected_manifest_sha256=spec.safetensors_manifest_sha256,
+        )
+        try:
+            source_evidence = _validate_source_evidence(store.evidence, spec=spec)
+            quantizer_module = load_qsrt_encoder(args.exllamav3_root)
+            install_sqg_quantizer(quantizer_module)
+
+            def verify_encoder() -> None:
+                current = current_encoder_provenance(
+                    exllamav3_root=args.exllamav3_root,
+                    calibration=calibration,
+                )
+                if current != encoder:
+                    raise ValueError(
+                        "Fruit encoder sources changed during the rate sweep"
+                    )
+
+            run_fruit_uniform_rate_sweep(
+                args.output,
+                store=store,
+                calibration=calibration,
+                encoder=encoder,
+                source_evidence=source_evidence,
+                assignments=FRUIT_RATE_SWEEP_SAMPLE_ASSIGNMENTS,
+                rates=FRUIT_UNIFORM_RATE_SWEEP_RATES,
+                device=device,
+                quantizer_module=quantizer_module,
+                verify_encoder=verify_encoder,
+            )
+        finally:
+            store.close()
+    finally:
+        calibration.close()
+
+
 def main() -> None:
     args = parse_args()
+    device = torch.device(args.device)
+    if device.type != "cuda":
+        raise ValueError("Fruit QSRT encoding requires a CUDA device")
+    if args.rate_sweep_only:
+        _run_authenticated_rate_sweep(args, device=device)
+        return
+    if args.b12x_root is None or args.vllm_root is None or args.rate_sweep is None:
+        raise ValueError("Fruit model build requires B12X, vLLM, and rate-sweep inputs")
     runtime_qualification_sha256 = _RUNTIME_QUALIFICATION_AUTHORITY_SHA256
     rate_sweep_sha256 = _RATE_SWEEP_AUTHORITY_SHA256
     if rate_sweep_sha256 is None:
@@ -4184,8 +4259,6 @@ def main() -> None:
     spec = authority.spec
     publication = fruit_publication_spec(args.variant)
     device = torch.device(args.device)
-    if device.type != "cuda":
-        raise ValueError("Fruit QSRT encoding requires a CUDA device")
     if not args.base_model.is_dir():
         raise FileNotFoundError(args.base_model)
     if args.output.resolve() == args.base_model.resolve():

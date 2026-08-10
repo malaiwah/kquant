@@ -73,7 +73,15 @@ FRUIT_CALIBRATION_TOKENIZER_FILES = {
     ),
 }
 FRUIT_CALIBRATION_TRAINER_FILES = {
-    "train_fruit.py": "520be10eeaaf4bc525ba1f5d0d91b860556d9995e782a4c6ac225244105ffcd8"
+    "checkpoint_contract.py": (
+        "c8267e5c2ec9e8ed5195829020c7ad598d8a354e02cd26495fe7e767b8892d44"
+    ),
+    "run2_corpus_contract.py": (
+        "443645d22fff071cf6410cca23730e011e2af89591f1a8cbb4fd044ccaea908f"
+    ),
+    "train_fruit.py": (
+        "520be10eeaaf4bc525ba1f5d0d91b860556d9995e782a4c6ac225244105ffcd8"
+    ),
 }
 FRUIT_CALIBRATION_CONVENTIONS = {
     "serve_conv_v": 2,
@@ -283,10 +291,10 @@ FRUIT_INSTRUCT_CALIBRATION_AUTHORITY = FruitCalibrationAuthority(
     reference_sha256=(
         "e838645989a37e651e59f2388bb55d16f9b33b9a76b0352628abf2d4e667f414"
     ),
-    capture_id="24b290abaddb9eff8d7328a2a22f3c33bb7f6f45b77692393b3549ba0fded0a2",
-    fingerprint="3ed144b08b089cb96d030ede5e4a3959f43b4f12c8189e8036efb590fc4dc814",
+    capture_id="c25fcecb63d1874018bc7fd2a2b7b20ce4c7783d98e66f24fb779614f0ba67b6",
+    fingerprint="56d472c2c1d8856271d534a23a4bee77995cd84fbff968a390cc2a8110f0c749",
     manifest_sha256=(
-        "be944c8dfc5b550319d26bc2899f0d2ea3f4ca81275ba53034f0cc8ef7b4e9c5"
+        "f11efd9876fc5f787f1cfb5df9cd606659109ae3cbc3d582ac492da4811c1f3f"
     ),
     max_abs_logprob=1.0,
     rms_logprob=0.2,

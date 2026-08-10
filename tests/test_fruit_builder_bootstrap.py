@@ -104,6 +104,7 @@ def _launch(
     environment: dict[str, str] | None = None,
     external_oci_image_id: str = "sha256:" + "f" * 64,
     candidate_only: bool = True,
+    rate_sweep_only: bool = False,
     runtime_qualification_sha256: str | None = None,
     rate_sweep_sha256: str | None = (
         "95d3cb9f5dc66ec7615497d07ec0e42281594bfb20649e23b2c6dcbff34406f6"
@@ -141,9 +142,13 @@ def _launch(
             "--",
             str(output),
             *(
-                ("--candidate-only",)
-                if candidate_only
-                else ("--runtime-qualification", "runtime-qualification.json")
+                ("--rate-sweep-only",)
+                if rate_sweep_only
+                else (
+                    ("--candidate-only",)
+                    if candidate_only
+                    else ("--runtime-qualification", "runtime-qualification.json")
+                )
             ),
         ),
         check=False,
@@ -225,18 +230,18 @@ def test_authenticated_bootstrap_requires_stage_specific_qualification_authority
     assert "requires an external rate-sweep SHA-256" in missing_rate_authority.stderr
     assert not output.exists()
 
-    wrong_rate_authority = _launch(
+    arbitrary_rate_output = tmp_path / "arbitrary-rate-authority.txt"
+    arbitrary_rate_authority = _launch(
         trusted_bootstrap,
         checkout,
         revision,
         source_sha256,
         bootstrap_sha256,
-        output,
+        arbitrary_rate_output,
         rate_sweep_sha256="c" * 64,
     )
-    assert wrong_rate_authority.returncode != 0
-    assert "does not match the pinned authority" in wrong_rate_authority.stderr
-    assert not output.exists()
+    assert arbitrary_rate_authority.returncode == 0, arbitrary_rate_authority.stderr
+    assert arbitrary_rate_output.read_text(encoding="utf-8") == "committed snapshot\n"
 
     candidate = _launch(
         trusted_bootstrap,
@@ -263,6 +268,20 @@ def test_authenticated_bootstrap_requires_stage_specific_qualification_authority
     )
     assert final.returncode == 0, final.stderr
     assert output.read_text(encoding="utf-8") == "committed snapshot\n"
+
+    sweep_output = tmp_path / "rate-sweep.txt"
+    sweep = _launch(
+        trusted_bootstrap,
+        checkout,
+        revision,
+        source_sha256,
+        bootstrap_sha256,
+        sweep_output,
+        rate_sweep_only=True,
+        rate_sweep_sha256=None,
+    )
+    assert sweep.returncode == 0, sweep.stderr
+    assert sweep_output.read_text(encoding="utf-8") == "committed snapshot\n"
 
 
 @pytest.mark.parametrize(

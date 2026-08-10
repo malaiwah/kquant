@@ -30,6 +30,7 @@ from kquant.fruit_qsrt import (
     FRUIT_QSRT_SCHEMA,
     encode_fruit_expert,
 )
+from kquant.fruit_rate_evidence import FRUIT_RATE_SWEEP_SAMPLE_ASSIGNMENTS
 from kquant.fruit_source import (
     FruitCheckpointStore,
     FruitSafetensorsStore,
@@ -39,28 +40,6 @@ from scripts.build_fruit_qsrt_model import (
     _validate_part_cache_root,
     _validate_source_evidence,
     current_encoder_provenance,
-)
-
-SAMPLED_ASSIGNMENTS: tuple[tuple[int, int], ...] = (
-    (3, 0),
-    (3, 1),
-    (3, 255),
-    (4, 17),
-    (4, 128),
-    (5, 31),
-    (5, 224),
-    (6, 63),
-    (7, 95),
-    (8, 127),
-    (9, 159),
-    (10, 191),
-    (11, 223),
-    (12, 0),
-    (12, 64),
-    (12, 192),
-    (12, 255),
-    (13, 0),
-    (13, 255),
 )
 
 
@@ -261,7 +240,10 @@ def parse_args() -> argparse.Namespace:
     selection.add_argument(
         "--sample",
         action="store_true",
-        help=f"encode the frozen {len(SAMPLED_ASSIGNMENTS)}-assignment sample",
+        help=(
+            f"encode the frozen {len(FRUIT_RATE_SWEEP_SAMPLE_ASSIGNMENTS)}"
+            "-assignment sample"
+        ),
     )
     selection.add_argument(
         "--all",
@@ -292,7 +274,7 @@ def main() -> None:
     torch.cuda.set_device(device)
     torch.empty(0, device=device)
     if args.sample:
-        assignments = SAMPLED_ASSIGNMENTS
+        assignments = FRUIT_RATE_SWEEP_SAMPLE_ASSIGNMENTS
     elif args.all:
         assignments = tuple(
             (layer, expert)

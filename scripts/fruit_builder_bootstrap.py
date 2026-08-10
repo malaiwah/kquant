@@ -27,9 +27,6 @@ _SOURCE_FINGERPRINT_PREFIX = b"kquant-tracked-worktree-sha256-v1\0"
 _BOOTSTRAP_CONTEXT_ENV = "KQUANT_FRUIT_BUILDER_BOOTSTRAP_V5"
 _CONTEXT_SCHEMA = "kquant_fruit_builder_bootstrap_v5"
 _RUNTIME_IDENTITY_SCHEMA = "kquant_fruit_builder_external_oci_runtime_v1"
-_RATE_SWEEP_AUTHORITY_SHA256 = (
-    "95d3cb9f5dc66ec7615497d07ec0e42281594bfb20649e23b2c6dcbff34406f6"
-)
 _PYTHON_EXECUTABLE = Path("/opt/venv/bin/python")
 _PYTHON_SITE_PACKAGES = Path("/opt/venv/lib/python3.12/site-packages")
 _GIT_EXECUTABLE = Path("/usr/bin/git")
@@ -324,10 +321,18 @@ def _runtime_qualification_anchor(
         or argument.startswith("--runtime-qualification=")
         for argument in builder_args
     )
-    if candidate_mode == completion_mode:
+    rate_sweep_mode = "--rate-sweep-only" in builder_args
+    if sum((candidate_mode, completion_mode, rate_sweep_mode)) != 1:
         raise ValueError(
-            "production builder requires exactly one candidate or completion stage"
+            "production builder requires exactly one candidate, completion, "
+            "or rate-sweep stage"
         )
+    if rate_sweep_mode:
+        if supplied_sha256 is not None:
+            raise ValueError(
+                "rate-sweep builder must not accept a runtime qualification anchor"
+            )
+        return None
     if candidate_mode:
         if supplied_sha256 is not None:
             raise ValueError(
@@ -345,15 +350,18 @@ def _runtime_qualification_anchor(
     )
 
 
-def _rate_sweep_anchor(supplied_sha256: str | None) -> str:
+def _rate_sweep_anchor(
+    builder_args: list[str], supplied_sha256: str | None
+) -> str | None:
+    if "--rate-sweep-only" in builder_args:
+        if supplied_sha256 is not None:
+            raise ValueError(
+                "rate-sweep builder must not accept a rate-sweep authority"
+            )
+        return None
     if supplied_sha256 is None:
         raise ValueError("production builder requires an external rate-sweep SHA-256")
-    supplied = _digest(supplied_sha256, length=64, name="rate-sweep SHA-256")
-    if supplied != _RATE_SWEEP_AUTHORITY_SHA256:
-        raise ValueError(
-            "production rate-sweep SHA-256 does not match the pinned authority"
-        )
-    return _RATE_SWEEP_AUTHORITY_SHA256
+    return _digest(supplied_sha256, length=64, name="rate-sweep SHA-256")
 
 
 def main() -> None:
@@ -428,7 +436,7 @@ def main() -> None:
     runtime_qualification_sha256 = _runtime_qualification_anchor(
         builder_args, args.runtime_qualification_sha256
     )
-    rate_sweep_sha256 = _rate_sweep_anchor(args.rate_sweep_sha256)
+    rate_sweep_sha256 = _rate_sweep_anchor(builder_args, args.rate_sweep_sha256)
 
     snapshot = snapshot_git_revision(
         checkout,

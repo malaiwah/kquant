@@ -140,7 +140,7 @@ def _runtime_identity(value: object) -> dict[str, object]:
 
 def authenticate_production_builder(
     builder_file: Path,
-) -> tuple[tuple[str, str], Path, dict[str, object], str | None, str]:
+) -> tuple[tuple[str, str], Path, dict[str, object], str | None, str | None]:
     """Validate the trusted-launch context before any KQuant module is imported."""
 
     already_imported = sorted(
@@ -197,11 +197,13 @@ def authenticate_production_builder(
             length=64,
             name="runtime qualification SHA-256",
         )
-    rate_sweep_sha256 = _digest(
-        context.get("rate_sweep_sha256"),
-        length=64,
-        name="rate-sweep SHA-256",
-    )
+    rate_sweep_sha256 = context.get("rate_sweep_sha256")
+    if rate_sweep_sha256 is not None:
+        rate_sweep_sha256 = _digest(
+            rate_sweep_sha256,
+            length=64,
+            name="rate-sweep SHA-256",
+        )
     runtime = _runtime_identity(context.get("runtime"))
     python = runtime["python"]
     if not isinstance(python, dict):
