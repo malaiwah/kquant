@@ -440,6 +440,7 @@ def test_instruct_publication_uses_variant_specific_repositories() -> None:
     assert "GLM-5.2-SIQ-Fruit-Instruct/tree/48452ef3" in publication.fruit_audit_rows
     assert "GLM-5.2-QSRT-Fruit/tree/c1a0c62d" not in publication.fruit_audit_rows
     assert "Compact proxy, not the 754B teacher" in publication.quality_limitations
+    assert "each passed 0/8 behavior contracts" in publication.quality_limitations
     assert "Not assistant-quality" not in publication.quality_limitations
     assert "four-prompt" not in publication.quality_limitations
 
