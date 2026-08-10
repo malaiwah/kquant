@@ -63,6 +63,9 @@ def test_new_candidate_manifest_freezes_explicit_logical_schema(tmp_path) -> Non
     assert actual["h2_contract"]["indexed_by"] == "expert_r13"
     assert actual["h2_contract"]["down_candidate_grid"] == "w2_r13_r2"
     assert actual["h2_contract"]["prior"] == "expert_local_trace_scaled_identity"
+    assert actual["candidate_construction_fold"] == "fit"
+    assert actual["mode_proposal_metric"] == "confirmation_routed_functional_sse"
+    assert actual["mode_selection_fold"] == "confirmation"
     assert actual["h2_contract"]["unsupported_expert_fallback"] == "identity"
     assert actual["rotation_draws"] == {
         "source": "fixed_cli_draws",

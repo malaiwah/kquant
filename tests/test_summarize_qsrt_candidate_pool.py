@@ -84,11 +84,10 @@ def _metrics() -> dict[str, torch.Tensor]:
         ),
         "fit_counts": torch.tensor([[2, 1], [1, 1], [0, 1]], dtype=torch.int32),
         "confirmation_counts": torch.tensor([[1], [1], [0]], dtype=torch.int32),
-        "confirmation_ci95": torch.tensor(
-            [[0.1, 0.3], [-0.5, 0.1], [float("nan"), float("nan")]],
-            dtype=torch.float64,
+        "confirmation_familywise_relative_improvement_lower_bound": torch.tensor(
+            [0.1, -0.5, float("nan")], dtype=torch.float64
         ),
-        "confirmation_improvement": torch.tensor(
+        "confirmation_relative_improvement": torch.tensor(
             [0.2, 0.25, float("nan")], dtype=torch.float64
         ),
         OFFICIAL_SOURCE_DAMAGE_METRIC: damage,
@@ -124,8 +123,9 @@ def _arrays(metrics: dict[str, torch.Tensor]) -> dict[str, object]:
         "confirmation_support_sufficient": torch.tensor(
             [True, True, False]
         ).numpy(),
-        "confirmation_ci_low": metrics["confirmation_ci95"][:, 0].numpy(),
-        "confirmation_ci_high": metrics["confirmation_ci95"][:, 1].numpy(),
+        "confirmation_familywise_relative_improvement_lower_bound": metrics[
+            "confirmation_familywise_relative_improvement_lower_bound"
+        ].numpy(),
         "damage": metrics[OFFICIAL_SOURCE_DAMAGE_METRIC].numpy(),
     }
 
@@ -151,8 +151,8 @@ def _selections(
             for r2_column, r2 in enumerate(mode_ids)
             if bool(metrics["format_evaluated"][row, r13_column, r2_column])
         ]
-        improvement = float(metrics["confirmation_improvement"][row])
-        raw_ci = [float(value) for value in metrics["confirmation_ci95"][row]]
+        improvement = float(metrics["confirmation_relative_improvement"][row])
+        lower_bound = float(metrics["confirmation_familywise_relative_improvement_lower_bound"][row])
         result[str(expert)] = {
             "selection": {
                 "selected_r13": int(metrics["selected_r13"][row]),
@@ -170,11 +170,17 @@ def _selections(
                 "confirmation_relative_improvement": (
                     improvement if torch.isfinite(torch.tensor(improvement)) else None
                 ),
-                "confirmation_ci95": [
-                    value if torch.isfinite(torch.tensor(value)) else None
-                    for value in raw_ci
-                ],
-                "bootstrap_replicates_valid": 100,
+                "confirmation_familywise_relative_improvement_lower_bound": (
+                    lower_bound
+                    if torch.isfinite(torch.tensor(lower_bound))
+                    else None
+                ),
+                "familywise_alpha": 0.05,
+                "familywise_comparisons": len(mode_ids) ** 2 - 1,
+                "bootstrap_resampling_unit": "document",
+                "bootstrap_replicates_valid": (
+                    100 if torch.isfinite(torch.tensor(lower_bound)) else 0
+                ),
             },
             "evaluated_modes": sorted(
                 {rate for rates in evaluated_formats for rate in rates}
@@ -225,6 +231,7 @@ def test_summarize_arrays_reports_population_selection_evidence() -> None:
         "R1/R0": 0,
         "R1/R1": 0,
     }
+    assert summary["selection"]["nonzero_confirmation_proposals"] == 2
     assert summary["selection"]["accepted_nonzero_proposals"] == 1
     assert summary["selection"]["rejected_nonzero_proposals"] == 1
     assert summary["selection"]["r0_r0_only_evaluated"] == 1

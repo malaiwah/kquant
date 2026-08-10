@@ -382,11 +382,15 @@ evaluated through complete dense-$H$ BlockLDLQ re-encodes so cross-record
 covariance feedback is retained. For `w1`/`w3`, the common input covariance is
 retained while the selected output-row records receive their assigned rates.
 
-The encoder then reconstructs the full expert and scores applied-gate-square
-weighted routed output error on document-disjoint samples.  A nonzero mode is
-accepted only when its paired document-bootstrap lower confidence bound clears
-the frozen improvement margin over matched SQG `R0`; uncertain experts fall
-back to `(R0,R0)`.
+The encoder then reconstructs every full expert candidate and scores
+applied-gate-square weighted routed output error on document-disjoint samples.
+The fit rows construct the encoder and candidate grid but are not reused to
+rank reconstruction error. The disjoint confirmation fold ranks the complete
+3x3 grid. All eight nonzero comparisons share one document-bootstrap resampling
+matrix, and the confirmation argmin is accepted only when its one-sided
+Bonferroni-adjusted lower bound at familywise alpha 0.05 clears the frozen
+improvement margin. Uncertain experts fall back to `(R0,R0)`. The final
+validation fold remains external to selection.
 
 The initial search evaluates only the 3x3 Cartesian grid
 

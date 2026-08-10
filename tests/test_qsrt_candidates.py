@@ -19,7 +19,10 @@ from kquant.pack.qsrt_candidates import (
 from kquant.qsrt import INTERMEDIATE_CHANNELS, RECORDS_PER_EXPERT
 from kquant.qsrt_candidates import (
     activation_block_contexts,
+    BOOTSTRAP_RESAMPLING_UNIT,
+    PHASE1_FAMILYWISE_ALPHA,
     functional_sse_by_request,
+    familywise_paired_document_bootstrap,
     index_expert_rows,
     layer_fallback_contexts,
     partition_requests,
@@ -530,16 +533,13 @@ def test_phase1_mode_falls_back_before_search_with_weak_fit_support() -> None:
     assert selected.reason == "insufficient fit-document support"
 
 
-def test_phase1_rate_pair_is_selected_on_disjoint_confirmation_rows() -> None:
+def test_phase1_rate_pair_confirmation_proposes_and_familywise_gate_accepts() -> None:
     pairs = tuple((r13, r2) for r13 in (0, 1, 2) for r2 in (0, 1, 2))
     fit_counts = torch.ones(8, dtype=torch.int64)
     confirmation_counts = torch.ones(8, dtype=torch.int64)
-    # The fitted encoder population prefers R0/R0.  This must not suppress a
-    # rate transfer that consistently wins on rows excluded from construction.
-    fit = {
-        pair: torch.full((8,), 10.0 + pair[0] + pair[1]) for pair in pairs
-    }
+    fit = {pair: torch.full((8,), 10.0) for pair in pairs}
     confirmation = {pair: torch.full((8,), 10.0) for pair in pairs}
+    fit[(2, 1)] = torch.full((8,), 7.0)
     confirmation[(2, 1)] = torch.full((8,), 7.0)
 
     selected = select_phase1_rate_pair(
@@ -555,24 +555,187 @@ def test_phase1_rate_pair_is_selected_on_disjoint_confirmation_rows() -> None:
     assert selected.proposed == (2, 1)
     assert selected.selected == (2, 1)
     assert selected.accepted
-    assert selected.confirmation_ci95[0] is not None
-    assert selected.confirmation_ci95[0] > 0
+    assert selected.confirmation_familywise_relative_improvement_lower_bound is not None
+    assert selected.confirmation_familywise_relative_improvement_lower_bound > 0
+    assert selected.familywise_alpha == PHASE1_FAMILYWISE_ALPHA
+    assert selected.familywise_comparisons == 8
+    assert selected.bootstrap_resampling_unit == BOOTSTRAP_RESAMPLING_UNIT
 
 
-def test_phase1_rate_pair_requires_both_support_partitions() -> None:
-    pairs = ((0, 0), (0, 1))
-    values = {pair: torch.ones(6) for pair in pairs}
+def test_phase1_rate_pair_confirmation_argmin_does_not_reuse_fit_ranking() -> None:
+    pairs = tuple((r13, r2) for r13 in (0, 1, 2) for r2 in (0, 1, 2))
+    counts = torch.ones(8, dtype=torch.int64)
+    fit = {
+        pair: torch.full((8,), 10.0 + pair[0] + pair[1])
+        for pair in pairs
+    }
+    confirmation = {pair: torch.full((8,), 10.0) for pair in pairs}
+    confirmation[(2, 1)] = torch.full((8,), 1.0)
+
+    selected = select_phase1_rate_pair(
+        fit,
+        confirmation,
+        fit_counts=counts,
+        confirmation_counts=counts,
+        modes=pairs,
+        bootstrap_replicates=200,
+    )
+
+    assert selected.proposed == (2, 1)
+    assert selected.selected == (2, 1)
+    assert selected.accepted
+    assert selected.reason == "familywise lower bound cleared the margin"
+    assert selected.bootstrap_replicates_valid == 200
+
+
+def test_familywise_bootstrap_is_seeded_and_shares_document_resamples() -> None:
+    baseline = torch.full((16,), 10.0, dtype=torch.float64)
+    delta = torch.tensor([-3.0, *(1.0 for _ in range(15))])
+    candidates = (baseline - delta, baseline - 2.0 * delta)
+
+    first = familywise_paired_document_bootstrap(
+        baseline,
+        candidates,
+        replicates=500,
+        seed=19,
+    )
+    second = familywise_paired_document_bootstrap(
+        baseline,
+        candidates,
+        replicates=500,
+        seed=19,
+    )
+
+    assert first == second
+    assert first.comparisons == 2
+    assert first.valid_replicates == 500
+    assert first.resampling_unit == "document"
+    assert first.adjusted_lower_bounds[0] is not None
+    assert first.adjusted_lower_bounds[1] == pytest.approx(
+        2.0 * first.adjusted_lower_bounds[0]
+    )
+
+
+def test_phase1_rate_pair_rejects_winner_after_familywise_adjustment() -> None:
+    pairs = tuple((r13, r2) for r13 in (0, 1, 2) for r2 in (0, 1, 2))
+    baseline = torch.full((32,), 10.0, dtype=torch.float64)
+    proposed = baseline - 1.0
+    proposed[0] = 19.0
+    confirmation = {pair: baseline + 1.0 for pair in pairs}
+    confirmation[(0, 0)] = baseline
+    confirmation[(2, 1)] = proposed
+    counts = torch.ones(32, dtype=torch.int64)
+
+    old_pairwise = familywise_paired_document_bootstrap(
+        baseline,
+        (proposed,),
+        replicates=5_000,
+        seed=7,
+        familywise_alpha=0.025,
+    )
+    selected = select_phase1_rate_pair(
+        confirmation,
+        confirmation,
+        fit_counts=counts,
+        confirmation_counts=counts,
+        modes=pairs,
+        bootstrap_replicates=5_000,
+        seed=7,
+    )
+
+    assert old_pairwise.adjusted_lower_bounds[0] is not None
+    assert old_pairwise.adjusted_lower_bounds[0] > 0
+    assert selected.proposed == (2, 1)
+    assert selected.selected == (0, 0)
+    assert not selected.accepted
+    assert selected.confirmation_relative_improvement is not None
+    assert selected.confirmation_relative_improvement > 0
+    assert selected.confirmation_familywise_relative_improvement_lower_bound is not None
+    assert selected.confirmation_familywise_relative_improvement_lower_bound <= 0
+
+
+def test_familywise_rate_pair_gate_fails_closed_without_valid_baseline() -> None:
+    zero = torch.zeros(8, dtype=torch.float64)
+    invalid = torch.full((8,), float("nan"), dtype=torch.float64)
+    zero_result = familywise_paired_document_bootstrap(
+        zero,
+        (zero,),
+        replicates=200,
+        seed=3,
+    )
+    invalid_result = familywise_paired_document_bootstrap(
+        torch.ones(8, dtype=torch.float64),
+        (invalid,),
+        replicates=200,
+        seed=3,
+    )
+    pairs = tuple((r13, r2) for r13 in (0, 1, 2) for r2 in (0, 1, 2))
+    valid_table = {pair: torch.ones(8, dtype=torch.float64) for pair in pairs}
+    invalid_table = dict(valid_table)
+    invalid_table[(2, 1)] = invalid
+    invalid_selection = select_phase1_rate_pair(
+        valid_table,
+        invalid_table,
+        fit_counts=torch.ones(8, dtype=torch.int64),
+        confirmation_counts=torch.ones(8, dtype=torch.int64),
+        modes=pairs,
+        bootstrap_replicates=200,
+        seed=3,
+    )
+
+    assert zero_result.point_estimates == (None,)
+    assert zero_result.adjusted_lower_bounds == (None,)
+    assert zero_result.valid_replicates == 0
+    assert invalid_result.point_estimates == (None,)
+    assert invalid_result.adjusted_lower_bounds == (None,)
+    assert invalid_result.valid_replicates == 0
+    assert invalid_selection.selected == (0, 0)
+    assert not invalid_selection.accepted
+    assert invalid_selection.reason == "invalid confirmation-document SSE support"
+
+
+def test_phase1_rate_pair_keeps_r0_confirmation_argmin_without_bootstrap() -> None:
+    pairs = tuple((r13, r2) for r13 in (0, 1, 2) for r2 in (0, 1, 2))
+    counts = torch.ones(8, dtype=torch.int64)
+    values = {
+        pair: torch.full((8,), 10.0 + pair[0] + pair[1])
+        for pair in pairs
+    }
 
     selected = select_phase1_rate_pair(
         values,
         values,
+        fit_counts=counts,
+        confirmation_counts=counts,
+        modes=pairs,
+        bootstrap_replicates=200,
+    )
+
+    assert selected.proposed == (0, 0)
+    assert selected.selected == (0, 0)
+    assert selected.reason == "R0/R0 is the confirmation-document argmin"
+    assert selected.confirmation_relative_improvement is None
+    assert selected.confirmation_familywise_relative_improvement_lower_bound is None
+    assert selected.bootstrap_replicates_valid == 0
+
+
+def test_phase1_rate_pair_requires_both_support_partitions() -> None:
+    pairs = ((0, 0),)
+    fit_values = {pair: torch.ones(6) for pair in pairs}
+    confirmation_values = {pair: torch.ones(3) for pair in pairs}
+
+    selected = select_phase1_rate_pair(
+        fit_values,
+        confirmation_values,
         fit_counts=torch.ones(6, dtype=torch.int64),
         confirmation_counts=torch.ones(3, dtype=torch.int64),
         modes=pairs,
         min_fit_documents=4,
         min_confirmation_documents=4,
         bootstrap_replicates=200,
+        familywise_comparisons=8,
     )
 
     assert selected.selected == (0, 0)
     assert selected.reason == "insufficient confirmation-document support"
+    assert selected.familywise_comparisons == 8

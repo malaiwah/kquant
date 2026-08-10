@@ -41,8 +41,11 @@ from kquant.exl3_reference import (
 )
 from kquant.sqg_quantizer import install_sqg_quantizer
 from kquant.qsrt_candidates import (
+    BOOTSTRAP_RESAMPLING_UNIT,
+    MODE_PROPOSAL_METRIC,
     PERMUTATION_POLICIES,
     PHASE1_BOOTSTRAP_REPLICATES,
+    PHASE1_FAMILYWISE_ALPHA,
     PHASE1_MIN_CONFIRMATION_DOCUMENTS,
     PHASE1_MIN_FIT_DOCUMENTS,
     RequestPartition,
@@ -765,8 +768,12 @@ def _allocate_metrics(
         ),
         "block_contexts": torch.zeros((count, 768), dtype=torch.uint8),
         "block_scores": torch.zeros((count, 768), dtype=torch.float32),
-        "confirmation_improvement": torch.full((count,), float("nan"), dtype=torch.float64),
-        "confirmation_ci95": torch.full((count, 2), float("nan"), dtype=torch.float64),
+        "confirmation_relative_improvement": torch.full(
+            (count,), float("nan"), dtype=torch.float64
+        ),
+        "confirmation_familywise_relative_improvement_lower_bound": torch.full(
+            (count,), float("nan"), dtype=torch.float64
+        ),
         # This is already integrated over the sampled natural-routing rows and
         # includes the applied router gate squared.  It is therefore the
         # direct keep benefit for the codec objective; allocators must not
@@ -809,12 +816,16 @@ def _store_metrics(
             candidate.confirmation_sse[rate_pair]
         )
     if selection.confirmation_relative_improvement is not None:
-        metrics["confirmation_improvement"][row] = (
+        metrics["confirmation_relative_improvement"][row] = (
             selection.confirmation_relative_improvement
         )
-    for column, value in enumerate(selection.confirmation_ci95):
-        if value is not None:
-            metrics["confirmation_ci95"][row, column] = value
+    lower_bound = (
+        selection.confirmation_familywise_relative_improvement_lower_bound
+    )
+    if lower_bound is not None:
+        metrics[
+            "confirmation_familywise_relative_improvement_lower_bound"
+        ][row] = lower_bound
     selected_r13_column = mode_index[selection.selected_r13]
     selected_r2_column = mode_index[selection.selected_r2]
     official_source_excess_sse = (
@@ -1079,8 +1090,13 @@ def encode_layer(
             "shared_r": False,
             "candidate_construction_fold": "fit",
             "mode_selection_fold": "confirmation",
-            "mode_proposal_metric": "confirmation_routed_functional_sse",
-            "mode_acceptance": "paired_document_bootstrap_lower_bound_vs_r0",
+            "mode_proposal_metric": MODE_PROPOSAL_METRIC,
+            "mode_acceptance": (
+                "one_sided_familywise_document_bootstrap_lower_bound_vs_r0"
+            ),
+            "familywise_alpha": PHASE1_FAMILYWISE_ALPHA,
+            "familywise_comparisons": len(args.mode_ids) ** 2 - 1,
+            "bootstrap_resampling_unit": BOOTSTRAP_RESAMPLING_UNIT,
             "fit_documents": len(partition.fit),
             "confirmation_documents": len(partition.confirmation),
             "min_fit_documents": args.min_fit_documents,
@@ -1512,8 +1528,13 @@ def _manifest(args: argparse.Namespace) -> dict:
         "shared_r": False,
         "candidate_construction_fold": "fit",
         "mode_selection_fold": "confirmation",
-        "mode_proposal_metric": "confirmation_routed_functional_sse",
-        "mode_acceptance": "paired_document_bootstrap_lower_bound_vs_r0",
+        "mode_proposal_metric": MODE_PROPOSAL_METRIC,
+        "mode_acceptance": (
+            "one_sided_familywise_document_bootstrap_lower_bound_vs_r0"
+        ),
+        "familywise_alpha": PHASE1_FAMILYWISE_ALPHA,
+        "familywise_comparisons": len(args.mode_ids) ** 2 - 1,
+        "bootstrap_resampling_unit": BOOTSTRAP_RESAMPLING_UNIT,
         "min_fit_documents": args.min_fit_documents,
         "min_confirmation_documents": args.min_confirmation_documents,
         "minimum_improvement": args.minimum_improvement,

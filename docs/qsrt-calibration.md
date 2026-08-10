@@ -183,19 +183,29 @@ expected outcome, not an error.
 
 ## Candidate and validation separation
 
-The training capture supplies Hessians, importance order, rate-shift proposals,
-and the fit/confirmation folds used by the conservative selector. The separate
-validation capture serves two purposes:
+The training capture supplies Hessians, importance order, and the encoded
+3x3 `(r13,r2)` candidate grid. Because those fit rows construct the encoder,
+their reconstruction error is not reused for mode selection. The disjoint
+confirmation fold ranks all nine candidates. One shared document-resampling
+matrix evaluates the eight nonzero comparisons, and the selected argmin is
+accepted only when its one-sided lower bound at the Bonferroni quantile
+`0.05 / 8` clears the frozen margin. This controls the within-expert familywise
+error rate rather than evaluating the searched winner with an unadjusted
+pairwise interval. Unsupported, non-finite, or non-significant decisions fail
+closed to `R0/R0`.
+
+The separate validation capture serves two purposes:
 
 1. estimate each selected lossy candidate's natural-route damage for the X4T
    allocator; and
 2. compare every accepted `(r13,r2)` choice with a reconstructed R0/R0 control
    on the same held-out documents.
 
-Selection must use paired per-document evidence. Coefficient count is not a
-statistical sample size. Report traffic-weighted aggregate error, median,
-upper-tail regressions, high-traffic worst cases, mode frequencies, and
-support-conditioned confidence intervals.
+Selection uses paired per-document evidence. Coefficient count is not a
+statistical sample size. Persist the familywise alpha, comparison count,
+document resampling unit, adjusted lower bound, valid bootstrap replicate
+count, traffic-weighted aggregate error, upper-tail regressions, high-traffic
+worst cases, mode frequencies, and support.
 
 ## Interim production-pool confirmation frequencies
 
@@ -213,9 +223,10 @@ partly or fully represented layers:
 
 The exact mode histogram was `R0/R0` 20,485; `R0/R1` 266; `R0/R2` 894;
 `R1/R0` 125; `R1/R1` 974; `R1/R2` 2,763; `R2/R0` 9; `R2/R1` 18; and
-`R2/R2` 1,642.  Every selected nonzero mode in this snapshot cleared the
-paired document-bootstrap confirmation lower-bound gate; rejected proposals
-fell back to `R0/R0`.
+`R2/R2` 1,642. Every selected nonzero mode in this historical snapshot cleared
+the then-current pairwise document-bootstrap confirmation gate. The snapshot
+predates the simultaneous eight-comparison familywise contract above and must
+not be represented as post-change selection evidence.
 
 Treat this as an interim selector diagnostic, not an estimate with a random
 layer-sampling design.  The pack schedule is work-balanced, split-layer

@@ -14,6 +14,7 @@ from kquant.fruit_qsrt import (
     FRUIT_QSRT_PAIR_COUNT,
     FRUIT_QSRT_PAIR_WORDS,
     FRUIT_QSRT_SCHEMA,
+    _rate_pair_selection_evidence,
     FruitExpertEncoding,
     FruitMatrixEncoding,
     decode_fruit_matrix,
@@ -40,6 +41,7 @@ from kquant.logical_qsrt import (
     fruit_rate_modes,
     paired_record_bits,
 )
+from kquant.qsrt_candidates import select_phase1_rate_pair
 
 
 def _closed_states(mode, rate_axis: str) -> torch.Tensor:
@@ -282,3 +284,37 @@ def test_atom_layer_matches_independently_packed_experts() -> None:
             ].contiguous(),
         )
         assert torch.equal(atom_slab[:, index], expected)
+
+
+
+def test_fruit_selection_persists_familywise_document_evidence() -> None:
+    pairs = tuple((r13, r2) for r13 in (0, 1, 2) for r2 in (0, 1, 2))
+    counts = torch.ones(8, dtype=torch.int64)
+    metrics = {pair: torch.full((8,), 10.0) for pair in pairs}
+    metrics[(2, 1)] = torch.full((8,), 7.0)
+    decision = select_phase1_rate_pair(
+        metrics,
+        metrics,
+        fit_counts=counts,
+        confirmation_counts=counts,
+        modes=pairs,
+        bootstrap_replicates=200,
+        seed=17,
+    )
+
+    encoding = _expert(0, r13=decision.selected_r13, r2=decision.selected_r2)
+    encoding.selection = _rate_pair_selection_evidence(decision)
+    persisted = encoding.manifest()["selection"]
+
+    assert persisted["selected"] == {"r13": 2, "r2": 1}
+    assert persisted["mode_proposal_metric"] == "confirmation_routed_functional_sse"
+    assert persisted["familywise_alpha"] == 0.05
+    assert persisted["familywise_comparisons"] == 8
+    assert persisted["bootstrap_resampling_unit"] == "document"
+    assert persisted["bootstrap_replicates_valid"] == 200
+    assert persisted["confirmation_relative_improvement"] == pytest.approx(0.3)
+    assert persisted[
+        "confirmation_familywise_relative_improvement_lower_bound"
+    ] == pytest.approx(0.3)
+    assert persisted["external_validation_used"] is False
+    assert "confirmation_ci95" not in persisted

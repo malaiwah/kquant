@@ -43,7 +43,7 @@ from kquant.pack.qsrt_candidates import (
 
 
 SUMMARY_KIND = "kquant_kimi_k3_qsrt_candidate_pool_summary"
-SUMMARY_SCHEMA_VERSION = 1
+SUMMARY_SCHEMA_VERSION = 2
 
 
 def _read_json(path: Path) -> dict:
@@ -157,16 +157,17 @@ def _extract_layer(
     fit_sse = metrics["fit_sse"]
     confirmation_sse = metrics["confirmation_sse"]
     mode_zero = mode_ids.index(0)
-    ci95 = metrics.get("confirmation_ci95")
-    expected_ci_shape = (len(expert_ids), 2)
+    lower_bound = metrics.get("confirmation_familywise_relative_improvement_lower_bound")
+    expected_lower_bound_shape = (len(expert_ids),)
     if (
-        ci95 is None
-        or ci95.dtype != torch.float64
-        or tuple(ci95.shape) != expected_ci_shape
+        lower_bound is None
+        or lower_bound.dtype != torch.float64
+        or tuple(lower_bound.shape) != expected_lower_bound_shape
     ):
         raise ValueError(
-            "confirmation_ci95 must be a float64 tensor with shape "
-            f"{expected_ci_shape}"
+            "confirmation_familywise_relative_improvement_lower_bound must be "
+            "a float64 tensor "
+            f"with shape {expected_lower_bound_shape}"
         )
     return {
         "selected_r13": selected_r13.numpy(),
@@ -207,8 +208,7 @@ def _extract_layer(
             (metrics["confirmation_counts"] > 0).sum(dim=1)
             >= min_confirmation_documents
         ).numpy(),
-        "confirmation_ci_low": ci95[:, 0].numpy(),
-        "confirmation_ci_high": ci95[:, 1].numpy(),
+        "confirmation_familywise_relative_improvement_lower_bound": lower_bound.numpy(),
         "damage": validated["damage"].numpy(),
     }
 
@@ -243,7 +243,7 @@ def summarize_arrays(
     )
     if np.any(accepted & selected_differs):
         raise ValueError(
-            "accepted selected formats must equal their confirmation proposals"
+            "accepted selected formats must equal their proposed formats"
         )
     evaluated_count = arrays["evaluated_count"]
     format_count = len(mode_ids) ** 2
@@ -348,8 +348,12 @@ def summarize_arrays(
             "accepted_confirmation_relative_improvement_quantiles": (
                 _quantiles(accepted_relative)
             ),
-            "confirmation_ci95_lower_quantiles": _quantiles(
-                arrays["confirmation_ci_low"][nonzero_proposal]
+            "confirmation_familywise_relative_improvement_lower_bound_quantiles": (
+                _quantiles(
+                    arrays[
+                        "confirmation_familywise_relative_improvement_lower_bound"
+                    ][nonzero_proposal]
+                )
             ),
         },
         "support": {

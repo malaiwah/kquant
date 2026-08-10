@@ -13,6 +13,7 @@ import torch
 from safetensors.torch import load_file
 
 from kquant import constants as C
+from kquant.qsrt_candidates import familywise_paired_document_bootstrap
 from kquant.qsrt_rotations import (
     QSRTRotationPlan,
     QSRTLayerRotationPlan,
@@ -103,26 +104,6 @@ def _load_family(
     return result
 
 
-def _paired_lower_bound(
-    baseline: torch.Tensor,
-    candidate: torch.Tensor,
-    *,
-    replicates: int,
-    lower_quantile: float,
-    seed: int,
-) -> float:
-    delta = (baseline - candidate).to(torch.float64)
-    if delta.ndim != 1 or delta.numel() == 0:
-        raise ValueError("paired confirmation vectors must be nonempty and one-dimensional")
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    indices = torch.randint(
-        0,
-        delta.numel(),
-        (replicates, delta.numel()),
-        generator=generator,
-    )
-    draws = delta[indices].sum(dim=1)
-    return float(torch.quantile(draws, lower_quantile))
 
 
 def _select_one(
@@ -134,6 +115,7 @@ def _select_one(
 ) -> tuple[int, dict[str, object]]:
     totals = {draw: float(values.sum()) for draw, values in candidates.items()}
     proposed = min(totals, key=lambda draw: (totals[draw], draw))
+    comparison_draws = tuple(sorted(draw for draw in candidates if draw != 0))
     report: dict[str, object] = {
         "confirmation_sse": {str(draw): value for draw, value in totals.items()},
         "proposed_draw": proposed,
@@ -143,18 +125,22 @@ def _select_one(
     }
     if proposed == 0:
         return 0, report
-    comparisons = max(1, len(candidates) - 1)
-    lower = _paired_lower_bound(
+    bootstrap = familywise_paired_document_bootstrap(
         candidates[0],
-        candidates[proposed],
+        tuple(candidates[draw] for draw in comparison_draws),
         replicates=replicates,
-        lower_quantile=0.05 / comparisons,
         seed=seed,
+        relative=False,
     )
+    lower = bootstrap.adjusted_lower_bounds[comparison_draws.index(proposed)]
     threshold = minimum_relative_improvement * totals[0]
+    report["familywise_alpha"] = bootstrap.familywise_alpha
+    report["familywise_comparisons"] = bootstrap.comparisons
+    report["bootstrap_resampling_unit"] = bootstrap.resampling_unit
+    report["bootstrap_replicates_valid"] = bootstrap.valid_replicates
     report["familywise_lower_bound"] = lower
     report["required_improvement"] = threshold
-    if lower > threshold:
+    if lower is not None and lower > threshold:
         report["selected_draw"] = proposed
         report["reason"] = "familywise_paired_lower_bound_passed"
         return proposed, report

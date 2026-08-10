@@ -36,6 +36,11 @@ from kquant.qsrt import (
     SCHEMA as QSRT_SCHEMA,
     ExpertFormatSpec,
 )
+from kquant.qsrt_candidates import (
+    BOOTSTRAP_RESAMPLING_UNIT,
+    MODE_PROPOSAL_METRIC,
+    PHASE1_FAMILYWISE_ALPHA,
+)
 from kquant.qsrt_storage import ATOM_SCALE_BYTES, ATOMS_PER_EXPERT, QSRTLayerLayout
 from kquant.pack.qsrt_candidates import (
     CANDIDATE_POOL_KIND,
@@ -625,14 +630,14 @@ def _validate_selection_semantics(
 
     improvement = _require_tensor(
         metrics,
-        "confirmation_improvement",
+        "confirmation_relative_improvement",
         shape=(experts,),
         dtype=torch.float64,
     )
-    ci95 = _require_tensor(
+    lower_bound = _require_tensor(
         metrics,
-        "confirmation_ci95",
-        shape=(experts, 2),
+        "confirmation_familywise_relative_improvement_lower_bound",
+        shape=(experts,),
         dtype=torch.float64,
     )
     expected_selected_r13 = torch.zeros(experts, dtype=torch.uint8)
@@ -642,7 +647,7 @@ def _validate_selection_semantics(
         r2 = int(proposed_r2[row])
         if (r13, r2) == (0, 0):
             if not bool(torch.isnan(improvement[row])) or not bool(
-                torch.all(torch.isnan(ci95[row]))
+                torch.isnan(lower_bound[row])
             ):
                 raise ValueError(
                     "R0/R0 proposals must not carry confirmation evidence"
@@ -659,7 +664,7 @@ def _validate_selection_semantics(
         observed = 1.0 - trial / baseline if baseline > 0 else None
         if observed is None:
             if not bool(torch.isnan(improvement[row])) or not bool(
-                torch.all(torch.isnan(ci95[row]))
+                torch.isnan(lower_bound[row])
             ):
                 raise ValueError(
                     "zero-baseline proposals have invalid confirmation evidence"
@@ -669,9 +674,11 @@ def _validate_selection_semantics(
             float(improvement[row]), observed, rel_tol=1e-12, abs_tol=1e-15
         ):
             raise ValueError("stored confirmation improvement does not close")
-        low, high = (float(value) for value in ci95[row])
-        if not np.isfinite((low, high)).all() or low > high:
-            raise ValueError("nonzero proposals must have a finite ordered CI")
+        low = float(lower_bound[row])
+        if math.isnan(low):
+            continue
+        if not math.isfinite(low):
+            raise ValueError("familywise lower bound must be finite or absent")
         if low > minimum_improvement:
             expected_selected_r13[row] = r13
             expected_selected_r2[row] = r2
@@ -835,14 +842,14 @@ def validate_selection_ledger_evidence(
         raise ValueError("selection support tensors are malformed")
     improvement = _require_tensor(
         metrics,
-        "confirmation_improvement",
+        "confirmation_relative_improvement",
         shape=(experts,),
         dtype=torch.float64,
     )
-    ci95 = _require_tensor(
+    lower_bound = _require_tensor(
         metrics,
-        "confirmation_ci95",
-        shape=(experts, 2),
+        "confirmation_familywise_relative_improvement_lower_bound",
+        shape=(experts,),
         dtype=torch.float64,
     )
     fit_support = (fit_counts > 0).sum(dim=1)
@@ -909,20 +916,38 @@ def validate_selection_ledger_evidence(
             raise ValueError(
                 f"selection evidence expert {expert} has invalid bootstrap support"
             )
+        if (valid_replicates > 0) is not math.isfinite(float(lower_bound[row])):
+            raise ValueError(
+                f"selection evidence expert {expert} valid replicate count "
+                "disagrees with its familywise lower bound"
+            )
+        familywise_alpha = selection.get("familywise_alpha")
+        if (
+            isinstance(familywise_alpha, bool)
+            or not isinstance(familywise_alpha, (int, float))
+            or float(familywise_alpha) != PHASE1_FAMILYWISE_ALPHA
+        ):
+            raise ValueError(
+                f"selection evidence expert {expert} familywise alpha drifted"
+            )
+        if selection.get("familywise_comparisons") != len(mode_ids) ** 2 - 1:
+            raise ValueError(
+                f"selection evidence expert {expert} comparison count drifted"
+            )
+        if selection.get("bootstrap_resampling_unit") != BOOTSTRAP_RESAMPLING_UNIT:
+            raise ValueError(
+                f"selection evidence expert {expert} resampling unit drifted"
+            )
         require_optional_float(
             selection.get("confirmation_relative_improvement"),
             float(improvement[row]),
             f"selection evidence expert {expert} confirmation improvement",
         )
-        raw_ci = selection.get("confirmation_ci95")
-        if not isinstance(raw_ci, list) or len(raw_ci) != 2:
-            raise ValueError(f"selection evidence expert {expert} CI is malformed")
-        for column, actual in enumerate(raw_ci):
-            require_optional_float(
-                actual,
-                float(ci95[row, column]),
-                f"selection evidence expert {expert} CI[{column}]",
-            )
+        require_optional_float(
+            selection.get("confirmation_familywise_relative_improvement_lower_bound"),
+            float(lower_bound[row]),
+            f"selection evidence expert {expert} familywise lower bound",
+        )
 
         expected_evaluated_modes = [
             mode
@@ -1140,10 +1165,13 @@ def load_qsrt_candidate_pool(
             "shared_r": False,
             "candidate_construction_fold": "fit",
             "mode_selection_fold": "confirmation",
-            "mode_proposal_metric": "confirmation_routed_functional_sse",
+            "mode_proposal_metric": MODE_PROPOSAL_METRIC,
             "mode_acceptance": (
-                "paired_document_bootstrap_lower_bound_vs_r0"
+                "one_sided_familywise_document_bootstrap_lower_bound_vs_r0"
             ),
+            "familywise_alpha": PHASE1_FAMILYWISE_ALPHA,
+            "familywise_comparisons": len(mode_ids) ** 2 - 1,
+            "bootstrap_resampling_unit": BOOTSTRAP_RESAMPLING_UNIT,
             "external_validation_used": False,
         }
         for name, expected in expected_selection_contract.items():

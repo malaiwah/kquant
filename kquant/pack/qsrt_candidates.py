@@ -47,7 +47,7 @@ from kquant.qsrt_candidates import (
 )
 
 CANDIDATE_POOL_KIND = "kquant_kimi_k3_qsrt_candidate_pool"
-CANDIDATE_POOL_SCHEMA_VERSION = 6
+CANDIDATE_POOL_SCHEMA_VERSION = 7
 OFFICIAL_SOURCE_DAMAGE_METRIC = "official_source_excess_sse"
 HessianPolicy = Literal["captured_blend", "identity"]
 HESSIAN_POLICIES: tuple[HessianPolicy, ...] = ("captured_blend", "identity")
@@ -791,6 +791,7 @@ def encode_phase1_expert(
         min_confirmation_documents=min_confirmation_documents,
         minimum_improvement=minimum_improvement,
         bootstrap_replicates=bootstrap_replicates,
+        familywise_comparisons=len(modes) ** 2 - 1,
         seed=deterministic_expert_seed(layer, expert),
     )
     selected_r13, selected_r2 = selection.selected
@@ -1213,6 +1214,7 @@ def encode_phase1_expert_batch(
             min_confirmation_documents=min_confirmation_documents,
             minimum_improvement=minimum_improvement,
             bootstrap_replicates=bootstrap_replicates,
+            familywise_comparisons=len(modes) ** 2 - 1,
             seed=deterministic_expert_seed(layer, expert),
         )
         selected_r13, selected_r2 = selection.selected

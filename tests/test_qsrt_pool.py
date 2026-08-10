@@ -148,13 +148,15 @@ def test_layer_metrics_reject_damage_that_does_not_close() -> None:
 
 def test_layer_metrics_rederive_confirmation_proposal_and_gate() -> None:
     metrics = _metrics()
-    metrics["confirmation_improvement"] = torch.tensor(
+    metrics["confirmation_relative_improvement"] = torch.tensor(
         [0.5, float("nan"), 0.25], dtype=torch.float64
     )
-    metrics["confirmation_ci95"] = torch.tensor(
-        [[0.5, 0.5], [float("nan"), float("nan")], [0.25, 0.25]],
-        dtype=torch.float64,
+    metrics["confirmation_familywise_relative_improvement_lower_bound"] = torch.tensor(
+        [0.5, float("nan"), 0.25], dtype=torch.float64
     )
+    # The fit argmin differs, but fit rows constructed the encoder and must not
+    # replace the disjoint confirmation proposal.
+    metrics["fit_sse"][0, 1, 1] = 0.1
 
     validate_layer_metrics(
         metrics,
@@ -166,6 +168,22 @@ def test_layer_metrics_rederive_confirmation_proposal_and_gate() -> None:
         min_confirmation_documents=1,
         minimum_improvement=0.0,
     )
+    metrics["proposed_r13"][0] = 1
+    metrics["proposed_r2"][0] = 1
+    with pytest.raises(ValueError, match="confirmation argmin"):
+        validate_layer_metrics(
+            metrics,
+            mode_ids=(0, 1),
+            fit_documents=2,
+            confirmation_documents=1,
+            expert_ids=(0, 1, 2),
+            min_fit_documents=1,
+            min_confirmation_documents=1,
+            minimum_improvement=0.0,
+        )
+    metrics["proposed_r13"][0] = 0
+    metrics["proposed_r2"][0] = 1
+
 
     metrics["selected_r2"][0] = 0
     with pytest.raises(ValueError, match="confirmation gate"):
@@ -213,8 +231,8 @@ def _selection_ledger(
             for r2_column, r2 in enumerate(mode_ids)
             if bool(metrics["format_evaluated"][row, r13_column, r2_column])
         ]
-        improvement = float(metrics["confirmation_improvement"][row])
-        ci = [float(value) for value in metrics["confirmation_ci95"][row]]
+        improvement = float(metrics["confirmation_relative_improvement"][row])
+        lower_bound = float(metrics["confirmation_familywise_relative_improvement_lower_bound"][row])
         selections[str(expert)] = {
             "selection": {
                 "selected_r13": int(metrics["selected_r13"][row]),
@@ -233,10 +251,15 @@ def _selection_ledger(
                 "confirmation_relative_improvement": (
                     improvement if np.isfinite(improvement) else None
                 ),
-                "confirmation_ci95": [
-                    value if np.isfinite(value) else None for value in ci
-                ],
-                "bootstrap_replicates_valid": 100,
+                "confirmation_familywise_relative_improvement_lower_bound": (
+                    lower_bound if np.isfinite(lower_bound) else None
+                ),
+                "familywise_alpha": 0.05,
+                "familywise_comparisons": len(mode_ids) ** 2 - 1,
+                "bootstrap_resampling_unit": "document",
+                "bootstrap_replicates_valid": (
+                    100 if np.isfinite(lower_bound) else 0
+                ),
             },
             "evaluated_modes": sorted(
                 {rate for rate_pair in evaluated_formats for rate in rate_pair}
@@ -251,12 +274,11 @@ def _selection_ledger(
 
 def test_selection_json_is_bound_to_tensor_evidence_and_descriptors() -> None:
     metrics = _metrics()
-    metrics["confirmation_improvement"] = torch.tensor(
+    metrics["confirmation_relative_improvement"] = torch.tensor(
         [0.5, float("nan"), 0.25], dtype=torch.float64
     )
-    metrics["confirmation_ci95"] = torch.tensor(
-        [[0.5, 0.5], [float("nan"), float("nan")], [0.25, 0.25]],
-        dtype=torch.float64,
+    metrics["confirmation_familywise_relative_improvement_lower_bound"] = torch.tensor(
+        [0.5, float("nan"), 0.25], dtype=torch.float64
     )
     ledger = _selection_ledger(metrics)
 
@@ -279,12 +301,11 @@ def test_selection_json_is_bound_to_tensor_evidence_and_descriptors() -> None:
 
 def test_selection_json_preserves_qsrt_candidate_schema() -> None:
     metrics = _metrics()
-    metrics["confirmation_improvement"] = torch.tensor(
+    metrics["confirmation_relative_improvement"] = torch.tensor(
         [0.5, float("nan"), 0.25], dtype=torch.float64
     )
-    metrics["confirmation_ci95"] = torch.tensor(
-        [[0.5, 0.5], [float("nan"), float("nan")], [0.25, 0.25]],
-        dtype=torch.float64,
+    metrics["confirmation_familywise_relative_improvement_lower_bound"] = torch.tensor(
+        [0.5, float("nan"), 0.25], dtype=torch.float64
     )
     ledger = _selection_ledger(metrics)
 
@@ -299,12 +320,11 @@ def test_selection_json_preserves_qsrt_candidate_schema() -> None:
 
 def test_selection_json_rejects_matrix_rate_drift() -> None:
     metrics = _metrics()
-    metrics["confirmation_improvement"] = torch.tensor(
+    metrics["confirmation_relative_improvement"] = torch.tensor(
         [0.5, float("nan"), 0.25], dtype=torch.float64
     )
-    metrics["confirmation_ci95"] = torch.tensor(
-        [[0.5, 0.5], [float("nan"), float("nan")], [0.25, 0.25]],
-        dtype=torch.float64,
+    metrics["confirmation_familywise_relative_improvement_lower_bound"] = torch.tensor(
+        [0.5, float("nan"), 0.25], dtype=torch.float64
     )
     ledger = _selection_ledger(metrics)
     matrix = ledger["selections"]["0"]["mode_coding"]["R0/R1"]["matrices"]["w2"]

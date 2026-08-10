@@ -9,7 +9,8 @@ The selection split is deliberately asymmetric:
 
 * fit documents determine the neuron order and expert-local covariance blends;
 * confirmation documents choose among the already-encoded fixed-rate formats
-  and must also clear a paired bootstrap lower-bound gate against R0; and
+  and a one-sided familywise document bootstrap gates the confirmation argmin
+  against R0; and
 * insufficient support deterministically falls back to R0 and identity H2.
 
 This separation matters because the fit rows also define the encoder Hessian.
@@ -72,6 +73,9 @@ PHASE1_MIN_FIT_DOCUMENTS = 6
 PHASE1_MIN_CONFIRMATION_DOCUMENTS = 4
 PHASE1_BOOTSTRAP_REPLICATES = 2_000
 PHASE1_SELECTION_SEED = 20_260_801
+PHASE1_FAMILYWISE_ALPHA = 0.05
+BOOTSTRAP_RESAMPLING_UNIT = "document"
+MODE_PROPOSAL_METRIC = "confirmation_routed_functional_sse"
 
 PermutationPolicy = Literal[
     "identity",
@@ -168,8 +172,20 @@ class ModeSelection:
 
 
 @dataclass(frozen=True)
+class FamilywiseBootstrap:
+    """Shared-resample evidence for simultaneous paired comparisons."""
+
+    familywise_alpha: float
+    comparisons: int
+    resampling_unit: str
+    point_estimates: tuple[float | None, ...]
+    adjusted_lower_bounds: tuple[float | None, ...]
+    valid_replicates: int
+
+
+@dataclass(frozen=True)
 class RatePairSelection:
-    """Confirmation-selected and bootstrap-gated ``(r13, r2)`` decision."""
+    """Fit-selected, familywise confirmation-gated ``(r13, r2)`` decision."""
 
     proposed_r13: int
     proposed_r2: int
@@ -179,8 +195,11 @@ class RatePairSelection:
     reason: str
     fit_documents: int
     confirmation_documents: int
+    familywise_alpha: float
+    familywise_comparisons: int
+    bootstrap_resampling_unit: str
     confirmation_relative_improvement: float | None
-    confirmation_ci95: tuple[float | None, float | None]
+    confirmation_familywise_relative_improvement_lower_bound: float | None
     bootstrap_replicates_valid: int
 
     @property
@@ -695,6 +714,131 @@ def _bootstrap_improvement(
     return observed, (float(low), float(high)), int(samples.size)
 
 
+def familywise_paired_document_bootstrap(
+    baseline: torch.Tensor,
+    candidates: Sequence[torch.Tensor],
+    *,
+    support: torch.Tensor | None = None,
+    replicates: int,
+    seed: int,
+    familywise_alpha: float = PHASE1_FAMILYWISE_ALPHA,
+    relative: bool = True,
+) -> FamilywiseBootstrap:
+    """Bootstrap paired document improvements with one draw matrix.
+
+    Every candidate uses the same resampled document indices.  The returned
+    lower bounds use the conservative one-sided Bonferroni quantile
+    ``familywise_alpha / comparisons``.
+    """
+
+    trials = tuple(candidates)
+    comparisons = len(trials)
+    if comparisons < 1:
+        raise ValueError("familywise bootstrap requires at least one comparison")
+    if isinstance(replicates, bool) or replicates < 100:
+        raise ValueError("bootstrap replicates must be at least 100")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("bootstrap seed must be an integer")
+    if (
+        isinstance(familywise_alpha, bool)
+        or not math.isfinite(familywise_alpha)
+        or not 0.0 < familywise_alpha < 1.0
+    ):
+        raise ValueError("familywise alpha must lie strictly between zero and one")
+    if baseline.ndim != 1:
+        raise ValueError("paired bootstrap baseline must be one-dimensional")
+    if any(candidate.shape != baseline.shape for candidate in trials):
+        raise ValueError("paired bootstrap candidates must match the baseline")
+    if support is None:
+        support = torch.ones(baseline.shape, dtype=torch.bool, device=baseline.device)
+    if support.dtype != torch.bool or support.shape != baseline.shape:
+        raise ValueError("bootstrap support mask has the wrong shape")
+
+    base = baseline[support].double().cpu()
+    candidate_values = tuple(candidate[support].double().cpu() for candidate in trials)
+    empty = tuple(None for _candidate in trials)
+    if (
+        base.numel() == 0
+        or not bool(torch.all(torch.isfinite(base)))
+        or bool(torch.any(base < 0))
+        or any(
+            not bool(torch.all(torch.isfinite(candidate)))
+            or bool(torch.any(candidate < 0))
+            for candidate in candidate_values
+        )
+    ):
+        return FamilywiseBootstrap(
+            familywise_alpha=familywise_alpha,
+            comparisons=comparisons,
+            resampling_unit=BOOTSTRAP_RESAMPLING_UNIT,
+            point_estimates=empty,
+            adjusted_lower_bounds=empty,
+            valid_replicates=0,
+        )
+
+    baseline_total = float(base.sum())
+    if relative and baseline_total <= 0:
+        return FamilywiseBootstrap(
+            familywise_alpha=familywise_alpha,
+            comparisons=comparisons,
+            resampling_unit=BOOTSTRAP_RESAMPLING_UNIT,
+            point_estimates=empty,
+            adjusted_lower_bounds=empty,
+            valid_replicates=0,
+        )
+    if relative:
+        point_estimates = tuple(
+            1.0 - float(candidate.sum()) / baseline_total
+            for candidate in candidate_values
+        )
+    else:
+        point_estimates = tuple(
+            float((base - candidate).sum()) for candidate in candidate_values
+        )
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    indices = torch.randint(
+        0,
+        base.numel(),
+        (replicates, base.numel()),
+        generator=generator,
+    )
+    sampled_baseline = base[indices].sum(dim=1)
+    valid = sampled_baseline > 0 if relative else torch.ones_like(
+        sampled_baseline, dtype=torch.bool
+    )
+    valid_replicates = int(valid.sum())
+    if valid_replicates == 0:
+        return FamilywiseBootstrap(
+            familywise_alpha=familywise_alpha,
+            comparisons=comparisons,
+            resampling_unit=BOOTSTRAP_RESAMPLING_UNIT,
+            point_estimates=point_estimates,
+            adjusted_lower_bounds=empty,
+            valid_replicates=0,
+        )
+
+    quantile = familywise_alpha / comparisons
+    lower_bounds: list[float] = []
+    for candidate in candidate_values:
+        if relative:
+            sampled_candidate = candidate[indices].sum(dim=1)
+            improvement = (
+                1.0 - sampled_candidate[valid] / sampled_baseline[valid]
+            )
+        else:
+            improvement = (base - candidate)[indices].sum(dim=1)[valid]
+        lower_bounds.append(float(torch.quantile(improvement, quantile)))
+    return FamilywiseBootstrap(
+        familywise_alpha=familywise_alpha,
+        comparisons=comparisons,
+        resampling_unit=BOOTSTRAP_RESAMPLING_UNIT,
+        point_estimates=point_estimates,
+        adjusted_lower_bounds=tuple(lower_bounds),
+        valid_replicates=valid_replicates,
+    )
+
+
 def select_phase1_mode(
     fit_sse: Mapping[int, torch.Tensor],
     confirmation_sse: Mapping[int, torch.Tensor],
@@ -794,22 +938,66 @@ def select_phase1_rate_pair(
     min_confirmation_documents: int = PHASE1_MIN_CONFIRMATION_DOCUMENTS,
     minimum_improvement: float = 0.0,
     bootstrap_replicates: int = PHASE1_BOOTSTRAP_REPLICATES,
+    familywise_comparisons: int | None = None,
     seed: int = PHASE1_SELECTION_SEED,
 ) -> RatePairSelection:
     """Select a coupled expert format while keeping both rate axes independent.
 
-    ``fit_sse`` is retained in the persisted evidence and checked for support,
-    but it is not used to rank formats: those same documents constructed the
-    encoder Hessians and channel order.  The disjoint confirmation fold ranks
-    the complete Cartesian ``(r13, r2)`` grid and then bootstrap-gates its
-    winner against R0/R0.
+    The fit documents construct the encoded candidates but are not reused to
+    rank their reconstruction error. The disjoint confirmation fold ranks the
+    complete Cartesian ``(r13, r2)`` grid. All non-R0 confirmation comparisons
+    share one document-resampling matrix, and the confirmation argmin is
+    accepted only when its one-sided Bonferroni lower bound clears the margin.
     """
 
     candidates = tuple((int(r13), int(r2)) for r13, r2 in modes)
-    if not candidates or candidates[0] != (0, 0) or len(set(candidates)) != len(candidates):
-        raise ValueError("rate-pair candidates must be unique and begin with R0/R0")
-    if set(fit_sse) != set(candidates) or set(confirmation_sse) != set(candidates):
-        raise ValueError("rate-pair SSE tables must contain every requested candidate")
+    if (
+        not candidates
+        or candidates[0] != (0, 0)
+        or len(set(candidates)) != len(candidates)
+    ):
+        raise ValueError(
+            "rate-pair candidates must be unique and begin with R0/R0"
+        )
+    supported_rates = set(PHASE1_MODE_IDS)
+    if any(
+        r13 not in supported_rates or r2 not in supported_rates
+        for r13, r2 in candidates
+    ):
+        raise ValueError("rate-pair candidates contain an unsupported rate ID")
+    if set(fit_sse) != set(candidates) or set(confirmation_sse) != set(
+        candidates
+    ):
+        raise ValueError(
+            "rate-pair SSE tables must contain every requested candidate"
+        )
+    if fit_counts.ndim != 1 or confirmation_counts.ndim != 1:
+        raise ValueError("rate-pair document counts must be one-dimensional")
+    if any(value.shape != fit_counts.shape for value in fit_sse.values()) or any(
+        value.shape != confirmation_counts.shape
+        for value in confirmation_sse.values()
+    ):
+        raise ValueError("rate-pair SSE vectors must match their document counts")
+    if not math.isfinite(minimum_improvement):
+        raise ValueError("minimum improvement must be finite")
+    comparison_modes = tuple(
+        candidate for candidate in candidates if candidate != (0, 0)
+    )
+    observed_comparisons = len(comparison_modes)
+    comparisons = (
+        observed_comparisons
+        if familywise_comparisons is None
+        else familywise_comparisons
+    )
+    if (
+        isinstance(comparisons, bool)
+        or not isinstance(comparisons, int)
+        or comparisons < 0
+        or (observed_comparisons > 0 and comparisons != observed_comparisons)
+    ):
+        raise ValueError(
+            "familywise comparison count must match the evaluated candidate grid"
+        )
     fit_support = fit_counts > 0
     confirmation_support = confirmation_counts > 0
     fit_documents = int(fit_support.sum())
@@ -822,7 +1010,7 @@ def select_phase1_rate_pair(
         accepted: bool,
         reason: str,
         improvement: float | None = None,
-        interval: tuple[float | None, float | None] = (None, None),
+        lower_bound: float | None = None,
         valid: int = 0,
     ) -> RatePairSelection:
         return RatePairSelection(
@@ -834,8 +1022,11 @@ def select_phase1_rate_pair(
             reason=reason,
             fit_documents=fit_documents,
             confirmation_documents=confirmation_documents,
+            familywise_alpha=PHASE1_FAMILYWISE_ALPHA,
+            familywise_comparisons=comparisons,
+            bootstrap_resampling_unit=BOOTSTRAP_RESAMPLING_UNIT,
             confirmation_relative_improvement=improvement,
-            confirmation_ci95=interval,
+            confirmation_familywise_relative_improvement_lower_bound=lower_bound,
             bootstrap_replicates_valid=valid,
         )
 
@@ -853,14 +1044,37 @@ def select_phase1_rate_pair(
             accepted=False,
             reason="insufficient confirmation-document support",
         )
+    fit_values = tuple(
+        fit_sse[candidate][fit_support].double() for candidate in candidates
+    )
+    if any(
+        not bool(torch.all(torch.isfinite(values))) or bool(torch.any(values < 0))
+        for values in fit_values
+    ):
+        return decision(
+            (0, 0),
+            (0, 0),
+            accepted=False,
+            reason="invalid fit-document SSE support",
+        )
+    confirmation_values = tuple(
+        confirmation_sse[candidate][confirmation_support].double()
+        for candidate in candidates
+    )
+    if any(
+        not bool(torch.all(torch.isfinite(values))) or bool(torch.any(values < 0))
+        for values in confirmation_values
+    ):
+        return decision(
+            (0, 0),
+            (0, 0),
+            accepted=False,
+            reason="invalid confirmation-document SSE support",
+        )
     proposed = min(
         candidates,
         key=lambda mode: (
-            float(
-                confirmation_sse[mode][confirmation_support]
-                .double()
-                .sum()
-            ),
+            float(confirmation_sse[mode][confirmation_support].double().sum()),
             mode[0] + mode[1],
             mode[0],
             mode[1],
@@ -873,28 +1087,33 @@ def select_phase1_rate_pair(
             accepted=False,
             reason="R0/R0 is the confirmation-document argmin",
         )
-    improvement, interval, valid = _bootstrap_improvement(
+    bootstrap = familywise_paired_document_bootstrap(
         confirmation_sse[(0, 0)],
-        confirmation_sse[proposed],
-        confirmation_support,
+        tuple(confirmation_sse[mode] for mode in comparison_modes),
+        support=confirmation_support,
         replicates=bootstrap_replicates,
         seed=seed,
+        familywise_alpha=PHASE1_FAMILYWISE_ALPHA,
+        relative=True,
     )
-    accepted = interval[0] is not None and interval[0] > minimum_improvement
-    if interval[0] is None:
-        reason = "confirmation bootstrap has no valid baseline samples"
-    elif interval[0] <= minimum_improvement:
-        reason = "confirmation lower confidence bound did not clear the margin"
+    proposed_column = comparison_modes.index(proposed)
+    improvement = bootstrap.point_estimates[proposed_column]
+    lower_bound = bootstrap.adjusted_lower_bounds[proposed_column]
+    accepted = lower_bound is not None and lower_bound > minimum_improvement
+    if lower_bound is None:
+        reason = "familywise bootstrap has no valid baseline samples"
+    elif lower_bound <= minimum_improvement:
+        reason = "familywise lower bound did not clear the margin"
     else:
-        reason = "confirmation lower confidence bound cleared the margin"
+        reason = "familywise lower bound cleared the margin"
     return decision(
         proposed,
         proposed if accepted else (0, 0),
         accepted=accepted,
         reason=reason,
         improvement=improvement,
-        interval=interval,
-        valid=valid,
+        lower_bound=lower_bound,
+        valid=bootstrap.valid_replicates,
     )
 
 

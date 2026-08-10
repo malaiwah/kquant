@@ -42,8 +42,12 @@ from kquant.logical_qsrt import (
 )
 from kquant.qsrt import pack_trellis_edges, unpack_trellis_states
 from kquant.qsrt_candidates import (
+    BOOTSTRAP_RESAMPLING_UNIT,
+    MODE_PROPOSAL_METRIC,
+    PHASE1_FAMILYWISE_ALPHA,
     PHASE1_MIN_CONFIRMATION_DOCUMENTS,
     PHASE1_MIN_FIT_DOCUMENTS,
+    RatePairSelection,
     build_expert_hessians,
     deterministic_expert_seed,
     functional_sse_by_request,
@@ -1199,7 +1203,7 @@ def _encode_identity_expert(
     else:
         r13 = r2 = 0
         selection = {
-            "policy": "activation_coupled_functional_sse_v1",
+            "policy": "activation_coupled_familywise_sse_v2",
             "calibrated_activations": True,
             "hessian_policy": (
                 "global_fit_h13_identity_h2_fallback"
@@ -1209,6 +1213,16 @@ def _encode_identity_expert(
             "accepted": False,
             "reason": force_r0_reason,
             "calibration_fingerprint": calibration_fingerprint,
+            "proposed": {"r13": 0, "r2": 0},
+            "selected": {"r13": 0, "r2": 0},
+            "mode_proposal_metric": MODE_PROPOSAL_METRIC,
+            "familywise_alpha": PHASE1_FAMILYWISE_ALPHA,
+            "familywise_comparisons": 8,
+            "bootstrap_resampling_unit": BOOTSTRAP_RESAMPLING_UNIT,
+            "bootstrap_replicates_valid": 0,
+            "confirmation_relative_improvement": None,
+            "confirmation_familywise_relative_improvement_lower_bound": None,
+            "external_validation_used": False,
         }
         if fallback_evidence is not None:
             selection["support"] = dict(fallback_evidence)
@@ -1300,6 +1314,39 @@ def _metric_summary(
         "normalized_sse": sse_total / energy_total if energy_total > 0 else None,
         "documents": int(torch.count_nonzero(counts)),
         "rows": int(counts.sum()),
+    }
+
+
+def _rate_pair_selection_evidence(
+    decision: RatePairSelection,
+) -> dict[str, object]:
+    """Serialize the complete statistical evidence behind a Fruit rate pair."""
+
+    return {
+        "proposed": {
+            "r13": decision.proposed_r13,
+            "r2": decision.proposed_r2,
+        },
+        "selected": {
+            "r13": decision.selected_r13,
+            "r2": decision.selected_r2,
+        },
+        "accepted": decision.accepted,
+        "reason": decision.reason,
+        "mode_proposal_metric": MODE_PROPOSAL_METRIC,
+        "fit_documents": decision.fit_documents,
+        "confirmation_documents": decision.confirmation_documents,
+        "familywise_alpha": decision.familywise_alpha,
+        "familywise_comparisons": decision.familywise_comparisons,
+        "bootstrap_resampling_unit": decision.bootstrap_resampling_unit,
+        "bootstrap_replicates_valid": decision.bootstrap_replicates_valid,
+        "confirmation_relative_improvement": (
+            decision.confirmation_relative_improvement
+        ),
+        "confirmation_familywise_relative_improvement_lower_bound": (
+            decision.confirmation_familywise_relative_improvement_lower_bound
+        ),
+        "external_validation_used": False,
     }
 
 
@@ -1491,28 +1538,12 @@ def _encode_calibrated_expert(
         else None
     )
     selection = {
-        "policy": "activation_coupled_functional_sse_v1",
+        "policy": "activation_coupled_familywise_sse_v2",
         "calibrated_activations": True,
         "hessian_policy": "global_fit_h13_candidate_conditional_expert_h2",
         "permutation_policy": "gate_square_post_silu_energy_h2_reverse",
         "calibration_fingerprint": calibration.fingerprint,
-        "proposed": {
-            "r13": decision.proposed_r13,
-            "r2": decision.proposed_r2,
-        },
-        "selected": {
-            "r13": decision.selected_r13,
-            "r2": decision.selected_r2,
-        },
-        "accepted": decision.accepted,
-        "reason": decision.reason,
-        "fit_documents": decision.fit_documents,
-        "confirmation_documents": decision.confirmation_documents,
-        "confirmation_relative_improvement": (
-            decision.confirmation_relative_improvement
-        ),
-        "confirmation_ci95": list(decision.confirmation_ci95),
-        "bootstrap_replicates_valid": decision.bootstrap_replicates_valid,
+        **_rate_pair_selection_evidence(decision),
         "group_score_min": float(group_scores.min().cpu()),
         "group_score_max": float(group_scores.max().cpu()),
         "candidate_conditional_h2": h2_evidence,
