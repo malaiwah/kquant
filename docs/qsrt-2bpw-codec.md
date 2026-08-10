@@ -22,7 +22,7 @@ g=zW_1^{\mathsf T},
 \qquad
 u=zW_3^{\mathsf T},
 \qquad
-h=\operatorname{SiTU}(g,u),
+h=\mathrm{SiTU}(g,u),
 \qquad
 y=hW_2^{\mathsf T}.
 $$
@@ -30,7 +30,7 @@ $$
 The coordinatewise activation is
 
 $$
-\operatorname{SiTU}(g,u)
+\mathrm{SiTU}(g,u)
 =\left[4\tanh(g/4)\,\sigma(g)\right]
  \odot
  \left[25\tanh(u/25)\right].
@@ -131,7 +131,7 @@ p &= (\mathtt{0x3FA7D929}\,x_1+
       \mathtt{0xC928FD8E})\bmod2^{32},\\
 \phi &= p\mathbin{\&}M,\\
 s &= p\gg30,\\
-j &= \operatorname{rev}_2(b)\oplus s,\\
+j &= \mathrm{rev}_2(b)\oplus s,\\
 r &= (j\ll14)\mathbin{|}\phi.
 \end{aligned}
 $$
@@ -180,7 +180,7 @@ The reconstruction value is scaled and rounded to the nearest finite E4M3
 number:
 
 $$
-Y(r)=\operatorname{RNE}_{\mathrm{E4M3FN}}(1.5z_r).
+Y(r)=\mathrm{RNE}_{\mathrm{E4M3FN}}(1.5z_r).
 $$
 
 E4M3 is an eight-bit floating-point reconstruction alphabet with one sign bit,
@@ -211,7 +211,7 @@ table. For table index $q$,
 
 $$
 Y_{12}(q)=
-\operatorname{mode}
+\mathrm{mode}
 \{Y(16q),Y(16q+1),\ldots,Y(16q+15)\},
 $$
 
@@ -249,7 +249,7 @@ activation.
 Interleave corresponding gate and up rows:
 
 $$
-Q_e=\operatorname{interleave}(W_{1,e},W_{3,e})
+Q_e=\mathrm{interleave}(W_{1,e},W_{3,e})
 \in\mathbb R^{6144\times3584}.
 $$
 
@@ -369,7 +369,7 @@ $$
 \widehat H_{2,e}
 =\alpha_e H^{\mathrm{sample}}_{2,e}
 +(1-\alpha_e)
-\frac{\operatorname{tr}(H^{\mathrm{sample}}_{2,e})}{d}I.
+\frac{\mathrm{tr}(H^{\mathrm{sample}}_{2,e})}{d}I.
 $$
 
 The identity term stabilizes poorly sampled directions without importing a

@@ -128,12 +128,12 @@ x_1 &= x_0\oplus((x_0\ll11)\mathbin{\&}M_w),\\
 p &= (\mathtt{0x3FA7D929}\,x_1+\mathtt{0xC928FD8E})\bmod2^{32},\\
 \phi &= p\mathbin{\&}M_w,\\
 s_K &= p\gg(32-K),\\
-j &= \operatorname{rev}_K(b)\oplus s_K,\\
+j &= \mathrm{rev}_K(b)\oplus s_K,\\
 G_K(h,b)=r &= (j\ll w)\mathbin{|}\phi.
 \end{aligned}
 $$
 
-Here $\operatorname{rev}_K$ reverses the $K$ branch bits. Both xorshifts are
+Here $\mathrm{rev}_K$ reverses the $K$ branch bits. Both xorshifts are
 triangular bijections on $w$ bits, and `0x3FA7D929` is odd, so multiplication
 by it is invertible modulo $2^w$. Therefore $h\mapsto\phi$ is a permutation.
 For fixed $h$, $b\mapsto j$ is also a permutation. It follows that
@@ -167,7 +167,7 @@ u_r=\frac{r+\tfrac12}{65536},
 \qquad
 z_r=\Phi^{-1}(u_r),
 \qquad
-Y(r)=\operatorname{RNE}_{\mathrm{E4M3FN}}(1.5z_r).
+Y(r)=\mathrm{RNE}_{\mathrm{E4M3FN}}(1.5z_r).
 $$
 
 An E4M3-aware piecewise Chebyshev construction is a compact synthesis of this
@@ -183,7 +183,7 @@ bytes. For $q\in\{0,\ldots,4095\}$, define
 
 $$
 Y_{12}(q)=
-\operatorname{mode}\{Y(16q),Y(16q+1),\ldots,Y(16q+15)\},
+\mathrm{mode}\{Y(16q),Y(16q+1),\ldots,Y(16q+15)\},
 $$
 
 with the lower unsigned E4M3 byte selected on a modal tie. Runtime
@@ -585,7 +585,7 @@ The coupled transform is an exact reparameterization of the full-precision
 expert. Let
 
 $$
-Q=\operatorname{interleave}(W_1,W_3)
+Q=\mathrm{interleave}(W_1,W_3)
 $$
 
 contain alternating gate and up rows. Let $U_R$ be the layer-shared normalized
@@ -664,7 +664,7 @@ $$
 \widehat H_{2,e}
 =\alpha_e H^{\mathrm{sample}}_{2,e}
 +(1-\alpha_e)
-\frac{\operatorname{tr}(H^{\mathrm{sample}}_{2,e})}{3072}I.
+\frac{\mathrm{tr}(H^{\mathrm{sample}}_{2,e})}{3072}I.
 $$
 
 Unsupported experts use identity. A layer-global post-SiTU covariance is
