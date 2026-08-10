@@ -281,6 +281,41 @@ def test_deferred_functional_sse_matches_reference(mask: torch.Tensor) -> None:
         assert torch.equal(plan.counts, expected_counts)
 
 
+def test_candidate_middle_propagates_selected_activation(monkeypatch) -> None:
+    activations = []
+
+    def recording_middle(
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        activation: str,
+    ) -> torch.Tensor:
+        activations.append(activation)
+        return gate + up
+
+    monkeypatch.setattr(packed_candidates, "expert_middle", recording_middle)
+    inputs = torch.eye(2)
+    upstream = {
+        "w1": {
+            0: SimpleNamespace(reconstruction=torch.eye(2)),
+            1: SimpleNamespace(reconstruction=2.0 * torch.eye(2)),
+        },
+        "w3": {
+            0: SimpleNamespace(reconstruction=3.0 * torch.eye(2)),
+            1: SimpleNamespace(reconstruction=4.0 * torch.eye(2)),
+        },
+    }
+
+    result = _candidate_middle_by_r13(
+        inputs,
+        upstream,
+        (0, 1),
+        activation="silu",
+    )
+
+    assert activations == ["silu", "silu"]
+    torch.testing.assert_close(result[0], 4.0 * torch.eye(2))
+    torch.testing.assert_close(result[1], 6.0 * torch.eye(2))
+
 def test_conditional_h2_uses_each_decoded_upstream_candidate() -> None:
     inputs = torch.tensor(
         [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 0.5]]

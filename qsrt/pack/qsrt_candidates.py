@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from collections.abc import Mapping
-from typing import Literal, Protocol, Sequence
+from typing import Literal, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +16,7 @@ from qsrt.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     reconstruct_trellis_states,
 )
+from qsrt.expert_activation import ExpertActivation, expert_middle
 from qsrt.qsrt_candidates import (
     PERMUTATION_POLICIES,
     PermutationPolicy,
@@ -58,7 +59,6 @@ from qsrt.pack.qsrt_encoder import (
     quantize_qsrt_matrix_expert_batch,
 )
 from qsrt.tp_simulator import situ
-
 
 CANDIDATE_POOL_KIND = "qsrt_kimi_k3_qsrt_candidate_pool"
 CANDIDATE_POOL_SCHEMA_VERSION = 6
@@ -171,9 +171,12 @@ class QSRTCandidateEncoding:
 
 
 def _source_middle(
-    gate_projection: torch.Tensor, up_projection: torch.Tensor
+    gate_projection: torch.Tensor,
+    up_projection: torch.Tensor,
+    *,
+    activation: ExpertActivation = "situ",
 ) -> torch.Tensor:
-    return situ(gate_projection, up_projection)
+    return expert_middle(gate_projection, up_projection, activation)
 
 
 def _folded_intermediate_conditioning(
@@ -406,13 +409,16 @@ def _candidate_middle_by_r13(
     inputs: torch.Tensor,
     upstream: dict[str, dict[int, QSRTMatrixCandidate]],
     evaluated_modes: Sequence[int],
+    *,
+    activation: ExpertActivation = "situ",
 ) -> dict[int, torch.Tensor]:
-    """Replay exact candidate reconstructions through Kimi's SiTU."""
+    """Replay exact candidate reconstructions through the selected activation."""
 
     return {
         int(r13): _source_middle(
             F.linear(inputs, upstream["w1"][int(r13)].reconstruction),
             F.linear(inputs, upstream["w3"][int(r13)].reconstruction),
+            activation=activation,
         )
         for r13 in evaluated_modes
     }
@@ -598,6 +604,7 @@ def encode_phase1_expert(
     device: torch.device,
     shared_scale_scope: object,
     mode_ids: Sequence[int] = PHASE1_MODE_IDS,
+    activation: ExpertActivation = "situ",
     quantizer_module: object | None = None,
     min_fit_documents: int = 6,
     min_confirmation_documents: int = 4,
@@ -658,7 +665,9 @@ def encode_phase1_expert(
     if all_rows.rows:
         source_gate = F.linear(inputs, source_w1)
         source_up = F.linear(inputs, source_w3)
-        source_middle = _source_middle(source_gate, source_up)
+        source_middle = _source_middle(
+            source_gate, source_up, activation=activation
+        )
         del source_gate, source_up
     else:
         source_middle = torch.empty(
@@ -681,7 +690,7 @@ def encode_phase1_expert(
             "h13_local_alpha": 0.0,
         }
         context_basis = (
-            f"official_source_post_situ_fit_documents:{permutation_policy}"
+            f"official_source_post_{activation}_fit_documents:{permutation_policy}"
         )
         covariance = {
             **covariance,
@@ -746,7 +755,10 @@ def encode_phase1_expert(
     del source_w1, source_w3
 
     middle_by_r13 = _candidate_middle_by_r13(
-        inputs, upstream_candidates, evaluated_modes
+        inputs,
+        upstream_candidates,
+        evaluated_modes,
+        activation=activation,
     )
     h2_by_r13, h2_evidence = _conditional_h2_by_r13(
         inputs,
@@ -765,7 +777,7 @@ def encode_phase1_expert(
                 "identity"
                 if hessian_policy == "identity"
                 else (
-                    "decoded_candidate_post_situ_adaptive_shrinkage"
+                    f"decoded_candidate_post_{activation}_adaptive_shrinkage"
                     if have_local_support
                     else "identity_support_fallback"
                 )
@@ -773,7 +785,7 @@ def encode_phase1_expert(
             "h2_by_r13": h2_evidence,
         }
     )
-    context_basis += "+decoded_candidate_post_situ_h2"
+    context_basis += f"+decoded_candidate_post_{activation}_h2"
 
     source_w2 = _load_source_matrix(store, layer, expert, "w2", device)
     if all_rows.rows:
@@ -959,6 +971,7 @@ def encode_phase1_expert_batch(
     device: torch.device,
     shared_scale_scope: object,
     mode_ids: Sequence[int] = PHASE1_MODE_IDS,
+    activation: ExpertActivation = "situ",
     quantizer_module: object | None = None,
     min_fit_documents: int = 6,
     min_confirmation_documents: int = 4,
@@ -1048,7 +1061,9 @@ def encode_phase1_expert_batch(
         if all_rows.rows:
             source_gate = F.linear(inputs, source_w1)
             source_up = F.linear(inputs, source_w3)
-            source_middle = _source_middle(source_gate, source_up)
+            source_middle = _source_middle(
+                source_gate, source_up, activation=activation
+            )
             del source_gate, source_up
         else:
             source_middle = torch.empty(
@@ -1064,7 +1079,8 @@ def encode_phase1_expert_batch(
                 policy=permutation_policy,
             )
             context_basis = (
-                f"official_source_post_situ_fit_documents:{permutation_policy}"
+                f"official_source_post_{activation}_fit_documents:"
+                f"{permutation_policy}"
             )
         else:
             block_contexts = fallback_block_contexts.clone()
@@ -1225,7 +1241,10 @@ def encode_phase1_expert_batch(
         execution_basis = item["coupled_execution"]
         if execution_basis is None:
             middle_by_r13 = _candidate_middle_by_r13(
-                inputs, upstream, evaluated_modes
+                inputs,
+                upstream,
+                evaluated_modes,
+                activation=activation,
             )
         else:
             middle_by_r13 = {
@@ -1233,6 +1252,7 @@ def encode_phase1_expert_batch(
                     inputs,
                     upstream["w1"][int(r13)].reconstruction,
                     upstream["w3"][int(r13)].reconstruction,
+                    activation=activation,
                 )
                 for r13 in evaluated_modes
             }
@@ -1256,7 +1276,7 @@ def encode_phase1_expert_batch(
                     "identity"
                     if hessian_policy == "identity"
                     else (
-                        "decoded_candidate_post_situ_adaptive_shrinkage"
+                        f"decoded_candidate_post_{activation}_adaptive_shrinkage"
                         if int(item["covariance"]["fit_documents"])
                         >= min_fit_documents
                         else "identity_support_fallback"
@@ -1266,7 +1286,8 @@ def encode_phase1_expert_batch(
             }
         )
         item["context_basis"] = (
-            str(item["context_basis"]) + "+decoded_candidate_post_situ_h2"
+            str(item["context_basis"])
+            + f"+decoded_candidate_post_{activation}_h2"
         )
         all_rows = item["all_rows"]
         if item["coupled_reference_output"] is not None:

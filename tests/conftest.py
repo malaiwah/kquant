@@ -14,17 +14,19 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+import scripts.qsrt_import_guard  # noqa: F401
+
+# isort: split
 import qsrt.constants as C
 from qsrt.io import mxfp4
 
-MINI = dict(layers=(1, 2), experts=4, latent=64, inter=96)
+MINI = {"layers": (1, 2), "experts": 4, "latent": 64, "inter": 96}
 
 
 def _rand_expert(rng: torch.Generator, out: int, k: int):
     codes = torch.randint(0, 16, (out, k), dtype=torch.uint8, generator=rng)
     packed = mxfp4.pack_codes(codes)
-    scale = torch.randint(105, 130, (out, k // 32), dtype=torch.uint8,
-                          generator=rng)
+    scale = torch.randint(105, 130, (out, k // 32), dtype=torch.uint8, generator=rng)
     return packed, scale
 
 
@@ -52,18 +54,24 @@ def mini_ckpt(tmp_path_factory) -> Path:
                 packed, scale = _rand_expert(rng, out, k)
                 put(shard, C.expert_tensor(layer, e, m, "weight_packed"), packed)
                 put(shard, C.expert_tensor(layer, e, m, "weight_scale"), scale)
-        put(shard, C.router_bias_tensor(layer),
-            torch.randn(E, generator=rng).float())
-        put(shard, C.router_weight_tensor(layer),
-            torch.randn(E, 32, generator=rng).bfloat16())
-        put(shard, C.latent_up_proj_tensor(layer),
-            torch.randn(48, lat, generator=rng).bfloat16())
+        put(shard, C.router_bias_tensor(layer), torch.randn(E, generator=rng).float())
+        put(
+            shard,
+            C.router_weight_tensor(layer),
+            torch.randn(E, 32, generator=rng).bfloat16(),
+        )
+        put(
+            shard,
+            C.latent_up_proj_tensor(layer),
+            torch.randn(48, lat, generator=rng).bfloat16(),
+        )
 
     for shard, tensors in shard_tensors.items():
         save_file(tensors, str(snap / shard))
     total = sum(
         t.numel() * t.element_size()
-        for ts in shard_tensors.values() for t in ts.values()
+        for ts in shard_tensors.values()
+        for t in ts.values()
     )
     (snap / C.INDEX_FILE).write_text(
         json.dumps({"metadata": {"total_size": total}, "weight_map": weight_map})

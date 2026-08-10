@@ -75,6 +75,41 @@ def test_production_coupled_transform_closes_and_matches_research_oracle() -> No
     assert torch.allclose(output, research_output, rtol=2e-5, atol=2e-5)
 
 
+def test_production_coupled_transform_respects_silu_activation() -> None:
+    generator = torch.Generator().manual_seed(872)
+    rows, hidden, intermediate = 7, 16, 12
+    weights = (
+        torch.randn(intermediate, hidden, generator=generator),
+        torch.randn(intermediate, hidden, generator=generator),
+        torch.randn(hidden, intermediate, generator=generator),
+    )
+    inputs = torch.randn(rows, hidden, generator=generator)
+    spec = CoupledHadamardSpec(
+        residual_block_size=8,
+        preactivation_block_size=8,
+        postactivation_block_size=4,
+        intermediate_draw=2,
+    )
+    encoded = encode_coupled_weights(weights, spec)
+    execution = coupled_execution(encoded, spec)
+
+    transformed_inputs = execution.transform_inputs(inputs)
+    middle = execution.decode_middle(
+        transformed_inputs,
+        encoded[0],
+        encoded[1],
+        activation="silu",
+    )
+    actual = execution.decode_output(torch.nn.functional.linear(middle, encoded[2]))
+    reference = torch.nn.functional.linear(
+        torch.nn.functional.silu(torch.nn.functional.linear(inputs, weights[0]))
+        * torch.nn.functional.linear(inputs, weights[1]),
+        weights[2],
+    )
+
+    assert torch.allclose(actual, reference, rtol=2e-5, atol=2e-5)
+
+
 def test_coupled_hessian_transforms_preserve_quadratic_forms() -> None:
     generator = torch.Generator().manual_seed(91)
     hidden, intermediate = 16, 12
