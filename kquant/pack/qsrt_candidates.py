@@ -33,7 +33,6 @@ from kquant.qsrt import (
     H308,
     K2,
     PHASE1_MODE_IDS,
-    RATE_TRANSFER_MODES,
     RECORDS_PER_EXPERT,
     SCHEMA,
     ExpertFormatSpec,
@@ -58,7 +57,6 @@ from kquant.qsrt_coupled import (
     coupled_execution,
     encode_coupled_weights,
 )
-from kquant.tp_simulator import situ
 
 CANDIDATE_POOL_KIND = "kquant_kimi_k3_qsrt_candidate_pool"
 CANDIDATE_POOL_SCHEMA_VERSION = 6

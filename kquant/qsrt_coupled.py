@@ -17,7 +17,6 @@ import torch.nn.functional as F
 
 from kquant.expert_activation import ExpertActivation, expert_middle
 
-
 Tensor = torch.Tensor
 WeightTriplet = tuple[Tensor, Tensor, Tensor]
 

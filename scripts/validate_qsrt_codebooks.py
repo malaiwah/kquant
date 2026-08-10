@@ -45,7 +45,13 @@ from kquant.expert_activation import (
 )
 from kquant.ldlq import SIGMA_REG, make_shared_h
 from kquant.pack.qsrt_encoder import plan_qsrt_matrix
-from kquant.sqg_e4m3 import sqg_xor_cheb_t12_bytes
+from kquant.qsrt import (
+    RATE_TRANSFER_MODES,
+    RECORDS_PER_EXPERT,
+    TILES_PER_RECORD_AXIS,
+    matrix_rate_axis,
+    unpack_trellis_states,
+)
 from kquant.qsrt_candidates import (
     RequestPartition,
     activation_block_contexts,
@@ -54,13 +60,6 @@ from kquant.qsrt_candidates import (
     request_documents,
     select_expert_rows,
 )
-from kquant.qsrt import (
-    RATE_TRANSFER_MODES,
-    RECORDS_PER_EXPERT,
-    TILES_PER_RECORD_AXIS,
-    matrix_rate_axis,
-    unpack_trellis_states,
-)
 from kquant.source_weights import OfficialMXFP4Store
 from kquant.sqg_e4m3 import (
     SQG_CHEB_NORMAL_E4M3,
@@ -68,6 +67,7 @@ from kquant.sqg_e4m3 import (
     sqg_e4m3_bytes,
     sqg_e4m3_bytes_from_rank_lut,
     sqg_e4m3_codebook,
+    sqg_xor_cheb_t12_bytes,
 )
 from kquant.sqg_quantizer import install_sqg_quantizer
 from kquant.tp_simulator import comparison_metrics
