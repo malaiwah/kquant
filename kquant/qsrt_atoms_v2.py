@@ -1,10 +1,8 @@
 """Revision-two TP-independent QSRT atom storage.
 
-Atoms-v2 retains the 96-row atom-major container used by atoms-v1.  Its
-fixed H308 profile gives two physical record pairs a seven-bit P43 payload
-and the other ten pairs a six-bit P33 payload.  Each atom row therefore stores
-two compact, fixed-width expert groups instead of padding every expert to the
-larger P43 bundle.
+Atoms-v2 retains the 96-row atom-major container used by atoms-v1. Its profiles
+either store the fixed H308 P33/P43 groups or one uniform P22 group. The format
+section also carries the expert-static coupled-Hadamard draw for pure K2.
 """
 
 from __future__ import annotations
@@ -19,6 +17,7 @@ from kquant.qsrt import (
     FIXED_HIGH_RATE_RECORD_BITS,
     FORMAT_SECTION_BYTES,
     INTERMEDIATE_CHANNELS,
+    K2,
     LATENT_CHANNELS,
     LAYER_HEADER_BYTES,
     PAIRS_PER_EXPERT,
@@ -28,6 +27,7 @@ from kquant.qsrt import (
     STORAGE_ALIGNMENT,
     align_up,
     pair_rotation,
+    ExpertFormatSpec,
 )
 from kquant.qsrt_storage import (
     ATOM_CHANNELS,
@@ -49,6 +49,9 @@ ENCODING = "qsrt_sqg_e4m3"
 CODEBOOK = "sqg_xor_cheb_t12"
 PROFILE = "k3x22_k4x2"
 PROFILE_ID = 2
+PURE_K2_PROFILE = "k2_coupled_h512_h128"
+PURE_K2_PROFILE_ID = 3
+SUPPORTED_PROFILES = (PROFILE, PURE_K2_PROFILE)
 
 K3_RECORDS = FIXED_HIGH_RATE_RECORD_BITS.count(3)
 K4_RECORDS = FIXED_HIGH_RATE_RECORD_BITS.count(4)
@@ -60,13 +63,18 @@ P33_MATRIX_TRELLIS_BYTES = ATOM_CHANNELS * LATENT_CHANNELS * 3 // 8
 P43_MATRIX_TRELLIS_BYTES = (
     ATOM_SIDE_CHANNELS * LATENT_CHANNELS * (4 + 3) // 8
 )
+P22_MATRIX_TRELLIS_BYTES = (
+    ATOM_SIDE_CHANNELS * LATENT_CHANNELS * (2 + 2) // 8
+)
 P33_ATOM_BUNDLE_BYTES = 3 * P33_MATRIX_TRELLIS_BYTES + ATOM_SCALE_BYTES
 P43_ATOM_BUNDLE_BYTES = 3 * P43_MATRIX_TRELLIS_BYTES + ATOM_SCALE_BYTES
+P22_ATOM_BUNDLE_BYTES = 3 * P22_MATRIX_TRELLIS_BYTES + ATOM_SCALE_BYTES
 
 _SAFETENSORS_HEADER_LENGTH = struct.Struct("<Q")
 FORMAT_TENSOR = "_qsrt_format_section"
 SHARED_SCALE_TENSOR = "_qsrt_shared_scale_section"
 ATOM_TENSOR = "qsrt_atoms"
+ROTATION_DRAW_OFFSET = EXPERTS_PER_LAYER
 
 
 def _validate_layer(layer: int) -> None:
@@ -157,14 +165,28 @@ def atom_pair(physical_atom: int) -> int:
 @dataclass(frozen=True)
 class QSRTAtomsV2Layout:
     layer: int
+    profile: str = PROFILE
 
     def __post_init__(self) -> None:
         _validate_layer(self.layer)
+        if self.profile not in SUPPORTED_PROFILES:
+            raise ValueError(f"unsupported QSRT atoms-v2 profile: {self.profile}")
+
+    @property
+    def pure_k2(self) -> bool:
+        return self.profile == PURE_K2_PROFILE
 
     def group_experts(self, physical_atom: int, *, p43: bool) -> tuple[int, ...]:
+        if self.pure_k2:
+            atom_pair(physical_atom)
+            return () if p43 else tuple(range(EXPERTS_PER_LAYER))
         return pair_experts(self.layer, atom_pair(physical_atom), p43=p43)
 
     def group_bundle_bytes(self, *, p43: bool) -> int:
+        if self.pure_k2:
+            if p43:
+                raise ValueError("pure-K2 atoms do not contain a P43 group")
+            return P22_ATOM_BUNDLE_BYTES
         return P43_ATOM_BUNDLE_BYTES if p43 else P33_ATOM_BUNDLE_BYTES
 
     def group_payload_bytes(self, physical_atom: int, *, p43: bool) -> int:
@@ -173,6 +195,8 @@ class QSRTAtomsV2Layout:
         )
 
     def atom_slot_payload_bytes(self, physical_atom: int) -> int:
+        if self.pure_k2:
+            return self.group_payload_bytes(physical_atom, p43=False)
         return self.group_payload_bytes(
             physical_atom, p43=False
         ) + self.group_payload_bytes(physical_atom, p43=True)
@@ -204,6 +228,13 @@ class QSRTAtomsV2Layout:
         )
 
     def bundle_offset(self, physical_atom: int, expert: int) -> int:
+        if self.pure_k2:
+            if not 0 <= expert < EXPERTS_PER_LAYER:
+                raise ValueError(f"expert must lie in 0..{EXPERTS_PER_LAYER - 1}")
+            return (
+                self.group_offset(physical_atom, p43=False)
+                + expert * P22_ATOM_BUNDLE_BYTES
+            )
         p43 = expert_pair_is_p43(self.layer, expert, atom_pair(physical_atom))
         experts = self.group_experts(physical_atom, p43=p43)
         try:
@@ -241,21 +272,25 @@ class QSRTAtomsV2Layout:
         )
 
     def to_manifest(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "schema": SCHEMA,
             "version": VERSION,
             "encoding": ENCODING,
             "codebook": CODEBOOK,
-            "profile": PROFILE,
+            "profile": self.profile,
             "atom_channels": ATOM_CHANNELS,
             "atom_slots": ATOMS_PER_EXPERT,
-            "p33_atom_bundle_bytes": P33_ATOM_BUNDLE_BYTES,
-            "p43_atom_bundle_bytes": P43_ATOM_BUNDLE_BYTES,
             "atom_slot_stride_bytes": self.atom_slot_stride_bytes,
             "compressed_payload_bytes": self.compressed_payload_bytes,
             "disk_bytes": self.disk_bytes,
             "equal_shard_counts": list(EQUAL_SHARD_COUNTS),
         }
+        if self.pure_k2:
+            result["p22_atom_bundle_bytes"] = P22_ATOM_BUNDLE_BYTES
+        else:
+            result["p33_atom_bundle_bytes"] = P33_ATOM_BUNDLE_BYTES
+            result["p43_atom_bundle_bytes"] = P43_ATOM_BUNDLE_BYTES
+        return result
 
 
 @dataclass(frozen=True)
@@ -270,25 +305,33 @@ class QSRTAtomsV2Header:
 
     def _document(self) -> dict[str, object]:
         atom_data_bytes = ATOMS_PER_EXPERT * self.layout.atom_slot_stride_bytes
+        profile_id = PURE_K2_PROFILE_ID if self.layout.pure_k2 else PROFILE_ID
         metadata = {
             "format": "pt",
             "schema": SCHEMA,
             "version": str(VERSION),
             "encoding": ENCODING,
             "codebook": CODEBOOK,
-            "profile": PROFILE,
-            "profile_id": str(PROFILE_ID),
+            "profile": self.layout.profile,
+            "profile_id": str(profile_id),
             "layer": str(self.layer),
             "experts": str(EXPERTS_PER_LAYER),
             "intermediate_channels": str(INTERMEDIATE_CHANNELS),
             "latent_channels": str(LATENT_CHANNELS),
             "atom_channels": str(ATOM_CHANNELS),
             "atom_slots": str(ATOMS_PER_EXPERT),
-            "p33_atom_bundle_bytes": str(P33_ATOM_BUNDLE_BYTES),
-            "p43_atom_bundle_bytes": str(P43_ATOM_BUNDLE_BYTES),
             "atom_slot_stride_bytes": str(self.layout.atom_slot_stride_bytes),
             "alignment_bytes": str(STORAGE_ALIGNMENT),
         }
+        if self.layout.pure_k2:
+            metadata["p22_atom_bundle_bytes"] = str(P22_ATOM_BUNDLE_BYTES)
+            metadata["residual_hadamard_block_size"] = "512"
+            metadata["preactivation_hadamard_block_size"] = "128"
+            metadata["postactivation_hadamard_block_size"] = "128"
+            metadata["intermediate_rotation_draws"] = "format_section[896:1792]"
+        else:
+            metadata["p33_atom_bundle_bytes"] = str(P33_ATOM_BUNDLE_BYTES)
+            metadata["p43_atom_bundle_bytes"] = str(P43_ATOM_BUNDLE_BYTES)
         return {
             "__metadata__": metadata,
             FORMAT_TENSOR: {
@@ -340,7 +383,8 @@ class QSRTAtomsV2Header:
             document = json.loads(payload[8:].decode("utf-8"))
             metadata = document["__metadata__"]
             layer = int(metadata["layer"])
-            result = cls(layer, QSRTAtomsV2Layout(layer))
+            profile = str(metadata["profile"])
+            result = cls(layer, QSRTAtomsV2Layout(layer, profile=profile))
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("QSRT atoms-v2 header is malformed") from exc
         if document != result._document():
@@ -352,6 +396,65 @@ if P33_ATOM_BUNDLE_BYTES != 129216:
     raise AssertionError("atoms-v2 P33 bundles must close atoms-v1 geometry")
 if P43_ATOM_BUNDLE_BYTES != 150720:
     raise AssertionError("atoms-v2 P43 bundle accounting drifted")
+if P22_ATOM_BUNDLE_BYTES != 86208:
+    raise AssertionError("atoms-v2 P22 bundle accounting drifted")
+
+
+def pack_atoms_v2_format_section(
+    profile: str, rotation_draws: tuple[int, ...] | None = None
+):
+    """Pack formats and optional pure-K2 expert rotation draws."""
+
+    import torch
+
+    if profile not in SUPPORTED_PROFILES:
+        raise ValueError(f"unsupported QSRT atoms-v2 profile: {profile}")
+    if profile == PROFILE:
+        if rotation_draws is not None:
+            raise ValueError("H308 atoms must not carry rotation draws")
+        from kquant.qsrt import pack_qsrt_format_section
+
+        return pack_qsrt_format_section(
+            [ExpertFormatSpec.compressed(3)] * EXPERTS_PER_LAYER
+        )
+    if rotation_draws is None or len(rotation_draws) != EXPERTS_PER_LAYER:
+        raise ValueError("pure-K2 atoms require one rotation draw per expert")
+    if any(isinstance(draw, bool) or not 0 <= draw < 8 for draw in rotation_draws):
+        raise ValueError("pure-K2 rotation draws must lie in 0..7")
+    result = torch.zeros(FORMAT_SECTION_BYTES, dtype=torch.uint8)
+    result[:EXPERTS_PER_LAYER] = ExpertFormatSpec.compressed(K2.mode_id).code
+    result[
+        ROTATION_DRAW_OFFSET : ROTATION_DRAW_OFFSET + EXPERTS_PER_LAYER
+    ] = torch.tensor(rotation_draws, dtype=torch.uint8)
+    return result
+
+
+def unpack_atoms_v2_format_section(profile: str, payload):
+    """Return ``(format names, rotation draws)`` for one atoms-v2 section."""
+
+    import torch
+
+    if payload.dtype != torch.uint8 or payload.ndim != 1:
+        raise TypeError("atoms-v2 format section must be a flat uint8 tensor")
+    if payload.numel() != FORMAT_SECTION_BYTES:
+        raise ValueError("atoms-v2 format section must contain exactly 4096 bytes")
+    if profile == PROFILE:
+        from kquant.qsrt import unpack_qsrt_format_section
+
+        return unpack_qsrt_format_section(payload), None
+    if profile != PURE_K2_PROFILE:
+        raise ValueError(f"unsupported QSRT atoms-v2 profile: {profile}")
+    expected = ExpertFormatSpec.compressed(K2.mode_id).code
+    if bool(torch.any(payload[:EXPERTS_PER_LAYER] != expected)):
+        raise ValueError("pure-K2 atoms contain a non-K2 expert")
+    draws = payload[
+        ROTATION_DRAW_OFFSET : ROTATION_DRAW_OFFSET + EXPERTS_PER_LAYER
+    ]
+    if bool(torch.any(draws > 7)):
+        raise ValueError("pure-K2 atoms contain an invalid rotation draw")
+    if bool(torch.any(payload[ROTATION_DRAW_OFFSET + EXPERTS_PER_LAYER :] != 0)):
+        raise ValueError("pure-K2 format section has nonzero alignment padding")
+    return (K2.name,) * EXPERTS_PER_LAYER, tuple(int(x) for x in draws.tolist())
 
 
 __all__ = [
@@ -367,8 +470,12 @@ __all__ = [
     "P33_MATRIX_TRELLIS_BYTES",
     "P43_ATOM_BUNDLE_BYTES",
     "P43_MATRIX_TRELLIS_BYTES",
+    "P22_ATOM_BUNDLE_BYTES",
+    "P22_MATRIX_TRELLIS_BYTES",
     "PROFILE",
     "PROFILE_ID",
+    "PURE_K2_PROFILE",
+    "PURE_K2_PROFILE_ID",
     "QSRTAtomsV2Header",
     "QSRTAtomsV2Layout",
     "SCHEMA",
@@ -378,5 +485,7 @@ __all__ = [
     "expert_pair_is_p43",
     "logical_rate_record_index",
     "pair_experts",
+    "pack_atoms_v2_format_section",
     "physical_to_logical_records",
+    "unpack_atoms_v2_format_section",
 ]

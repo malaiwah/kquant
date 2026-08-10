@@ -187,6 +187,9 @@ def _external_transform(
     intermediate_draw: int,
     sign_draw: int,
     scale_gauge: tuple[str, float],
+    block_size: int,
+    preactivation_block_size: int,
+    postactivation_block_size: int,
 ) -> CoupledTriplet:
     gauged = apply_w3_w2_scale_gauge(
         apply_w3_w2_sign_draw(source, draw=sign_draw),
@@ -195,7 +198,9 @@ def _external_transform(
     )
     return encode_coupled_block_hadamard(
         gauged,
-        block_size=512,
+        block_size=block_size,
+        preactivation_block_size=preactivation_block_size,
+        postactivation_block_size=postactivation_block_size,
         residual_rotation_draw=residual_draw,
         intermediate_rotation_draw=intermediate_draw,
     )
@@ -208,6 +213,9 @@ def _execute_arm(
     *,
     residual_draw: int,
     intermediate_draw: int,
+    block_size: int,
+    preactivation_block_size: int,
+    postactivation_block_size: int,
 ) -> torch.Tensor:
     if arm == "baseline":
         return expert_hidden(inputs, reconstruction) @ reconstruction.down.T
@@ -216,7 +224,9 @@ def _execute_arm(
     return execute_coupled_block_hadamard(
         inputs,
         reconstruction,
-        block_size=512,
+        block_size=block_size,
+        preactivation_block_size=preactivation_block_size,
+        postactivation_block_size=postactivation_block_size,
         residual_rotation_draw=residual_draw,
         intermediate_rotation_draw=intermediate_draw,
     )
@@ -233,6 +243,7 @@ def _encode_triplet(
     device: torch.device,
     quantizer_module: Any,
     ldlq_tf32: bool,
+    tailbite_context: int,
 ) -> tuple[CoupledTriplet, list[dict[str, Any]]]:
     reconstructions = []
     evidence = []
@@ -250,6 +261,7 @@ def _encode_triplet(
             scale_scope_key=(KIND, layer, expert, arm, codebook, matrix, bits),
             g_scale_into_sv=matrix in ("w1", "w3"),
             ldlq_tf32=ldlq_tf32,
+            tailbite_context=tailbite_context,
         )
         reconstructions.append(result["reconstruction"].float())
         evidence.append(result["payload"])
@@ -267,6 +279,9 @@ def _score(
     evidence: list[dict[str, Any]],
     residual_draw: int,
     intermediate_draw: int,
+    block_size: int,
+    preactivation_block_size: int,
+    postactivation_block_size: int,
 ) -> dict[str, Any]:
     source_output = expert_hidden(rows["inputs"], source) @ source.down.T
     encoded_source_output = _execute_arm(
@@ -275,6 +290,9 @@ def _score(
         arm,
         residual_draw=residual_draw,
         intermediate_draw=intermediate_draw,
+        block_size=block_size,
+        preactivation_block_size=preactivation_block_size,
+        postactivation_block_size=postactivation_block_size,
     )
     output = _execute_arm(
         rows["inputs"],
@@ -282,6 +300,9 @@ def _score(
         arm,
         residual_draw=residual_draw,
         intermediate_draw=intermediate_draw,
+        block_size=block_size,
+        preactivation_block_size=preactivation_block_size,
+        postactivation_block_size=postactivation_block_size,
     )
     error = output - source_output
 
@@ -356,6 +377,24 @@ def parse_args() -> argparse.Namespace:
         help="one residual-side signed-Hadamard draw shared by the layer",
     )
     parser.add_argument(
+        "--coupled-hadamard-block-size",
+        type=int,
+        choices=(64, 128, 256, 512),
+        default=512,
+    )
+    parser.add_argument(
+        "--coupled-hadamard-preactivation-block-size",
+        type=int,
+        choices=(64, 128, 256, 512, 1024, 2048),
+        default=512,
+    )
+    parser.add_argument(
+        "--coupled-hadamard-postactivation-block-size",
+        type=int,
+        choices=(64, 128, 256, 512, 1024),
+        default=512,
+    )
+    parser.add_argument(
         "--coupled-intermediate-draws",
         type=_parse_expert_draws,
         default={},
@@ -377,6 +416,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exllamav3-root", type=Path, default=Path("/home/luke/projects/exllamav3"))
     parser.add_argument("--official-revision", default=C.REVISION)
     parser.add_argument("--ldlq-tf32", action="store_true")
+    parser.add_argument(
+        "--tailbite-context",
+        type=int,
+        default=128,
+        help="cyclic Viterbi screening context (1..128)",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -392,6 +437,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--arms supports baseline and coupled_hadamard")
     if args.maximum_rows <= 0:
         parser.error("--maximum-rows must be positive")
+    if not 1 <= args.tailbite_context <= 128:
+        parser.error("--tailbite-context must lie in 1..128")
     if args.coupled_residual_draw < 0:
         parser.error("--coupled-residual-draw must be nonnegative")
     if any(
@@ -435,6 +482,13 @@ def main() -> None:
         "validation_manifest_sha256": _sha256(args.validation_cache / "manifest.json"),
         "maximum_rows": args.maximum_rows,
         "coupled_rotations": {
+            "residual_block_size": args.coupled_hadamard_block_size,
+            "preactivation_block_size": (
+                args.coupled_hadamard_preactivation_block_size
+            ),
+            "postactivation_block_size": (
+                args.coupled_hadamard_postactivation_block_size
+            ),
             "residual_layer_shared": args.coupled_residual_draw,
             "intermediate_by_expert": {
                 str(expert): draw
@@ -452,6 +506,7 @@ def main() -> None:
             for expert, (policy, strength) in sorted(args.w3_w2_scale_gauges.items())
         },
         "ldlq_tf32": args.ldlq_tf32,
+        "tailbite_context": args.tailbite_context,
         "no_qat": True,
         "writes_checkpoint_payloads": False,
     }
@@ -498,6 +553,13 @@ def main() -> None:
                 intermediate_draw=intermediate_draw,
                 sign_draw=sign_draw,
                 scale_gauge=scale_gauge,
+                block_size=args.coupled_hadamard_block_size,
+                preactivation_block_size=(
+                    args.coupled_hadamard_preactivation_block_size
+                ),
+                postactivation_block_size=(
+                    args.coupled_hadamard_postactivation_block_size
+                ),
             ),
         }
         results: dict[str, Any] = {}
@@ -514,6 +576,7 @@ def main() -> None:
                     device=device,
                     quantizer_module=quantizer_module,
                     ldlq_tf32=args.ldlq_tf32,
+                    tailbite_context=args.tailbite_context,
                 )
                 results[codebook][arm] = _score(
                     source,
@@ -525,6 +588,9 @@ def main() -> None:
                     evidence,
                     args.coupled_residual_draw,
                     intermediate_draw,
+                    args.coupled_hadamard_block_size,
+                    args.coupled_hadamard_preactivation_block_size,
+                    args.coupled_hadamard_postactivation_block_size,
                 )
                 print(
                     f"layer {args.layer} expert {expert} {codebook} {arm}: "

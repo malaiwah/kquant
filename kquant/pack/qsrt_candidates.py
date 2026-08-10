@@ -31,12 +31,19 @@ from kquant.qsrt_candidates import (
 )
 from kquant.qsrt import (
     H308,
+    K2,
     SCHEMA,
     ExpertFormatSpec,
     PHASE1_MODE_IDS,
     RATE_TRANSFER_MODES,
     RECORDS_PER_EXPERT,
     resolve_mode,
+)
+from kquant.qsrt_coupled import (
+    CoupledHadamardExecution,
+    CoupledHadamardSpec,
+    coupled_execution,
+    encode_coupled_weights,
 )
 from kquant.pack.qsrt_encoder import (
     Layout,
@@ -157,7 +164,7 @@ class QSRTCandidateEncoding:
             "covariance": self.covariance,
             "evaluated_modes": list(self.evaluated_modes),
             "mode_coding": {
-                (H308.name if r13 == r2 == H308.mode_id else f"R{r13}/R{r2}"): value
+                (resolve_mode(r13).name if r13 == r2 else f"R{r13}/R{r2}"): value
                 for (r13, r2), value in self.mode_coding.items()
             },
         }
@@ -619,13 +626,17 @@ def encode_phase1_expert(
         raise ValueError("invalid K3 layer/expert assignment")
     modes = tuple(int(mode) for mode in mode_ids)
     fixed_high_rate = modes == (H308.mode_id,)
+    fixed_k2 = modes == (K2.mode_id,)
+    fixed_profile = fixed_high_rate or fixed_k2
     if (
         not modes
         or len(set(modes)) != len(modes)
-        or (not fixed_high_rate and modes[0] != 0)
+        or (not fixed_profile and modes[0] != 0)
     ):
-        raise ValueError("mode_ids must be H308 alone or unique and begin with R0")
-    if any(mode not in (0, 1, 2, H308.mode_id) for mode in modes):
+        raise ValueError(
+            "mode_ids must be H308/K2 alone or unique and begin with R0"
+        )
+    if any(mode not in (0, 1, 2, H308.mode_id, K2.mode_id) for mode in modes):
         raise ValueError("mode_ids contain an unsupported schedule")
     if hessian_policy not in HESSIAN_POLICIES:
         raise ValueError(f"unsupported Hessian policy: {hessian_policy}")
@@ -689,9 +700,12 @@ def encode_phase1_expert(
             "h13_local_alpha": 0.0,
         }
 
+    if fixed_k2:
+        block_contexts = torch.zeros_like(block_contexts)
+        context_basis = "uniform_k2_identity_transformed_coordinate_order"
     can_confirm = confirmation_documents >= min_confirmation_documents
     evaluated_modes = (
-        modes if fixed_high_rate or (have_local_support and can_confirm) else (0,)
+        modes if fixed_profile or (have_local_support and can_confirm) else (0,)
     )
     evaluated_formats = tuple(
         (r13, r2) for r13 in evaluated_modes for r2 in evaluated_modes
@@ -842,14 +856,19 @@ def encode_phase1_expert(
 
     assert fit_reference is not None and fit_counts is not None
     assert confirmation_reference is not None and confirmation_counts is not None
-    if fixed_high_rate:
+    if fixed_profile:
+        fixed_mode = H308 if fixed_high_rate else K2
         selection = RatePairSelection(
-            proposed_r13=H308.mode_id,
-            proposed_r2=H308.mode_id,
-            selected_r13=H308.mode_id,
-            selected_r2=H308.mode_id,
+            proposed_r13=fixed_mode.mode_id,
+            proposed_r2=fixed_mode.mode_id,
+            selected_r13=fixed_mode.mode_id,
+            selected_r2=fixed_mode.mode_id,
             accepted=True,
-            reason="fixed_22k3_2k4_high_rate_profile",
+            reason=(
+                "fixed_22k3_2k4_high_rate_profile"
+                if fixed_high_rate
+                else "fixed_uniform_k2_profile"
+            ),
             fit_documents=int(torch.count_nonzero(fit_counts)),
             confirmation_documents=int(torch.count_nonzero(confirmation_counts)),
             confirmation_relative_improvement=None,
@@ -956,6 +975,7 @@ def encode_phase1_expert_batch(
     transform_seeds_by_expert: Mapping[
         int, Mapping[str, QSRTTransformSeeds]
     ] | None = None,
+    coupled_intermediate_draws_by_expert: Mapping[int, int] | None = None,
 ) -> list[QSRTCandidateEncoding]:
     """Encode several experts while batching their independent trellis work.
 
@@ -975,13 +995,27 @@ def encode_phase1_expert_batch(
         raise ValueError("invalid K3 layer/expert assignment")
     modes = tuple(int(mode) for mode in mode_ids)
     fixed_high_rate = modes == (H308.mode_id,)
+    fixed_k2 = modes == (K2.mode_id,)
+    fixed_profile = fixed_high_rate or fixed_k2
+    coupled_k2 = coupled_intermediate_draws_by_expert is not None
+    if coupled_k2:
+        if not fixed_k2:
+            raise ValueError("coupled activation-boundary transforms require fixed K2")
+        if folded_scale_power != 0.0:
+            raise ValueError("coupled K2 requires folded_scale_power zero")
+        missing = set(expert_ids) - set(coupled_intermediate_draws_by_expert)
+        extra = set(coupled_intermediate_draws_by_expert) - set(expert_ids)
+        if missing or extra:
+            raise ValueError("coupled K2 draw map must cover exactly the expert batch")
     if (
         not modes
         or len(set(modes)) != len(modes)
-        or (not fixed_high_rate and modes[0] != 0)
+        or (not fixed_profile and modes[0] != 0)
     ):
-        raise ValueError("mode_ids must be H308 alone or unique and begin with R0")
-    if any(mode not in (0, 1, 2, H308.mode_id) for mode in modes):
+        raise ValueError(
+            "mode_ids must be H308/K2 alone or unique and begin with R0"
+        )
+    if any(mode not in (0, 1, 2, H308.mode_id, K2.mode_id) for mode in modes):
         raise ValueError("mode_ids contain an unsupported schedule")
     if hessian_policy not in HESSIAN_POLICIES:
         raise ValueError(f"unsupported Hessian policy: {hessian_policy}")
@@ -1061,12 +1095,43 @@ def encode_phase1_expert_batch(
                 "h13_local_alpha": 0.0,
             }
 
+        if fixed_k2:
+            block_contexts = torch.zeros_like(block_contexts)
+            context_basis = "uniform_k2_identity_transformed_coordinate_order"
         can_confirm = confirmation_documents >= min_confirmation_documents
         evaluated_modes = (
-            modes if fixed_high_rate or (have_local_support and can_confirm) else (0,)
+            modes if fixed_profile or (have_local_support and can_confirm) else (0,)
         )
         mode_specs = tuple(resolve_mode(mode) for mode in evaluated_modes)
         contexts_device = block_contexts.to(device=device, dtype=torch.long)
+        coupled_execution_basis: CoupledHadamardExecution | None = None
+        coupled_source_w2: torch.Tensor | None = None
+        coupled_reference_output: torch.Tensor | None = None
+        if coupled_k2:
+            draw = int(coupled_intermediate_draws_by_expert[expert])
+            spec = CoupledHadamardSpec(intermediate_draw=draw)
+            source_w2 = _load_source_matrix(store, layer, expert, "w2", device)
+            transformed = encode_coupled_weights(
+                (source_w1, source_w3, source_w2), spec
+            )
+            coupled_execution_basis = coupled_execution(transformed, spec)
+            coupled_source_w2 = transformed[2]
+            coupled_reference_output = (
+                F.linear(source_middle, source_w2)
+                if all_rows.rows
+                else torch.empty(
+                    (0, global_h13.shape[0]),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+            source_w1, source_w3 = transformed[:2]
+            inputs = coupled_execution_basis.transform_inputs(inputs)
+            h13 = coupled_execution_basis.transform_h13(h13)
+            transformed_global_h2 = coupled_execution_basis.transform_h2(global_h2)
+            context_basis += f"+coupled_hadamard_intermediate_draw_{draw}"
+        else:
+            transformed_global_h2 = global_h2
         intermediate_conditioning = _folded_intermediate_conditioning(
             block_scores.to(device=device),
             contexts_device,
@@ -1100,6 +1165,11 @@ def encode_phase1_expert_batch(
                     for r13 in evaluated_modes
                     for r2 in evaluated_modes
                 ),
+                "h13": h13,
+                "global_h2_basis": transformed_global_h2,
+                "coupled_execution": coupled_execution_basis,
+                "coupled_source_w2": coupled_source_w2,
+                "coupled_reference_output": coupled_reference_output,
             }
         )
         upstream_sources.append({"w1": source_w1, "w3": source_w3})
@@ -1140,7 +1210,9 @@ def encode_phase1_expert_batch(
     conditional_h2s: list[dict[int, torch.Tensor]] = []
     for item, upstream in zip(prepared, upstream_candidates):
         expert = int(item["expert"])
-        source_w2 = _load_source_matrix(store, layer, expert, "w2", device)
+        source_w2 = item["coupled_source_w2"]
+        if source_w2 is None:
+            source_w2 = _load_source_matrix(store, layer, expert, "w2", device)
         source_middle = item["source_middle"]
         inputs = item["inputs"]
         gates = item["gates"]
@@ -1150,16 +1222,27 @@ def encode_phase1_expert_batch(
         assert isinstance(inputs, torch.Tensor)
         assert isinstance(gates, torch.Tensor)
         assert isinstance(fit_mask, torch.Tensor)
-        middle_by_r13 = _candidate_middle_by_r13(
-            inputs, upstream, evaluated_modes
-        )
+        execution_basis = item["coupled_execution"]
+        if execution_basis is None:
+            middle_by_r13 = _candidate_middle_by_r13(
+                inputs, upstream, evaluated_modes
+            )
+        else:
+            middle_by_r13 = {
+                int(r13): execution_basis.decode_middle(
+                    inputs,
+                    upstream["w1"][int(r13)].reconstruction,
+                    upstream["w3"][int(r13)].reconstruction,
+                )
+                for r13 in evaluated_modes
+            }
         h2_by_r13, h2_evidence = _conditional_h2_by_r13(
             inputs,
             gates,
             fit_mask.to(device=device),
             middle_by_r13,
-            global_h13=global_h13,
-            global_h2=global_h2,
+            global_h13=item["h13"],
+            global_h2=item["global_h2_basis"],
             device=device,
             hessian_policy=hessian_policy,
             have_local_support=(
@@ -1186,7 +1269,9 @@ def encode_phase1_expert_batch(
             str(item["context_basis"]) + "+decoded_candidate_post_situ_h2"
         )
         all_rows = item["all_rows"]
-        if all_rows.rows:
+        if item["coupled_reference_output"] is not None:
+            reference_output = item["coupled_reference_output"]
+        elif all_rows.rows:
             reference_output = F.linear(source_middle, source_w2)
         else:
             reference_output = torch.empty(
@@ -1270,6 +1355,9 @@ def encode_phase1_expert_batch(
             candidate_output = F.linear(
                 middle_by_r13[r13], down[r13][r2].reconstruction
             )
+            execution_basis = item["coupled_execution"]
+            if execution_basis is not None:
+                candidate_output = execution_basis.decode_output(candidate_output)
             deferred_fit_sse.append(
                 _defer_functional_row_sse(fit_plan, candidate_output)
             )
@@ -1296,14 +1384,19 @@ def encode_phase1_expert_batch(
         fit_counts = fit_plan.counts
         confirmation_reference = confirmation_plan.reference_energy
         confirmation_counts = confirmation_plan.counts
-        if fixed_high_rate:
+        if fixed_profile:
+            fixed_mode = H308 if fixed_high_rate else K2
             selection = RatePairSelection(
-                proposed_r13=H308.mode_id,
-                proposed_r2=H308.mode_id,
-                selected_r13=H308.mode_id,
-                selected_r2=H308.mode_id,
+                proposed_r13=fixed_mode.mode_id,
+                proposed_r2=fixed_mode.mode_id,
+                selected_r13=fixed_mode.mode_id,
+                selected_r2=fixed_mode.mode_id,
                 accepted=True,
-                reason="fixed_22k3_2k4_high_rate_profile",
+                reason=(
+                    "fixed_22k3_2k4_high_rate_profile"
+                    if fixed_high_rate
+                    else "fixed_uniform_k2_profile"
+                ),
                 fit_documents=int(torch.count_nonzero(fit_counts)),
                 confirmation_documents=int(torch.count_nonzero(confirmation_counts)),
                 confirmation_relative_improvement=None,
@@ -1372,6 +1465,27 @@ def encode_phase1_expert_batch(
                 "r2": selected_r2,
                 "codebook": codebook,
                 "tailbite_context": int(tailbite_context),
+                "coupled_hadamard": (
+                    None
+                    if item["coupled_execution"] is None
+                    else {
+                        "residual_block_size": item[
+                            "coupled_execution"
+                        ].spec.residual_block_size,
+                        "preactivation_block_size": item[
+                            "coupled_execution"
+                        ].spec.preactivation_block_size,
+                        "postactivation_block_size": item[
+                            "coupled_execution"
+                        ].spec.postactivation_block_size,
+                        "residual_draw": item[
+                            "coupled_execution"
+                        ].spec.residual_draw,
+                        "intermediate_draw": item[
+                            "coupled_execution"
+                        ].spec.intermediate_draw,
+                    }
+                ),
                 **_mode_evidence(selected_encodings),
             },
         )

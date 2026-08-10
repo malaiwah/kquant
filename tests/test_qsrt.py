@@ -14,9 +14,11 @@ from kquant.qsrt import (
     FORMAT_TABLE_BYTES,
     HOT_METADATA_BYTES,
     H308,
+    K2,
     INTERMEDIATE_CHANNELS,
     LAYER_HEADER_BYTES,
     MATRIX_TRELLIS_BYTES,
+    PURE_K2_MATRIX_TRELLIS_BYTES,
     FIXED_HIGH_RATE_TRELLIS_BYTES,
     PAIRS_PER_EXPERT,
     PAIR_BYTES,
@@ -86,6 +88,23 @@ def test_h308_is_a_fixed_74_bit_record_strip() -> None:
     assert record_bits(H308) == (3,) * 22 + (4,) * 2
     assert sum(record_bits(H308)) == 74
     assert ExpertFormatSpec.compressed(3).name == "H308"
+
+
+def test_uniform_k2_is_a_fixed_two_bit_profile() -> None:
+    assert record_bits(K2) == (2,) * RECORDS_PER_EXPERT
+    assert pair_kinds(K2) == ("P22",) * PAIRS_PER_EXPERT
+    assert sum(record_bits(K2)) == 48
+    assert ExpertFormatSpec.compressed(K2.mode_id).name == "K2"
+    assert ExpertFormatSpec.from_code(0x44).name == "K2"
+    assert mode_from_context_bits((2,)) is K2
+    descriptor = QSRTTrellisDescriptor(
+        mode_id=K2.mode_id,
+        rate_axis="k",
+        k_tiles=192,
+        n_tiles=224,
+    )
+    assert descriptor.payload_bytes == PURE_K2_MATRIX_TRELLIS_BYTES
+    assert descriptor.to_manifest()["pair_kinds"] == ["P22"] * PAIRS_PER_EXPERT
 
 
 def test_pair_rotation_is_a_per_expert_bijection() -> None:

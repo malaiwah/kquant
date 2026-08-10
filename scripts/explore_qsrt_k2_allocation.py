@@ -5938,14 +5938,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--coupled-hadamard-preactivation-block-size",
         type=int,
-        choices=(512, 1024, 2048),
+        choices=(64, 128, 256, 512, 1024, 2048),
         default=512,
         help="block width over the 6,144 interleaved pre-SiTU coordinates",
     )
     parser.add_argument(
         "--coupled-hadamard-postactivation-block-size",
         type=int,
-        choices=(512, 1024),
+        choices=(64, 128, 256, 512, 1024),
         default=512,
         help="block width over the 3,072 post-SiTU/W2 coordinates",
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize a sealed H308 candidate pool directly as QSRT atoms-v2."""
+"""Materialize a sealed fixed-profile candidate pool as QSRT atoms-v2."""
 
 from __future__ import annotations
 
@@ -20,8 +20,14 @@ from kquant.pack.qsrt_pool import (
     CANDIDATE_POOL_COMPLETION_FILENAME,
     load_qsrt_candidate_pool,
 )
-from kquant.qsrt import H308
-from kquant.qsrt_atoms_v2 import PROFILE, QSRTAtomsV2Layout, SCHEMA
+from kquant.qsrt import H308, K2, record_bits
+from kquant.qsrt_atoms_v2 import (
+    PROFILE,
+    PURE_K2_PROFILE,
+    QSRTAtomsV2Layout,
+    SCHEMA,
+)
+from kquant.qsrt_coupled_plan import K2CoupledRotationPlan
 
 
 MANIFEST_FILENAME = "qsrt-manifest.json"
@@ -73,8 +79,33 @@ def main() -> None:
     args = parser.parse_args()
 
     pool = load_qsrt_candidate_pool(args.candidate_pool, require_completion=True)
-    if pool.mode_ids != (H308.mode_id,):
-        raise ValueError("atoms-v2 materialization requires the fixed H308 pool")
+    if pool.mode_ids == (H308.mode_id,):
+        mode = H308
+        profile = PROFILE
+        rotation_plan = None
+    elif pool.mode_ids == (K2.mode_id,):
+        mode = K2
+        profile = PURE_K2_PROFILE
+        if pool.coupled_k2_rotation_draws is None:
+            raise ValueError("pure K2 candidate pool has no coupled rotation draws")
+        coupled_contract = pool.manifest.get("coupled_k2_rotation")
+        if not isinstance(coupled_contract, dict):
+            raise ValueError("pure K2 candidate pool has no rotation contract")
+        rotation_plan = K2CoupledRotationPlan(
+            {
+                layer: tuple(
+                    int(draw)
+                    for draw in pool.coupled_k2_rotation_draws[layer - 1]
+                )
+                for layer in C.MOE_LAYERS
+            },
+            str(
+                coupled_contract.get("selection")
+                or coupled_contract.get("source")
+            ),
+        )
+    else:
+        raise ValueError("atoms-v2 materialization requires fixed H308 or K2")
     if pool.codebook != CODEBOOK_SQG_XOR_CHEB_T12:
         raise ValueError("atoms-v2 materialization requires sqg_xor_cheb_t12")
     if pool.completion is None or pool.content_sha256 is None:
@@ -90,10 +121,9 @@ def main() -> None:
         "complete": False,
         "storage_schema": SCHEMA,
         "storage_format": "qsrt_atoms_v2",
-        "profile": PROFILE,
-        "record_bits": list(H308.context_bits),
-        "trellis_bits_per_weight": sum(H308.context_bits)
-        / len(H308.context_bits),
+        "profile": profile,
+        "record_bits": list(record_bits(mode)),
+        "trellis_bits_per_weight": sum(record_bits(mode)) / len(record_bits(mode)),
         "tensor_parallel_independent": True,
         "all_experts_qsrt": True,
         "candidate_pool": str(pool.root),
@@ -101,7 +131,10 @@ def main() -> None:
         "candidate_codebook": pool.codebook,
         "candidate_mode_ids": list(pool.mode_ids),
         "source_revision": pool.manifest.get("source_revision"),
-        "layer_layout": QSRTAtomsV2Layout(1).to_manifest(),
+        "coupled_k2_rotation_plan": (
+            None if rotation_plan is None else rotation_plan.to_json()
+        ),
+        "layer_layout": QSRTAtomsV2Layout(1, profile=profile).to_manifest(),
         "layers": {},
     }
     identity_fields = tuple(name for name in manifest if name not in {"complete", "layers"})
@@ -131,6 +164,10 @@ def main() -> None:
             layer,
             batch_size=args.batch_size,
             discard_partial=args.discard_partials,
+            profile=profile,
+            rotation_draws=(
+                None if rotation_plan is None else rotation_plan.for_layer(layer)
+            ),
         )
         print(
             f"layer {layer}: {result['disk_bytes']} bytes ({index}/{len(args.layers)})",
@@ -186,7 +223,7 @@ def main() -> None:
         "candidate_completion": CANDIDATE_POOL_COMPLETION_FILENAME,
         "candidate_pool_content_sha256": pool.content_sha256,
         "storage_schema": SCHEMA,
-        "profile": PROFILE,
+        "profile": profile,
         "layer_count": len(C.MOE_LAYERS),
         "layer_bytes": total_bytes,
         "layers": completion_layers,

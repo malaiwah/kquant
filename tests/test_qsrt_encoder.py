@@ -11,6 +11,7 @@ from kquant.exl3_reference import (
 from kquant.qsrt import (
     CONTEXT_GROUP_CHANNELS,
     H308,
+    K2,
     INTERMEDIATE_CHANNELS,
     RATE_TRANSFER_MODES,
     RECORDS_PER_EXPERT,
@@ -81,6 +82,25 @@ def test_h308_plan_applies_permutation_before_fixed_record_funding() -> None:
         assert sum(plan.physical_tile_bits) == 8 * 74
     assert torch.equal(plans[0].physical_permutation, plans[1].physical_permutation)
     assert torch.equal(plans[0].physical_permutation, plans[2].physical_permutation)
+
+
+def test_uniform_k2_plan_is_identity_ordered_in_transformed_coordinates() -> None:
+    contexts = torch.zeros(
+        INTERMEDIATE_CHANNELS // CONTEXT_GROUP_CHANNELS, dtype=torch.long
+    )
+    plans = [
+        plan_qsrt_matrix(contexts, K2, matrix=matrix)
+        for matrix in ("w1", "w3", "w2")
+    ]
+    expected = (2,) * (INTERMEDIATE_CHANNELS // 16)
+    for plan in plans:
+        assert plan.encoder_tile_bits == expected
+        assert plan.physical_tile_bits == expected
+        assert plan.physical_pair_bpw == (2.0,) * 12
+        assert torch.equal(
+            plan.physical_permutation,
+            torch.arange(INTERMEDIATE_CHANNELS),
+        )
 
 
 def test_qsrt_pair_prefix_order_grows_one_exact_trie_branch_per_pair() -> None:

@@ -32,13 +32,21 @@ from kquant.qsrt import (
     FIXED_HIGH_RATE_TRELLIS_BYTES,
     H308,
     INTERMEDIATE_CHANNELS,
+    K2,
     LATENT_CHANNELS,
     LOGICAL_CANDIDATE_SCHEMAS,
     MATRIX_TRELLIS_BYTES,
+    PURE_K2_MATRIX_TRELLIS_BYTES,
     SCHEMA as QSRT_SCHEMA,
     ExpertFormatSpec,
 )
 from kquant.qsrt_storage import ATOM_SCALE_BYTES, ATOMS_PER_EXPERT, QSRTLayerLayout
+from kquant.qsrt_coupled_plan import (
+    K2CoupledDrawSelection,
+    K2CoupledRotationPlan,
+    PRODUCTION_SELECTION,
+    select_k2_coupled_draw,
+)
 from kquant.pack.qsrt_candidates import (
     CANDIDATE_POOL_KIND,
     CANDIDATE_POOL_SCHEMA_VERSION,
@@ -64,29 +72,43 @@ def _is_fixed_high_rate(mode_ids: tuple[int, ...]) -> bool:
     return mode_ids == (H308.mode_id,)
 
 
+def _fixed_mode(mode_ids: tuple[int, ...]):
+    if mode_ids == (H308.mode_id,):
+        return H308
+    if mode_ids == (K2.mode_id,):
+        return K2
+    return None
+
+
 def _format_label(r13: int, r2: int) -> str:
-    if r13 == r2 == H308.mode_id:
-        return H308.name
+    if r13 == r2 and r13 in (H308.mode_id, K2.mode_id):
+        return H308.name if r13 == H308.mode_id else K2.name
     return f"R{r13}/R{r2}"
 
 
 def _matrix_trellis_bytes(mode_ids: tuple[int, ...]) -> int:
-    return (
-        FIXED_HIGH_RATE_TRELLIS_BYTES
-        if _is_fixed_high_rate(mode_ids)
-        else MATRIX_TRELLIS_BYTES
-    )
+    fixed_mode = _fixed_mode(mode_ids)
+    if fixed_mode == H308:
+        return FIXED_HIGH_RATE_TRELLIS_BYTES
+    if fixed_mode == K2:
+        return PURE_K2_MATRIX_TRELLIS_BYTES
+    return MATRIX_TRELLIS_BYTES
 
 
 def _selection_contract(mode_ids: tuple[int, ...]) -> dict[str, object]:
-    if _is_fixed_high_rate(mode_ids):
+    fixed_mode = _fixed_mode(mode_ids)
+    if fixed_mode is not None:
         return {
-            "format_grid": "fixed_h308",
+            "format_grid": f"fixed_{fixed_mode.name.lower()}",
             "shared_r": True,
             "candidate_construction_fold": "fit",
             "mode_selection_fold": "none",
             "mode_proposal_metric": "none",
-            "mode_acceptance": "fixed_22k3_2k4_high_rate_profile",
+            "mode_acceptance": (
+                "fixed_22k3_2k4_high_rate_profile"
+                if fixed_mode == H308
+                else "fixed_uniform_k2_profile"
+            ),
             "external_validation_used": False,
         }
     return {
@@ -121,6 +143,7 @@ class QSRTCandidatePool:
     trellis_schema: str | None = None
     mode_ids: tuple[int, ...] = (0, 1, 2)
     codebook: str = CODEBOOK_SQG_XOR_CHEB_T12
+    coupled_k2_rotation_draws: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -551,17 +574,24 @@ def validate_layer_metrics(
             raise ValueError(
                 "selection validation parameters must be provided together"
             )
-        if _is_fixed_high_rate(mode_ids):
+        fixed_mode = _fixed_mode(mode_ids)
+        if fixed_mode is not None:
             if not bool(torch.all(evaluated)):
-                raise ValueError("fixed H308 profile must be evaluated for every expert")
-            expected = torch.full((experts,), H308.mode_id, dtype=torch.uint8)
+                raise ValueError(
+                    f"fixed {fixed_mode.name} profile must be evaluated for every expert"
+                )
+            expected = torch.full(
+                (experts,), fixed_mode.mode_id, dtype=torch.uint8
+            )
             if not (
                 torch.equal(proposed_r13, expected)
                 and torch.equal(proposed_r2, expected)
                 and torch.equal(selected_r13, expected)
                 and torch.equal(selected_r2, expected)
             ):
-                raise ValueError("fixed H308 profile was not selected exactly")
+                raise ValueError(
+                    f"fixed {fixed_mode.name} profile was not selected exactly"
+                )
             improvement = _require_tensor(
                 metrics,
                 "confirmation_improvement",
@@ -577,7 +607,9 @@ def validate_layer_metrics(
             if not bool(torch.all(torch.isnan(improvement))) or not bool(
                 torch.all(torch.isnan(ci95))
             ):
-                raise ValueError("fixed H308 profile must not carry selection evidence")
+                raise ValueError(
+                    f"fixed {fixed_mode.name} profile must not carry selection evidence"
+                )
         else:
             _validate_selection_semantics(
                 metrics,
@@ -614,6 +646,186 @@ def validate_layer_metrics(
         "proposed_r13": proposed_r13,
         "proposed_r2": proposed_r2,
         "evaluated_format_count": evaluated.sum(dim=(1, 2)),
+    }
+
+
+def validate_coupled_k2_rotation_metrics(
+    metrics: Mapping[str, torch.Tensor],
+    contract: Mapping[str, object] | None,
+    *,
+    layer: int,
+    expert_ids: tuple[int, ...],
+    min_fit_documents: int,
+    min_confirmation_documents: int,
+    minimum_improvement: float,
+    ledger: Mapping[str, object] | None = None,
+) -> dict[str, torch.Tensor] | None:
+    """Validate the selected coupled-Hadamard draw and its fold evidence."""
+
+    metric_names = {
+        "coupled_draw_evaluated",
+        "coupled_draw_fit_sse",
+        "coupled_draw_confirmation_sse",
+        "coupled_draw_proposed",
+        "coupled_draw_selected",
+        "coupled_draw_confirmation_improvement",
+    }
+    present = metric_names.intersection(metrics)
+    if contract is None:
+        if present:
+            raise ValueError("non-coupled candidate pool carries coupled draw metrics")
+        return None
+    if present != metric_names:
+        raise ValueError("coupled candidate metrics are incomplete")
+    if not isinstance(contract, Mapping):
+        raise ValueError("coupled K2 rotation contract must be an object")
+
+    experts = len(expert_ids)
+    evaluated = _require_tensor(
+        metrics, "coupled_draw_evaluated", shape=(experts, 8), dtype=torch.bool
+    )
+    fit_sse = _require_tensor(
+        metrics, "coupled_draw_fit_sse", shape=(experts, 8), dtype=torch.float64
+    )
+    confirmation_sse = _require_tensor(
+        metrics,
+        "coupled_draw_confirmation_sse",
+        shape=(experts, 8),
+        dtype=torch.float64,
+    )
+    proposed = _require_tensor(
+        metrics, "coupled_draw_proposed", shape=(experts,), dtype=torch.uint8
+    )
+    selected = _require_tensor(
+        metrics, "coupled_draw_selected", shape=(experts,), dtype=torch.uint8
+    )
+    improvement = _require_tensor(
+        metrics,
+        "coupled_draw_confirmation_improvement",
+        shape=(experts,),
+        dtype=torch.float64,
+    )
+    fit_counts = metrics["fit_counts"]
+    confirmation_counts = metrics["confirmation_counts"]
+    format_fit_sse = metrics["fit_sse"]
+    format_confirmation_sse = metrics["confirmation_sse"]
+
+    source = contract.get("source")
+    if source == "model_rotation_plan":
+        plan = K2CoupledRotationPlan.from_json(contract.get("plan"))
+        layer_draws = plan.for_layer(layer)
+        expected_draws = tuple((layer_draws[expert],) for expert in expert_ids)
+        dynamic_draws: tuple[int, ...] | None = None
+    elif source == "candidate_pool_selection":
+        if contract.get("selection") != PRODUCTION_SELECTION:
+            raise ValueError("coupled draw selection policy is unsupported")
+        raw_draws = contract.get("draw_candidates")
+        if not isinstance(raw_draws, list) or any(
+            isinstance(draw, bool) or not isinstance(draw, int) for draw in raw_draws
+        ):
+            raise ValueError("coupled draw candidates are malformed")
+        dynamic_draws = tuple(raw_draws)
+        if (
+            not dynamic_draws
+            or dynamic_draws[0] != 0
+            or len(set(dynamic_draws)) != len(dynamic_draws)
+            or any(not 0 <= draw < 8 for draw in dynamic_draws)
+        ):
+            raise ValueError("coupled draw candidates must be unique and begin at zero")
+        expected_draws = (dynamic_draws,) * experts
+    else:
+        raise ValueError("coupled K2 rotation source is unsupported")
+
+    selections = None if ledger is None else ledger.get("selections")
+    if ledger is not None and not isinstance(selections, Mapping):
+        raise ValueError("coupled selection ledger has no expert evidence")
+
+    for row, expert in enumerate(expert_ids):
+        draws = expected_draws[row]
+        expected_mask = torch.zeros(8, dtype=torch.bool)
+        expected_mask[list(draws)] = True
+        if not torch.equal(evaluated[row], expected_mask):
+            raise ValueError(f"expert {expert} coupled draw evaluation set drifted")
+        for values, name in (
+            (fit_sse[row], "fit"),
+            (confirmation_sse[row], "confirmation"),
+        ):
+            if not bool(torch.all(torch.isfinite(values[expected_mask]))) or bool(
+                torch.any(values[expected_mask] < 0)
+            ):
+                raise ValueError(f"expert {expert} coupled {name} SSE is invalid")
+            if not bool(torch.all(torch.isnan(values[~expected_mask]))):
+                raise ValueError(
+                    f"expert {expert} unevaluated coupled {name} SSE must be NaN"
+                )
+        fit_documents = int(torch.count_nonzero(fit_counts[row]))
+        confirmation_documents = int(
+            torch.count_nonzero(confirmation_counts[row])
+        )
+        fit_map = {draw: float(fit_sse[row, draw]) for draw in draws}
+        confirmation_map = {
+            draw: float(confirmation_sse[row, draw]) for draw in draws
+        }
+        if dynamic_draws is not None:
+            decision = select_k2_coupled_draw(
+                dynamic_draws,
+                fit_map,
+                confirmation_map,
+                fit_documents=fit_documents,
+                confirmation_documents=confirmation_documents,
+                min_fit_documents=min_fit_documents,
+                min_confirmation_documents=min_confirmation_documents,
+                minimum_improvement=minimum_improvement,
+            )
+            expected_improvement = decision.confirmation_relative_improvement
+        else:
+            draw = draws[0]
+            decision = K2CoupledDrawSelection(
+                evaluated_draws=draws,
+                proposed_draw=draw,
+                selected_draw=draw,
+                fit_documents=fit_documents,
+                confirmation_documents=confirmation_documents,
+                confirmation_relative_improvement=None,
+                accepted=False,
+                reason="fixed_model_rotation_plan",
+            )
+            expected_improvement = None
+        if int(proposed[row]) != decision.proposed_draw or int(selected[row]) != decision.selected_draw:
+            raise ValueError(f"expert {expert} coupled draw decision drifted")
+        if expected_improvement is None:
+            if not math.isnan(float(improvement[row])):
+                raise ValueError(f"expert {expert} coupled improvement must be NaN")
+        elif not math.isclose(
+            float(improvement[row]), expected_improvement, rel_tol=1e-12, abs_tol=1e-15
+        ):
+            raise ValueError(f"expert {expert} coupled improvement drifted")
+        draw = decision.selected_draw
+        if not torch.equal(format_fit_sse[row, 0, 0].sum(), fit_sse[row, draw]):
+            raise ValueError(f"expert {expert} selected coupled fit SSE does not close")
+        if not torch.equal(
+            format_confirmation_sse[row, 0, 0].sum(), confirmation_sse[row, draw]
+        ):
+            raise ValueError(
+                f"expert {expert} selected coupled confirmation SSE does not close"
+            )
+        if selections is not None:
+            evidence = selections[str(expert)].get("coupled_k2_rotation")
+            expected_evidence = {
+                **decision.to_json(),
+                "fit_post_projection_sse": {
+                    str(draw): fit_map[draw] for draw in draws
+                },
+                "confirmation_post_projection_sse": {
+                    str(draw): confirmation_map[draw] for draw in draws
+                },
+            }
+            if evidence != expected_evidence:
+                raise ValueError(f"expert {expert} coupled JSON evidence drifted")
+    return {
+        "selected": selected,
+        "proposed": proposed,
+        "evaluated_count": evaluated.sum(dim=1),
     }
 
 
@@ -1063,7 +1275,11 @@ def validate_selection_ledger_evidence(
                 expected_mode = rate_pair[pair_index]
                 expected_matrix = {
                     "mode": (
-                        H308.name if expected_mode == H308.mode_id else f"R{expected_mode}"
+                        H308.name
+                        if expected_mode == H308.mode_id
+                        else K2.name
+                        if expected_mode == K2.mode_id
+                        else f"R{expected_mode}"
                     ),
                     "mode_id": expected_mode,
                     "rate_axis": rate_axis,
@@ -1143,15 +1359,24 @@ def load_qsrt_candidate_pool(
                 f"{manifest.get(name)!r} != {expected!r}"
             )
     mode_ids = tuple(int(mode) for mode in manifest.get("mode_ids", ()))
-    fixed_high_rate = _is_fixed_high_rate(mode_ids)
+    coupled_rotation_contract = manifest.get("coupled_k2_rotation")
+    fixed_profile = _fixed_mode(mode_ids) is not None
     conventional_grid = (
         bool(mode_ids)
         and mode_ids[0] == 0
         and mode_ids == tuple(sorted(set(mode_ids)))
         and all(mode in (0, 1, 2) for mode in mode_ids)
     )
-    if not (fixed_high_rate or conventional_grid):
+    if not (fixed_profile or conventional_grid):
         raise ValueError("candidate pool has an invalid rate-transfer mode policy")
+    if (mode_ids == (K2.mode_id,)) != isinstance(
+        coupled_rotation_contract, Mapping
+    ):
+        raise ValueError(
+            "fixed K2 requires exactly one coupled rotation contract"
+        )
+    if mode_ids != (K2.mode_id,) and coupled_rotation_contract is not None:
+        raise ValueError("non-K2 candidate pool carries a coupled rotation contract")
     expected_contract = _selection_contract(mode_ids)
     for name in ("format_grid", "shared_r"):
         if manifest.get(name) != expected_contract[name]:
@@ -1184,6 +1409,11 @@ def load_qsrt_candidate_pool(
     proposed_r13 = np.empty_like(damage, dtype=np.uint8)
     proposed_r2 = np.empty_like(damage, dtype=np.uint8)
     evaluated_counts = np.empty_like(damage, dtype=np.uint8)
+    coupled_rotation_draws = (
+        np.empty_like(damage, dtype=np.uint8)
+        if coupled_rotation_contract is not None
+        else None
+    )
     histogram = {
         _format_label(r13, r2): 0 for r13 in mode_ids for r2 in mode_ids
     }
@@ -1214,6 +1444,8 @@ def load_qsrt_candidate_pool(
             raise ValueError(f"layer {layer} ledger is not a canonical all-expert pool")
         if ledger.get("codebook") != codebook:
             raise ValueError(f"layer {layer} codebook drifted")
+        if ledger.get("coupled_k2_rotation") != coupled_rotation_contract:
+            raise ValueError(f"layer {layer} coupled rotation contract drifted")
         if ledger.get("tailbite_context") != tailbite_context:
             raise ValueError(f"layer {layer} tailbite context drifted")
         contract = ledger.get("selection_contract", {})
@@ -1250,6 +1482,16 @@ def load_qsrt_candidate_pool(
             min_confirmation_documents=min_confirmation_documents,
             minimum_improvement=minimum_improvement,
         )
+        coupled_validated = validate_coupled_k2_rotation_metrics(
+            metrics,
+            coupled_rotation_contract,
+            layer=layer,
+            expert_ids=tuple(range(C.NUM_EXPERTS)),
+            min_fit_documents=min_fit_documents,
+            min_confirmation_documents=min_confirmation_documents,
+            minimum_improvement=minimum_improvement,
+            ledger=ledger,
+        )
         layer_trellis_schema = validate_selection_ledger_evidence(
             ledger,
             metrics,
@@ -1267,6 +1509,21 @@ def load_qsrt_candidate_pool(
         proposed_r13[row] = validated["proposed_r13"].numpy()
         proposed_r2[row] = validated["proposed_r2"].numpy()
         evaluated_counts[row] = validated["evaluated_format_count"].numpy()
+        if coupled_rotation_draws is not None:
+            if coupled_validated is None:
+                raise AssertionError("coupled K2 validation disappeared")
+            coupled_rotation_draws[row] = coupled_validated["selected"].numpy()
+            actual_draw_histogram = {
+                str(draw): int(
+                    (coupled_validated["selected"] == draw).sum()
+                )
+                for draw in range(8)
+                if bool((coupled_validated["selected"] == draw).any())
+            }
+            if ledger.get("selected_coupled_draw_histogram") != actual_draw_histogram:
+                raise ValueError(
+                    f"layer {layer} selected coupled-draw histogram does not close"
+                )
         actual_histogram = {
             _format_label(r13, r2): int(
                 (
@@ -1325,6 +1582,7 @@ def load_qsrt_candidate_pool(
         trellis_schema=trellis_schema,
         mode_ids=mode_ids,
         codebook=codebook,
+        coupled_k2_rotation_draws=coupled_rotation_draws,
     )
 
 

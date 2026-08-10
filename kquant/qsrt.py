@@ -85,9 +85,11 @@ FIXED_HIGH_RATE_TRELLIS_BYTES = (
     * sum(FIXED_HIGH_RATE_RECORD_BITS)
     // (RECORDS_PER_EXPERT * 8)
 )
+PURE_K2_MATRIX_TRELLIS_BYTES = INTERMEDIATE_CHANNELS * LATENT_CHANNELS * 2 // 8
+PURE_K2_EXPERT_TRELLIS_BYTES = 3 * PURE_K2_MATRIX_TRELLIS_BYTES
 EXPERT_TRELLIS_BYTES = 3 * MATRIX_TRELLIS_BYTES
 RateAxis = Literal["k", "n"]
-PairKind = Literal["P24", "P33"]
+PairKind = Literal["P22", "P24", "P33"]
 
 MATRIX_RATE_AXIS: dict[str, RateAxis] = {
     "w1": "n",
@@ -143,8 +145,8 @@ class ModeSpec:
     """One rate-transfer schedule, ordered from low to high importance.
 
     ``context_bits`` contains one entry per final 128-channel record.
-    IDs zero through two are equal-rate K2/K4 transfer modes.  ID three is
-    the fixed 22xK3 + 2xK4 all-QSRT high-rate profile.
+    IDs zero through two are equal-rate K2/K4 transfer modes. ID three is
+    the fixed 22xK3 + 2xK4 all-QSRT high-rate profile. ID four is uniform K2.
     """
 
     mode_id: int
@@ -153,11 +155,12 @@ class ModeSpec:
     def __post_init__(self) -> None:
         if isinstance(self.mode_id, bool) or not isinstance(self.mode_id, int):
             raise TypeError("mode_id must be an integer")
-        if not 0 <= self.mode_id <= 3:
-            raise ValueError("QSRT mode_id must identify R0, R1, R2, or H308")
+        if not 0 <= self.mode_id <= 4:
+            raise ValueError("QSRT mode_id must identify R0, R1, R2, H308, or K2")
         if not self.name:
             raise ValueError("mode name must not be empty")
-        if not self.context_bits or len(self.context_bits) % 2:
+        pure_k2 = self.mode_id == 4
+        if not self.context_bits or (len(self.context_bits) % 2 and not pure_k2):
             raise ValueError("a mode must contain an even, nonzero context count")
         if any(bits not in (2, 3, 4) for bits in self.context_bits):
             raise ValueError("Kimi-K3 QSRT supports only K2, K3, and K4")
@@ -165,6 +168,9 @@ class ModeSpec:
         if high_rate:
             if self.name != "H308" or self.context_bits != FIXED_HIGH_RATE_RECORD_BITS:
                 raise ValueError("H308 must contain exactly 22 K3 and 2 K4 records")
+        elif pure_k2:
+            if self.name != "K2" or self.context_bits != (2,):
+                raise ValueError("K2 must contain one uniform two-bit context")
         elif sum(self.context_bits) != 3 * len(self.context_bits):
             raise ValueError("a rate-transfer mode must average exactly three bits")
         if INTERMEDIATE_CHANNELS % len(self.context_bits):
@@ -174,7 +180,7 @@ class ModeSpec:
             raise ValueError("each context must contain whole 128-channel records")
         if tuple(sorted(self.context_bits)) != self.context_bits:
             raise ValueError("context rates must be monotone from K2 through K4")
-        if high_rate:
+        if high_rate or pure_k2:
             return
         records_per_context = RECORDS_PER_EXPERT // len(self.context_bits)
         k2_records = self.context_bits.count(2) * records_per_context
@@ -208,6 +214,7 @@ R0 = RATE_TRANSFER_MODES[0]
 R1 = RATE_TRANSFER_MODES[1]
 R2 = RATE_TRANSFER_MODES[2]
 H308 = ModeSpec(3, "H308", FIXED_HIGH_RATE_RECORD_BITS)
+K2 = ModeSpec(4, "K2", (2,))
 REPRESENTATIVE_MODE_CANDIDATES = RATE_TRANSFER_MODES
 EXPERIMENTAL_MODE_CANDIDATES = RATE_TRANSFER_MODES
 
@@ -224,7 +231,7 @@ PHASE1_H13_EXPERT_LOCAL_ALPHA = 0.0
 PHASE1_H2_EXPERT_LOCAL_ALPHA = 0.75
 PHASE1_H2_LOCAL_BASIS = "decoded_candidate_post_situ"
 PHASE1_H2_SHRINKAGE_POLICY = "weighted_oas_scaled_identity"
-_ALL_MODES = (*RATE_TRANSFER_MODES, H308)
+_ALL_MODES = (*RATE_TRANSFER_MODES, H308, K2)
 _MODES_BY_NAME = {mode.name: mode for mode in _ALL_MODES}
 _MODES_BY_ID = {mode.mode_id: mode for mode in _ALL_MODES}
 
@@ -235,6 +242,8 @@ def mode_from_context_bits(context_bits: Sequence[int]) -> ModeSpec:
     bits = tuple(context_bits)
     if bits == FIXED_HIGH_RATE_RECORD_BITS:
         return H308
+    if bits == (2,):
+        return K2
     if not bits or RECORDS_PER_EXPERT % len(bits):
         raise ValueError("allocation contexts must divide the 24 records")
     records_per_context = RECORDS_PER_EXPERT // len(bits)
@@ -259,10 +268,14 @@ class ExpertFormatSpec:
                 continue
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be an integer")
-            if not 0 <= value <= 3:
-                raise ValueError(f"{name} must identify R0, R1, R2, or H308")
-        if self.r13 is not None and (self.r13 == 3) != (self.r2 == 3):
-            raise ValueError("H308 must be selected for both matrix rate axes")
+            if not 0 <= value <= 4:
+                raise ValueError(
+                    f"{name} must identify R0, R1, R2, H308, or K2"
+                )
+        if self.r13 is not None:
+            fixed_ids = {H308.mode_id, K2.mode_id}
+            if (self.r13 in fixed_ids or self.r2 in fixed_ids) and self.r13 != self.r2:
+                raise ValueError("H308 and K2 must be selected for both matrix rate axes")
 
     @classmethod
     def x4t(cls) -> "ExpertFormatSpec":
@@ -283,6 +296,8 @@ class ExpertFormatSpec:
         assert self.r13 is not None and self.r2 is not None
         if self.r13 == self.r2 == H308.mode_id:
             return H308.name
+        if self.r13 == self.r2 == K2.mode_id:
+            return K2.name
         return f"R{self.r13}" if self.r13 == self.r2 else f"R{self.r13}/R{self.r2}"
 
     @property
@@ -298,7 +313,7 @@ class ExpertFormatSpec:
             return cls.x4t()
         r13 = code >> 4
         r2 = code & FORMAT_NIBBLE_MASK
-        if r13 > 3 or r2 > 3:
+        if r13 > 4 or r2 > 4:
             raise ValueError(f"format table contains invalid rate code 0x{code:02x}")
         return cls.compressed(r13, r2)
 
@@ -504,6 +519,8 @@ def record_contexts(mode: ModeSpec | str | int) -> tuple[int, ...]:
     spec = resolve_mode(mode)
     if spec.mode_id == H308.mode_id:
         return tuple(range(RECORDS_PER_EXPERT))
+    if spec.mode_id == K2.mode_id:
+        return (0,) * RECORDS_PER_EXPERT
     contexts: list[int] = []
     for low_context in range(spec.context_count // 2):
         high_context = spec.context_count - 1 - low_context
@@ -522,15 +539,20 @@ def record_bits(mode: ModeSpec | str | int) -> tuple[int, ...]:
 def pair_bits(mode: ModeSpec | str | int) -> tuple[tuple[int, int], ...]:
     records = record_bits(mode)
     pairs = tuple(zip(records[0::2], records[1::2], strict=True))
-    if len(pairs) != PAIRS_PER_EXPERT or any(sum(pair) != 6 for pair in pairs):
-        raise ValueError("every QSRT record pair must have a six-bit rate sum")
+    expected_sum = 4 if resolve_mode(mode).mode_id == K2.mode_id else 6
+    if len(pairs) != PAIRS_PER_EXPERT or any(
+        sum(pair) != expected_sum for pair in pairs
+    ):
+        raise ValueError("QSRT record pairs do not match the mode rate sum")
     return pairs
 
 
 def pair_kinds(mode: ModeSpec | str | int) -> tuple[PairKind, ...]:
     kinds: list[PairKind] = []
     for pair in pair_bits(mode):
-        if pair == (2, 4):
+        if pair == (2, 2):
+            kinds.append("P22")
+        elif pair == (2, 4):
             kinds.append("P24")
         elif pair == (3, 3):
             kinds.append("P33")
@@ -578,7 +600,7 @@ def storage_group_order(
 
     spec = resolve_mode(mode)
     _validate_block_contexts(block_contexts, spec)
-    if spec.mode_id == H308.mode_id:
+    if spec.mode_id in (H308.mode_id, K2.mode_id):
         return torch.argsort(block_contexts, stable=True)
     groups_per_record = RECORD_CHANNELS // CONTEXT_GROUP_CHANNELS
     by_context = []
@@ -940,7 +962,9 @@ class QSRTTrellisDescriptor:
     def words_per_pair(self) -> int:
         if self.mode.mode_id == H308.mode_id:
             raise ValueError("H308 has no fixed six-bit record-pair contract")
-        return self.tiles_per_record * TILE_CHANNELS * 6
+        return self.tiles_per_record * TILE_CHANNELS * sum(
+            pair_bits(self.mode)[0]
+        )
 
     @property
     def words_per_record(self) -> tuple[int, ...]:

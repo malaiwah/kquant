@@ -55,18 +55,28 @@ from kquant.qsrt_rotations import (
     QSRTLayerRotationPlan,
     load_qsrt_rotation_plan,
 )
+from kquant.qsrt_coupled_plan import (
+    K2CoupledDrawSelection,
+    K2CoupledRotationPlan,
+    PRODUCTION_SELECTION,
+    load_k2_coupled_rotation_plan,
+    select_k2_coupled_draw,
+)
 from kquant.qsrt import (
     FIXED_HIGH_RATE_TRELLIS_BYTES,
     H308,
+    K2,
     INTERMEDIATE_CHANNELS,
     LATENT_CHANNELS,
     LOGICAL_CANDIDATE_SCHEMAS,
     MATRIX_TRELLIS_BYTES,
+    PURE_K2_MATRIX_TRELLIS_BYTES,
     PHASE1_H2_EXPERT_LOCAL_ALPHA,
     PHASE1_H2_LOCAL_BASIS,
     PHASE1_H2_SHRINKAGE_POLICY,
     PHASE1_MODE_IDS,
     SCHEMA as QSRT_SCHEMA,
+    resolve_mode,
 )
 from kquant.pack.qsrt_candidates import (
     CANDIDATE_POOL_KIND,
@@ -189,6 +199,51 @@ def _rotation_manifest_contract(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _configured_coupled_k2_plan(
+    args: argparse.Namespace,
+) -> K2CoupledRotationPlan | None:
+    path = getattr(args, "coupled_k2_rotation_plan", None)
+    if path is None:
+        return None
+    cached = getattr(args, "_coupled_k2_rotation_plan_data", None)
+    if cached is None:
+        cached = load_k2_coupled_rotation_plan(path)
+        setattr(args, "_coupled_k2_rotation_plan_data", cached)
+    return cached
+
+
+def _configured_coupled_k2_draw_candidates(
+    args: argparse.Namespace,
+) -> tuple[int, ...] | None:
+    draws = getattr(args, "coupled_k2_draw_candidates", None)
+    if draws is None:
+        return None
+    return tuple(int(draw) for draw in draws)
+
+
+def _coupled_k2_manifest_contract(
+    args: argparse.Namespace,
+) -> dict[str, object] | None:
+    plan = _configured_coupled_k2_plan(args)
+    draws = _configured_coupled_k2_draw_candidates(args)
+    if plan is not None:
+        return {
+            "source": "model_rotation_plan",
+            "plan": plan.to_json(),
+        }
+    if draws is not None:
+        return {
+            "source": "candidate_pool_selection",
+            "selection": PRODUCTION_SELECTION,
+            "draw_candidates": list(draws),
+            "proposal_fold": "fit",
+            "proposal_metric": "total_post_projection_sse",
+            "acceptance_fold": "confirmation",
+            "acceptance_metric": "total_post_projection_sse_vs_draw_zero",
+        }
+    return None
+
+
 def _atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -212,6 +267,10 @@ def _candidate_payload_specs(layer: int, experts: list[int]) -> tuple[TensorSpec
 def _candidate_payload_specs_for_modes(
     layer: int, experts: list[int], mode_ids: tuple[int, ...]
 ) -> tuple[TensorSpec, ...]:
+    if mode_ids == (K2.mode_id,):
+        return _candidate_payload_specs_with_trellis_bytes(
+            layer, experts, PURE_K2_MATRIX_TRELLIS_BYTES
+        )
     if mode_ids != (H308.mode_id,):
         return _candidate_payload_specs(layer, experts)
     return _candidate_payload_specs_with_trellis_bytes(
@@ -269,32 +328,38 @@ def _parse_ints(value: str) -> tuple[int, ...]:
 
 def _parse_modes(value: str) -> tuple[int, ...]:
     modes = _parse_ints(value)
-    if modes == (H308.mode_id,):
+    if modes in ((H308.mode_id,), (K2.mode_id,)):
         return modes
     if modes[0] != 0 or any(mode not in (0, 1, 2) for mode in modes):
         raise argparse.ArgumentTypeError(
-            "mode IDs must be H308 alone (3) or begin with R0 and lie in 0..2"
+            "mode IDs must be H308 (3) or K2 (4) alone, or begin with R0"
         )
     return modes
 
 
 def _format_label(r13: int, r2: int) -> str:
-    if r13 == r2 == H308.mode_id:
-        return H308.name
+    if r13 == r2 and r13 in (H308.mode_id, K2.mode_id):
+        return resolve_mode(r13).name
     return f"R{r13}/R{r2}"
 
 
 def _selection_contract(args: argparse.Namespace) -> dict[str, object]:
     fixed_high_rate = args.mode_ids == (H308.mode_id,)
-    if fixed_high_rate:
+    fixed_k2 = args.mode_ids == (K2.mode_id,)
+    if fixed_high_rate or fixed_k2:
+        fixed_mode = H308 if fixed_high_rate else K2
         return {
-            "mode_ids": [H308.mode_id],
-            "format_grid": "fixed_h308",
+            "mode_ids": [fixed_mode.mode_id],
+            "format_grid": f"fixed_{fixed_mode.name.lower()}",
             "shared_r": True,
             "candidate_construction_fold": "fit",
             "mode_selection_fold": "none",
             "mode_proposal_metric": "none",
-            "mode_acceptance": "fixed_22k3_2k4_high_rate_profile",
+            "mode_acceptance": (
+                "fixed_22k3_2k4_high_rate_profile"
+                if fixed_high_rate
+                else "fixed_uniform_k2_profile"
+            ),
             "external_validation_used": False,
         }
     return {
@@ -311,10 +376,12 @@ def _selection_contract(args: argparse.Namespace) -> dict[str, object]:
 
 def _h2_contract(args: argparse.Namespace) -> dict[str, object]:
     fixed_high_rate = args.mode_ids == (H308.mode_id,)
+    fixed_k2 = args.mode_ids == (K2.mode_id,)
+    fixed_profile = fixed_high_rate or fixed_k2
     return {
         "basis": PHASE1_H2_LOCAL_BASIS,
         "indexed_by": (
-            "expert_upstream_profile" if fixed_high_rate else "expert_r13"
+            "expert_upstream_profile" if fixed_profile else "expert_r13"
         ),
         "shrinkage_policy": PHASE1_H2_SHRINKAGE_POLICY,
         "maximum_local_alpha": PHASE1_H2_EXPERT_LOCAL_ALPHA,
@@ -324,7 +391,11 @@ def _h2_contract(args: argparse.Namespace) -> dict[str, object]:
         "down_candidate_grid": (
             "one_decoded_upstream_conditioned_h308"
             if fixed_high_rate
-            else "w2_r13_r2"
+            else (
+                "one_decoded_upstream_conditioned_k2"
+                if fixed_k2
+                else "w2_r13_r2"
+            )
         ),
     }
 
@@ -810,6 +881,8 @@ def _allocate_metrics(
     modes: tuple[int, ...],
     fit_documents: int,
     confirmation_documents: int,
+    *,
+    coupled_k2: bool = False,
 ) -> dict[str, torch.Tensor]:
     count = len(experts)
     mode_count = len(modes)
@@ -848,6 +921,25 @@ def _allocate_metrics(
         # multiply it by route or gate mass a second time.
         OFFICIAL_SOURCE_DAMAGE_METRIC: torch.zeros(count, dtype=torch.float64),
     }
+    if coupled_k2:
+        metrics.update(
+            {
+                "coupled_draw_evaluated": torch.zeros(
+                    (count, 8), dtype=torch.bool
+                ),
+                "coupled_draw_fit_sse": torch.full(
+                    (count, 8), float("nan"), dtype=torch.float64
+                ),
+                "coupled_draw_confirmation_sse": torch.full(
+                    (count, 8), float("nan"), dtype=torch.float64
+                ),
+                "coupled_draw_proposed": torch.zeros(count, dtype=torch.uint8),
+                "coupled_draw_selected": torch.zeros(count, dtype=torch.uint8),
+                "coupled_draw_confirmation_improvement": torch.full(
+                    (count,), float("nan"), dtype=torch.float64
+                ),
+            }
+        )
     return metrics
 
 
@@ -856,6 +948,10 @@ def _store_metrics(
     row: int,
     modes: tuple[int, ...],
     candidate,
+    *,
+    coupled_selection: K2CoupledDrawSelection | None = None,
+    coupled_fit_sse: dict[int, float] | None = None,
+    coupled_confirmation_sse: dict[int, float] | None = None,
 ) -> None:
     selection = candidate.selection
     metrics["selected_r13"][row] = selection.selected_r13
@@ -899,6 +995,24 @@ def _store_metrics(
         ][row, selected_r13_column, selected_r2_column].sum()
     )
     metrics[OFFICIAL_SOURCE_DAMAGE_METRIC][row] = official_source_excess_sse
+    if coupled_selection is None:
+        if coupled_fit_sse is not None or coupled_confirmation_sse is not None:
+            raise ValueError("coupled draw SSE was provided without a selection")
+        return
+    if coupled_fit_sse is None or coupled_confirmation_sse is None:
+        raise ValueError("coupled draw selection is missing its SSE evidence")
+    for draw in coupled_selection.evaluated_draws:
+        metrics["coupled_draw_evaluated"][row, draw] = True
+        metrics["coupled_draw_fit_sse"][row, draw] = coupled_fit_sse[draw]
+        metrics["coupled_draw_confirmation_sse"][row, draw] = (
+            coupled_confirmation_sse[draw]
+        )
+    metrics["coupled_draw_proposed"][row] = coupled_selection.proposed_draw
+    metrics["coupled_draw_selected"][row] = coupled_selection.selected_draw
+    if coupled_selection.confirmation_relative_improvement is not None:
+        metrics["coupled_draw_confirmation_improvement"][row] = (
+            coupled_selection.confirmation_relative_improvement
+        )
 
 
 def encode_layer(
@@ -965,12 +1079,19 @@ def encode_layer(
         args.mode_ids,
         len(partition.fit),
         len(partition.confirmation),
+        **(
+            {"coupled_k2": True}
+            if _coupled_k2_manifest_contract(args) is not None
+            else {}
+        ),
     )
     selections: dict[str, dict] = {}
     shared_hidden: dict[str, torch.Tensor] = {}
     shared_scale_primer = experts[0] != 0
     primer_candidates = 0
     rotation_plan = _layer_rotation_plan(args, layer)
+    coupled_k2_plan = _configured_coupled_k2_plan(args)
+    coupled_k2_draw_candidates = _configured_coupled_k2_draw_candidates(args)
     started = time.time()
     with AtomicSafetensorsWriter(
         payload_path,
@@ -1000,59 +1121,76 @@ def encode_layer(
                 expert: rotation_plan.intermediate_draw(expert)
                 for expert in batch_experts
             }
-            candidates = encode_phase1_expert_batch(
-                store,
-                samples,
-                layer=layer,
-                experts=batch_experts,
-                partition=partition,
-                global_h13=global_h13,
-                global_h2=global_h2,
-                fallback_block_contexts=fallback_contexts,
-                fallback_block_scores=fallback_scores,
-                device=device,
-                shared_scale_scope=(
-                    KIND,
-                    str(args.dest.resolve()),
-                    layer,
-                ),
-                mode_ids=args.mode_ids,
-                min_fit_documents=args.min_fit_documents,
-                min_confirmation_documents=args.min_confirmation_documents,
-                bootstrap_replicates=args.bootstrap_replicates,
-                minimum_improvement=args.minimum_improvement,
-                quantizer_module=quantizer_module,
-                logical_trellis_schema=args.logical_trellis_schema,
-                codebook=args.codebook,
-                layout=args.layout,
-                ldlq_tf32=args.ldlq_tf32,
-                tailbite_context=args.tailbite_context,
-                hessian_policy=args.hessian_policy,
-                permutation_policy=args.permutation_policy,
-                folded_scale_power=args.folded_scale_power,
-                transform_seeds_by_expert=(
-                    None
-                    if not (
-                        rotation_plan.residual_draw
-                        or any(intermediate_draws.values())
-                    )
-                    else {
-                        expert: {
-                            matrix: qsrt_transform_seed_draw(
-                                layer,
-                                matrix,
-                                residual_draw=rotation_plan.residual_draw,
-                                intermediate_draw=intermediate_draws[expert],
-                                expert=expert,
-                            )
-                            for matrix in MATRICES
+            if coupled_k2_plan is not None:
+                coupled_draw_maps: list[dict[int, int] | None] = [
+                    coupled_k2_plan.for_experts(layer, batch_experts)
+                ]
+            elif coupled_k2_draw_candidates is not None:
+                coupled_draw_maps = [
+                    {expert: draw for expert in batch_experts}
+                    for draw in coupled_k2_draw_candidates
+                ]
+            else:
+                coupled_draw_maps = [None]
+            candidate_sets = []
+            for coupled_draw_map in coupled_draw_maps:
+                draw_candidates = encode_phase1_expert_batch(
+                    store,
+                    samples,
+                    layer=layer,
+                    experts=batch_experts,
+                    partition=partition,
+                    global_h13=global_h13,
+                    global_h2=global_h2,
+                    fallback_block_contexts=fallback_contexts,
+                    fallback_block_scores=fallback_scores,
+                    device=device,
+                    shared_scale_scope=(
+                        KIND,
+                        str(args.dest.resolve()),
+                        layer,
+                    ),
+                    mode_ids=args.mode_ids,
+                    min_fit_documents=args.min_fit_documents,
+                    min_confirmation_documents=args.min_confirmation_documents,
+                    bootstrap_replicates=args.bootstrap_replicates,
+                    minimum_improvement=args.minimum_improvement,
+                    quantizer_module=quantizer_module,
+                    logical_trellis_schema=args.logical_trellis_schema,
+                    codebook=args.codebook,
+                    layout=args.layout,
+                    ldlq_tf32=args.ldlq_tf32,
+                    tailbite_context=args.tailbite_context,
+                    hessian_policy=args.hessian_policy,
+                    permutation_policy=args.permutation_policy,
+                    folded_scale_power=args.folded_scale_power,
+                    transform_seeds_by_expert=(
+                        None
+                        if not (
+                            rotation_plan.residual_draw
+                            or any(intermediate_draws.values())
+                        )
+                        else {
+                            expert: {
+                                matrix: qsrt_transform_seed_draw(
+                                    layer,
+                                    matrix,
+                                    residual_draw=rotation_plan.residual_draw,
+                                    intermediate_draw=intermediate_draws[expert],
+                                    expert=expert,
+                                )
+                                for matrix in MATRICES
+                            }
+                            for expert in batch_experts
                         }
-                        for expert in batch_experts
-                    }
-                ),
-            )
-            if len(candidates) != len(batch_experts):
-                raise ValueError("expert batch returned the wrong candidate count")
+                    ),
+                    coupled_intermediate_draws_by_expert=coupled_draw_map,
+                )
+                if len(draw_candidates) != len(batch_experts):
+                    raise ValueError(
+                        "expert batch returned the wrong candidate count"
+                    )
+                candidate_sets.append((coupled_draw_map, draw_candidates))
             if primer_pending:
                 # Shared-su is historically defined by expert zero, the first
                 # source in a canonical full-layer encode.  A split worker
@@ -1060,15 +1198,75 @@ def encode_layer(
                 # scale cache, then discards its payload.  Keeping the primer
                 # in the same first batch also preserves the normal batch-20
                 # launch geometry.
-                candidates = candidates[1:]
-                primer_candidates += 1
+                candidate_sets = [
+                    (draw_map, candidates[1:])
+                    for draw_map, candidates in candidate_sets
+                ]
+                primer_candidates += len(candidate_sets)
                 primer_pending = False
-            if len(candidates) != len(actual_experts):
-                raise ValueError("shared-scale primer candidate accounting drifted")
-            for batch_row, (expert, candidate) in enumerate(
-                zip(actual_experts, candidates)
+            if any(
+                len(candidates) != len(actual_experts)
+                for _draw_map, candidates in candidate_sets
             ):
+                raise ValueError("shared-scale primer candidate accounting drifted")
+            for batch_row, expert in enumerate(actual_experts):
                 row = batch_begin + batch_row
+                coupled_selection: K2CoupledDrawSelection | None = None
+                coupled_fit_sse: dict[int, float] | None = None
+                coupled_confirmation_sse: dict[int, float] | None = None
+                if coupled_k2_plan is not None or coupled_k2_draw_candidates is not None:
+                    candidate_by_draw = {
+                        int(draw_map[expert]): candidates[batch_row]
+                        for draw_map, candidates in candidate_sets
+                        if draw_map is not None
+                    }
+                    coupled_fit_sse = {
+                        draw: float(candidate.fit_sse[(K2.mode_id, K2.mode_id)].sum())
+                        for draw, candidate in candidate_by_draw.items()
+                    }
+                    coupled_confirmation_sse = {
+                        draw: float(
+                            candidate.confirmation_sse[
+                                (K2.mode_id, K2.mode_id)
+                            ].sum()
+                        )
+                        for draw, candidate in candidate_by_draw.items()
+                    }
+                    reference_candidate = next(iter(candidate_by_draw.values()))
+                    fit_documents = int(
+                        torch.count_nonzero(reference_candidate.fit_counts)
+                    )
+                    confirmation_documents = int(
+                        torch.count_nonzero(reference_candidate.confirmation_counts)
+                    )
+                    if coupled_k2_draw_candidates is not None:
+                        coupled_selection = select_k2_coupled_draw(
+                            coupled_k2_draw_candidates,
+                            coupled_fit_sse,
+                            coupled_confirmation_sse,
+                            fit_documents=fit_documents,
+                            confirmation_documents=confirmation_documents,
+                            min_fit_documents=args.min_fit_documents,
+                            min_confirmation_documents=(
+                                args.min_confirmation_documents
+                            ),
+                            minimum_improvement=args.minimum_improvement,
+                        )
+                    else:
+                        selected_draw = next(iter(candidate_by_draw))
+                        coupled_selection = K2CoupledDrawSelection(
+                            evaluated_draws=(selected_draw,),
+                            proposed_draw=selected_draw,
+                            selected_draw=selected_draw,
+                            fit_documents=fit_documents,
+                            confirmation_documents=confirmation_documents,
+                            confirmation_relative_improvement=None,
+                            accepted=False,
+                            reason="fixed_model_rotation_plan",
+                        )
+                    candidate = candidate_by_draw[coupled_selection.selected_draw]
+                else:
+                    candidate = candidate_sets[0][1][batch_row]
                 try:
                     selected_payload = selected_candidate_tensors(
                         layer, expert, candidate
@@ -1079,7 +1277,15 @@ def encode_layer(
                     ) from exc
                 payload_writer.write_many(selected_payload)
                 del selected_payload
-                _store_metrics(metrics, row, args.mode_ids, candidate)
+                _store_metrics(
+                    metrics,
+                    row,
+                    args.mode_ids,
+                    candidate,
+                    coupled_selection=coupled_selection,
+                    coupled_fit_sse=coupled_fit_sse,
+                    coupled_confirmation_sse=coupled_confirmation_sse,
+                )
                 for matrix, part in (
                     ("w1", "suh"),
                     ("w3", "suh"),
@@ -1105,6 +1311,18 @@ def encode_layer(
                             f"actual_mean={float(value.float().mean())}"
                         )
                 selections[str(expert)] = candidate.metadata()
+                if coupled_selection is not None:
+                    selections[str(expert)]["coupled_k2_rotation"] = {
+                        **coupled_selection.to_json(),
+                        "fit_post_projection_sse": {
+                            str(draw): coupled_fit_sse[draw]
+                            for draw in coupled_selection.evaluated_draws
+                        },
+                        "confirmation_post_projection_sse": {
+                            str(draw): coupled_confirmation_sse[draw]
+                            for draw in coupled_selection.evaluated_draws
+                        },
+                    }
                 completed += 1
                 elapsed = time.time() - started
                 print(
@@ -1112,7 +1330,7 @@ def encode_layer(
                     f"({elapsed / completed:.1f}s/expert)",
                     flush=True,
                 )
-            del candidates
+            del candidate_sets
             torch.cuda.empty_cache()
             batch_begin += len(actual_experts)
 
@@ -1161,7 +1379,11 @@ def encode_layer(
             "router_weighting": "applied gate squared inside functional SSE",
             "keep_benefit": "equal to this value; do not apply traffic weighting again",
         },
-        "source_residency": "w1_w3_once_then_w2_reused_across_conditional_r13_grid",
+        "source_residency": (
+            "complete_expert_reencode_per_coupled_draw"
+            if _configured_coupled_k2_draw_candidates(args)
+            else "w1_w3_once_then_w2_reused_across_conditional_r13_grid"
+        ),
         "payload_write": "atomic_bounded_memory_safetensors_stream",
         "logical_trellis_schema": args.logical_trellis_schema,
         "codebook": args.codebook,
@@ -1180,6 +1402,16 @@ def encode_layer(
                 for expert, draw_id in rotation_plan.intermediate_overrides
             },
         },
+        "coupled_k2_rotation": _coupled_k2_manifest_contract(args),
+        "selected_coupled_draw_histogram": (
+            None
+            if "coupled_draw_selected" not in metrics
+            else {
+                str(draw): int((metrics["coupled_draw_selected"] == draw).sum())
+                for draw in range(8)
+                if bool((metrics["coupled_draw_selected"] == draw).any())
+            }
+        ),
         "selected_format_histogram": selected_histogram,
         "shared_hidden_scale_closure": sorted(shared_hidden),
         "shared_scale_primer_expert": 0 if shared_scale_primer else None,
@@ -1323,6 +1555,11 @@ def _merge_scheduled_layer(
             args.mode_ids,
             len(partition.fit),
             len(partition.confirmation),
+            **(
+                {"coupled_k2": True}
+                if _coupled_k2_manifest_contract(args) is not None
+                else {}
+            ),
         )
         expected_metric_keys = set(merged_metrics)
         for job in jobs:
@@ -1382,6 +1619,7 @@ def _merge_scheduled_layer(
             "ldlq_tf32",
             "tailbite_context",
             "rotation_draws",
+            "coupled_k2_rotation",
             "shared_hidden_scale_closure",
             "training_corpus_documents",
         )
@@ -1436,6 +1674,19 @@ def _merge_scheduled_layer(
                     for source in source_ledgers
                 ),
                 "selected_format_histogram": selected_histogram,
+                "selected_coupled_draw_histogram": (
+                    None
+                    if "coupled_draw_selected" not in metrics
+                    else {
+                        str(draw): int(
+                            (metrics["coupled_draw_selected"] == draw).sum()
+                        )
+                        for draw in range(8)
+                        if bool(
+                            (metrics["coupled_draw_selected"] == draw).any()
+                        )
+                    }
+                ),
                 "selections": selections,
             }
         )
@@ -1579,6 +1830,7 @@ def _manifest(args: argparse.Namespace) -> dict:
             "layer_shared_residual_draw_expert_private_intermediate_draw"
         ),
         "rotation_draws": _rotation_manifest_contract(args),
+        "coupled_k2_rotation": _coupled_k2_manifest_contract(args),
         "logical_trellis_schema": args.logical_trellis_schema,
         "codebook": args.codebook,
         "layout": getattr(args, "layout", "qsrt_guarded_reuse"),
@@ -1632,9 +1884,13 @@ def parent(args: argparse.Namespace) -> None:
         teacher_checkpoint=args.teacher_checkpoint,
     )
     fixed_high_rate = args.mode_ids == (H308.mode_id,)
+    fixed_k2 = args.mode_ids == (K2.mode_id,)
+    fixed_profile = fixed_high_rate or fixed_k2
     max_mode = max(args.mode_ids)
-    r0_work = 74 if fixed_high_rate else 72
-    full_work = r0_work if fixed_high_rate or max_mode == 0 else 96 + 8 * max_mode
+    coupled_draws = _configured_coupled_k2_draw_candidates(args)
+    fixed_k2_work = 48 * (1 if coupled_draws is None else len(coupled_draws))
+    r0_work = 74 if fixed_high_rate else (fixed_k2_work if fixed_k2 else 72)
+    full_work = r0_work if fixed_profile or max_mode == 0 else 96 + 8 * max_mode
     if schedule_path.exists():
         if not args.resume:
             raise FileExistsError(schedule_path)
@@ -1762,6 +2018,22 @@ def parent(args: argparse.Namespace) -> None:
             command.extend(("--sample-cache", str(args.sample_cache)))
         if args.rotation_plan is not None:
             command.extend(("--rotation-plan", str(args.rotation_plan)))
+        if args.coupled_k2_rotation_plan is not None:
+            command.extend(
+                (
+                    "--coupled-k2-rotation-plan",
+                    str(args.coupled_k2_rotation_plan),
+                )
+            )
+        if args.coupled_k2_draw_candidates is not None:
+            command.extend(
+                (
+                    "--coupled-k2-draw-candidates",
+                    ",".join(
+                        str(draw) for draw in args.coupled_k2_draw_candidates
+                    ),
+                )
+            )
         if args.official_repo_dir is not None:
             command.extend(("--official-repo-dir", str(args.official_repo_dir)))
         if args.resume:
@@ -1890,6 +2162,23 @@ def parse_args() -> argparse.Namespace:
             "and optional expert-private intermediate draw overrides"
         ),
     )
+    parser.add_argument(
+        "--coupled-k2-rotation-plan",
+        type=Path,
+        help=(
+            "complete model-wide expert-static intermediate rotation plan for "
+            "the coupled uniform-K2 profile"
+        ),
+    )
+    parser.add_argument(
+        "--coupled-k2-draw-candidates",
+        type=_parse_ints,
+        help=(
+            "expert-static coupled-K2 draw portfolio; fit proposes one draw "
+            "and the disjoint confirmation fold may only accept it against "
+            "draw zero"
+        ),
+    )
     parser.add_argument("--min-fit-documents", type=int, default=PHASE1_MIN_FIT_DOCUMENTS)
     parser.add_argument(
         "--min-confirmation-documents",
@@ -1963,6 +2252,40 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--rotation-plan cannot be combined with nonzero fixed rotation draws"
         )
+    coupled_k2_sources = sum(
+        value is not None
+        for value in (
+            args.coupled_k2_rotation_plan,
+            args.coupled_k2_draw_candidates,
+        )
+    )
+    if coupled_k2_sources > 1:
+        parser.error(
+            "--coupled-k2-rotation-plan and --coupled-k2-draw-candidates "
+            "are mutually exclusive"
+        )
+    if (args.mode_ids == (K2.mode_id,)) != (coupled_k2_sources == 1):
+        parser.error(
+            "fixed K2 and exactly one coupled-K2 rotation source must be "
+            "selected together"
+        )
+    if coupled_k2_sources and (
+        args.rotation_plan is not None
+        or args.residual_rotation_draw
+        or args.intermediate_rotation_draw
+    ):
+        parser.error(
+            "coupled K2 cannot be combined with the ordinary internal rotation controls"
+        )
+    if args.coupled_k2_draw_candidates is not None and (
+        args.coupled_k2_draw_candidates[0] != 0
+        or any(not 0 <= draw < 8 for draw in args.coupled_k2_draw_candidates)
+    ):
+        parser.error(
+            "--coupled-k2-draw-candidates must begin with zero and lie in 0..7"
+        )
+    if not math.isfinite(args.minimum_improvement) or args.minimum_improvement < 0:
+        parser.error("--minimum-improvement must be finite and nonnegative")
     if args.worker is None:
         if args.worker_count is not None:
             parser.error("--worker-count is internal to worker mode")

@@ -4,6 +4,7 @@ import torch
 
 from kquant.pack.qsrt_atoms_v2 import (
     assemble_candidate_records,
+    assemble_record_pair_atoms,
     disassemble_candidate_records,
     pack_local_scale_rate_records,
     pack_matrix_rate_records,
@@ -13,6 +14,7 @@ from kquant.pack.qsrt_atoms_v2 import (
 from kquant.qsrt import (
     FIXED_HIGH_RATE_RECORD_BITS,
     H308,
+    K2,
     RECORDS_PER_EXPERT,
     PackedQSRTTrellis,
     QSRTTrellisDescriptor,
@@ -21,19 +23,32 @@ from kquant.qsrt_atoms_v2 import (
     BASE_PHYSICAL_TO_LOGICAL_RECORD,
     K3_RECORDS,
     K4_RECORDS,
+    P22_ATOM_BUNDLE_BYTES,
     logical_rate_record_index,
     physical_to_logical_records,
     P33_ATOM_BUNDLE_BYTES,
     P43_ATOM_BUNDLE_BYTES,
+    PURE_K2_PROFILE,
     QSRTAtomsV2Header,
     QSRTAtomsV2Layout,
     expert_pair_is_p43,
+    pack_atoms_v2_format_section,
+    unpack_atoms_v2_format_section,
 )
 
 
 def _descriptor(rate_axis: str) -> QSRTTrellisDescriptor:
     return QSRTTrellisDescriptor(
         mode_id=H308.mode_id,
+        rate_axis=rate_axis,  # type: ignore[arg-type]
+        k_tiles=192 if rate_axis == "k" else 224,
+        n_tiles=224 if rate_axis == "k" else 192,
+    )
+
+
+def _k2_descriptor(rate_axis: str) -> QSRTTrellisDescriptor:
+    return QSRTTrellisDescriptor(
+        mode_id=K2.mode_id,
         rate_axis=rate_axis,  # type: ignore[arg-type]
         k_tiles=192 if rate_axis == "k" else 224,
         n_tiles=224 if rate_axis == "k" else 192,
@@ -191,3 +206,58 @@ def test_atoms_v2_header_is_canonical_safetensors_metadata() -> None:
     header = QSRTAtomsV2Header(24, layout)
     assert QSRTAtomsV2Header.from_bytes(header.to_bytes()) == header
     assert len(header.to_bytes()) == 4096
+
+
+def test_pure_k2_records_and_candidate_bundle_round_trip() -> None:
+    generator = torch.Generator().manual_seed(7713)
+    tensors = {}
+    for matrix, rate_axis in (("w1", "k"), ("w3", "k"), ("w2", "n")):
+        descriptor = _k2_descriptor(rate_axis)
+        shared_part = "svh" if matrix == "w2" else "suh"
+        local_part = "suh" if matrix == "w2" else "svh"
+        tensors[matrix] = {
+            "trellis": torch.randint(
+                -32768,
+                32768,
+                (descriptor.payload_words,),
+                dtype=torch.int16,
+                generator=generator,
+            ),
+            shared_part: torch.randn(3584, generator=generator).to(torch.float16),
+            local_part: torch.randn(3072, generator=generator).to(torch.float16),
+        }
+    bundles, shared = assemble_candidate_records(tensors=tensors, mode=K2)
+    assert tuple(bundles) == (2,)
+    assert bundles[2].shape[0] == RECORDS_PER_EXPERT
+    actual = disassemble_candidate_records(
+        bundles=bundles, shared=shared, mode=K2
+    )
+    for matrix in tensors:
+        for part in tensors[matrix]:
+            assert torch.equal(actual[matrix][part], tensors[matrix][part])
+
+    atoms = assemble_record_pair_atoms(
+        bundles[2][0:1],
+        bundles[2][1:2],
+        p43=False,
+        pair_bits=(2, 2),
+    )
+    assert atoms.shape == (8, 1, P22_ATOM_BUNDLE_BYTES)
+
+
+def test_pure_k2_atoms_v2_header_and_draw_section_are_canonical() -> None:
+    layout = QSRTAtomsV2Layout(24, profile=PURE_K2_PROFILE)
+    assert P22_ATOM_BUNDLE_BYTES == 86208
+    assert layout.disk_bytes == 7_415_300_096
+    assert layout.group_experts(0, p43=False) == tuple(range(896))
+    assert layout.group_experts(0, p43=True) == ()
+    header = QSRTAtomsV2Header(24, layout)
+    assert QSRTAtomsV2Header.from_bytes(header.to_bytes()) == header
+
+    draws = tuple(expert % 8 for expert in range(896))
+    section = pack_atoms_v2_format_section(PURE_K2_PROFILE, draws)
+    formats, actual_draws = unpack_atoms_v2_format_section(
+        PURE_K2_PROFILE, section
+    )
+    assert formats == (K2.name,) * 896
+    assert actual_draws == draws

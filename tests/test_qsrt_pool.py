@@ -12,6 +12,7 @@ from kquant.qsrt import (
     FIXED_HIGH_RATE_TRELLIS_BYTES,
     H308,
     INTERMEDIATE_CHANNELS,
+    K2,
     LATENT_CHANNELS,
     MATRIX_TRELLIS_BYTES,
     PHASE1_MODE_IDS,
@@ -33,10 +34,12 @@ from kquant.pack.qsrt_pool import (
     keep_mask_from_allocation_document,
     raw_keep_container_bytes,
     validate_candidate_pool_completion,
+    validate_coupled_k2_rotation_metrics,
     validate_layer_metrics,
     validate_selection_ledger_evidence,
     write_candidate_pool_completion,
 )
+from kquant.qsrt_coupled_plan import PRODUCTION_SELECTION, select_k2_coupled_draw
 from kquant.pack.qsrt_candidates import (
     CANDIDATE_POOL_SCHEMA_VERSION,
     OFFICIAL_SOURCE_DAMAGE_METRIC,
@@ -183,16 +186,17 @@ def test_layer_metrics_rederive_confirmation_proposal_and_gate() -> None:
         )
 
 
-def test_fixed_high_rate_metrics_have_no_selection_oracle() -> None:
+@pytest.mark.parametrize("fixed_mode", [H308, K2])
+def test_fixed_profile_metrics_have_no_selection_oracle(fixed_mode) -> None:
     fit_sse = torch.tensor([[[[1.0, 2.0]]]], dtype=torch.float64)
     confirmation_sse = torch.tensor([[[[3.0]]]], dtype=torch.float64)
     metrics = {
         "expert_ids": torch.tensor([7], dtype=torch.int16),
-        "mode_ids": torch.tensor([H308.mode_id], dtype=torch.uint8),
-        "selected_r13": torch.tensor([H308.mode_id], dtype=torch.uint8),
-        "selected_r2": torch.tensor([H308.mode_id], dtype=torch.uint8),
-        "proposed_r13": torch.tensor([H308.mode_id], dtype=torch.uint8),
-        "proposed_r2": torch.tensor([H308.mode_id], dtype=torch.uint8),
+        "mode_ids": torch.tensor([fixed_mode.mode_id], dtype=torch.uint8),
+        "selected_r13": torch.tensor([fixed_mode.mode_id], dtype=torch.uint8),
+        "selected_r2": torch.tensor([fixed_mode.mode_id], dtype=torch.uint8),
+        "proposed_r13": torch.tensor([fixed_mode.mode_id], dtype=torch.uint8),
+        "proposed_r2": torch.tensor([fixed_mode.mode_id], dtype=torch.uint8),
         "format_evaluated": torch.ones((1, 1, 1), dtype=torch.bool),
         "fit_sse": fit_sse,
         "confirmation_sse": confirmation_sse,
@@ -207,7 +211,7 @@ def test_fixed_high_rate_metrics_have_no_selection_oracle() -> None:
 
     validated = validate_layer_metrics(
         metrics,
-        mode_ids=(H308.mode_id,),
+        mode_ids=(fixed_mode.mode_id,),
         fit_documents=2,
         confirmation_documents=1,
         expert_ids=(7,),
@@ -221,9 +225,106 @@ def test_fixed_high_rate_metrics_have_no_selection_oracle() -> None:
     with pytest.raises(ValueError, match="absent from the mode table"):
         validate_layer_metrics(
             metrics,
-            mode_ids=(H308.mode_id,),
+            mode_ids=(fixed_mode.mode_id,),
             fit_documents=2,
             confirmation_documents=1,
+            expert_ids=(7,),
+            min_fit_documents=1,
+            min_confirmation_documents=1,
+            minimum_improvement=0.0,
+        )
+
+
+def test_coupled_k2_draw_metrics_recompute_disjoint_fold_decision() -> None:
+    fit_sse = torch.tensor([[[[4.0, 5.0]]]], dtype=torch.float64)
+    confirmation_sse = torch.tensor([[[[7.5]]]], dtype=torch.float64)
+    metrics = {
+        "expert_ids": torch.tensor([7], dtype=torch.int16),
+        "mode_ids": torch.tensor([K2.mode_id], dtype=torch.uint8),
+        "selected_r13": torch.tensor([K2.mode_id], dtype=torch.uint8),
+        "selected_r2": torch.tensor([K2.mode_id], dtype=torch.uint8),
+        "proposed_r13": torch.tensor([K2.mode_id], dtype=torch.uint8),
+        "proposed_r2": torch.tensor([K2.mode_id], dtype=torch.uint8),
+        "format_evaluated": torch.ones((1, 1, 1), dtype=torch.bool),
+        "fit_sse": fit_sse,
+        "confirmation_sse": confirmation_sse,
+        "fit_reference_energy": torch.ones((1, 2), dtype=torch.float64),
+        "confirmation_reference_energy": torch.ones((1, 1), dtype=torch.float64),
+        "fit_counts": torch.ones((1, 2), dtype=torch.int32),
+        "confirmation_counts": torch.ones((1, 1), dtype=torch.int32),
+        "confirmation_improvement": torch.full(
+            (1,), float("nan"), dtype=torch.float64
+        ),
+        "confirmation_ci95": torch.full((1, 2), float("nan"), dtype=torch.float64),
+        OFFICIAL_SOURCE_DAMAGE_METRIC: torch.tensor(
+            [16.5], dtype=torch.float64
+        ),
+        "coupled_draw_evaluated": torch.tensor(
+            [[True, False, False, False, False, False, True, False]]
+        ),
+        "coupled_draw_fit_sse": torch.tensor(
+            [[10.0, *([float("nan")] * 5), 9.0, float("nan")]],
+            dtype=torch.float64,
+        ),
+        "coupled_draw_confirmation_sse": torch.tensor(
+            [[8.0, *([float("nan")] * 5), 7.5, float("nan")]],
+            dtype=torch.float64,
+        ),
+        "coupled_draw_proposed": torch.tensor([6], dtype=torch.uint8),
+        "coupled_draw_selected": torch.tensor([6], dtype=torch.uint8),
+        "coupled_draw_confirmation_improvement": torch.tensor(
+            [0.0625], dtype=torch.float64
+        ),
+    }
+    contract = {
+        "source": "candidate_pool_selection",
+        "selection": PRODUCTION_SELECTION,
+        "draw_candidates": [0, 6],
+    }
+    decision = select_k2_coupled_draw(
+        (0, 6),
+        {0: 10.0, 6: 9.0},
+        {0: 8.0, 6: 7.5},
+        fit_documents=2,
+        confirmation_documents=1,
+        min_fit_documents=1,
+        min_confirmation_documents=1,
+        minimum_improvement=0.0,
+    )
+    ledger = {
+        "selections": {
+            "7": {
+                "coupled_k2_rotation": {
+                    **decision.to_json(),
+                    "fit_post_projection_sse": {"0": 10.0, "6": 9.0},
+                    "confirmation_post_projection_sse": {
+                        "0": 8.0,
+                        "6": 7.5,
+                    },
+                }
+            }
+        }
+    }
+
+    validated = validate_coupled_k2_rotation_metrics(
+        metrics,
+        contract,
+        layer=1,
+        expert_ids=(7,),
+        min_fit_documents=1,
+        min_confirmation_documents=1,
+        minimum_improvement=0.0,
+        ledger=ledger,
+    )
+    assert validated is not None
+    assert validated["selected"].tolist() == [6]
+
+    metrics["coupled_draw_selected"][0] = 0
+    with pytest.raises(ValueError, match="decision drifted"):
+        validate_coupled_k2_rotation_metrics(
+            metrics,
+            contract,
+            layer=1,
             expert_ids=(7,),
             min_fit_documents=1,
             min_confirmation_documents=1,
