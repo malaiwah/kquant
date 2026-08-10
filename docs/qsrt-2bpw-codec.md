@@ -76,6 +76,34 @@ The two-bit representation combines four mechanisms:
 3. an exact coupled Hadamard change of basis across all three matrices; and
 4. covariance-aware error feedback evaluated on the reconstructed expert.
 
+## Technical lineage
+
+QSRT uses the quantization architecture established by
+[QTIP](https://arxiv.org/abs/2406.11235) and
+[EXL3](https://github.com/turboderp-org/exllamav3/blob/master/doc/exl3.md).
+It is not an independent reinvention of their trellis encoder.
+
+[QTIP](https://github.com/Cornell-RelaxML/qtip) supplies the fundamental
+combination of incoherence processing, high-dimensional trellis-coded
+quantization, the hardware-efficient bitshift trellis, and procedural
+reconstruction codes. Its separation of the trellis memory $L$ from the
+per-step rate $K$ is the basis of the `L16` and `K2` terminology used here.
+
+EXL3 is a streamlined QTIP variant that retains procedural codebooks and
+tail-biting trellis optimization while providing a practical GPU encoder,
+blockwise signed-Hadamard regularization, scale conditioning, and packed
+tensor representation. QSRT's offline encoder is derived from that EXL3
+implementation and uses the unmodified ExLlamaV3 extension and Hadamard tensor
+utilities as dependencies.
+
+QSRT adds a model-specific labelled graph and finite-E4M3 reconstruction law,
+an exact expert-level transform that couples the gate, up, and down
+projections, reconstructed-upstream conditioning for the down projection, and
+a tensor-parallel-independent MoE payload. These additions change the graph,
+the reconstruction labels, and the expert-level calibration objective; they
+do not change the origin of the underlying bitshift-trellis and incoherence
+methods.
+
 ## History-dependent sequence quantization
 
 ### Four choices with fourteen bits of memory
@@ -238,11 +266,57 @@ Two-bit quantization is highly sensitive to outliers and unequal coordinate
 scales. Orthogonal Hadamard transforms spread concentrated energy across a
 block, making the sequence presented to the quantizer more homogeneous.
 
-The gate, up, and down matrices cannot be transformed independently: gate and
-up meet at a nonlinear activation, and the resulting intermediate coordinates
-are consumed by the down matrix. QSRT therefore uses a coupled change of basis
-whose transforms are explicitly cancelled on the correct side of the
-activation.
+Independent matrix-local transforms are valid only when each transform is
+cancelled at that matrix's immediate input or output. A change of basis that
+conditions the three-matrix expert as one function must also respect the
+nonlinear activation between gate/up and down. QSRT therefore uses a coupled
+change of basis whose transforms are explicitly cancelled on the correct side
+of the activation.
+
+### Relationship to QTIP and EXL3 incoherence processing
+
+The ordinary Hadamard rotations used by QTIP and EXL3 are matrix-local
+incoherence transforms. For one linear map with weight $W$, an input-side and
+an output-side orthogonal transform spread the coefficients of that matrix.
+Writing those transforms as $R_{\mathrm{in}}$ and $R_{\mathrm{out}}$, the
+standard construction has the form
+
+$$
+\widetilde W
+=R_{\mathrm{out}}WR_{\mathrm{in}}^{\mathsf T},
+\qquad
+\widetilde x=xR_{\mathrm{in}}^{\mathsf T},
+\qquad
+\widetilde x\widetilde W^{\mathsf T}
+=(xW^{\mathsf T})R_{\mathrm{out}}^{\mathsf T}.
+$$
+
+Applying $R_{\mathrm{out}}$ restores the original output. Each linear
+operator's coordinate change therefore closes locally. This regularization
+makes each matrix more homogeneous for its scalar or trellis codebook, but it
+does not by itself create a joint gate/up coordinate system or bind that
+system to the down projection.
+
+QSRT retains this matrix-local EXL3 regularization inside each trellis encode.
+The coupled Hadamard described here is an additional, expert-function-level
+reparameterization applied before that regularization. It differs in three
+structural ways:
+
+- gate and up rows are interleaved and rotated as one 6,144-coordinate
+  preactivation vector, so the stored upstream halves are not independently
+  rotated gate and up matrices;
+- the preactivation rotation is inverted before gate and up are separated and
+  before SiTU is evaluated, because a general orthogonal transform does not
+  commute with the coordinatewise nonlinearity; and
+- a separate post-SiTU rotation is applied to the hidden vector and matched by
+  the input side of $W_2$, while one layer-shared residual transform is matched
+  across the inputs of $W_1/W_3$ and the output of $W_2$.
+
+The distinction is therefore one of scope. QTIP/EXL3-style rotations condition
+individual linear operators. The coupled transform conditions the complete
+three-matrix expert while preserving its unquantized nonlinear function
+exactly. Its transform identifier is selected by reconstructing and scoring
+the complete expert, not by minimizing the error of any one matrix.
 
 ### Transformation
 
@@ -328,6 +402,12 @@ The encoder minimizes error in the directions exercised by routed
 activations, not unweighted coefficient error. For a linear matrix with input
 rows $X$, the local quadratic metric is based on the dense covariance
 $H=X^{\mathsf T}X$.
+
+The LDLQ/BlockLDLQ error-feedback construction is inherited through
+[QuIP#](https://arxiv.org/abs/2402.04396), QTIP, and EXL3. QSRT changes how the
+MoE covariances are formed and conditioned—especially for the down
+projection—not the underlying principle of feeding activation-weighted
+reconstruction error into later coefficient blocks.
 
 The encoder factors this dense matrix and quantizes coefficient blocks in an
 order that feeds each block's reconstruction error into later blocks. This is
