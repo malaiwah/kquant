@@ -12,7 +12,8 @@ import argparse
 import hashlib
 import json
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -96,6 +97,32 @@ PermutationChoice = Literal[
     "h2_p24_band_aligned",
     "h2_top2_band_aligned",
 ]
+
+MiddleDecoder = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
+]
+TripletExecutor = Callable[
+    [
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ],
+    torch.Tensor,
+]
+
+
+@dataclass(frozen=True)
+class CoupledSearchBasis:
+    source: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    h13: torch.Tensor
+    h2: torch.Tensor
+    inputs: torch.Tensor
+    permutation: torch.Tensor
+    reference_output: torch.Tensor
+    decode_middle: MiddleDecoder
+    execute_triplet: TripletExecutor
+    evidence: dict[str, object]
+
+
 PERMUTATION_CHOICES: tuple[PermutationChoice, ...] = (
     *PERMUTATION_POLICIES,
     "h2_exact",
@@ -2550,6 +2577,163 @@ def _coupled_hadamard_k2(
     }
 
 
+def _prepare_coupled_search_basis(
+    source: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    h13: torch.Tensor,
+    h2: torch.Tensor,
+    inputs: torch.Tensor,
+    selected_permutation: torch.Tensor,
+    block_size: int,
+    preactivation_block_size: int,
+    postactivation_block_size: int,
+    pre_permutation: str,
+) -> CoupledSearchBasis:
+    """Build exact coupled-Hadamard coordinates for mixed-rate research.
+
+    Quantization and candidate-local H2 fitting happen entirely in the
+    transformed execution basis.  Candidate outputs are mapped back to the
+    ordinary expert basis before fit or confirmation SSE is accumulated.
+    """
+
+    source_triplet = CoupledTriplet(*source)
+    if pre_permutation == "identity":
+        permutation = torch.arange(
+            source_triplet.intermediate,
+            dtype=torch.long,
+            device=inputs.device,
+        )
+        permuted_triplet = source_triplet
+    elif pre_permutation == "selected":
+        permutation = selected_permutation.to(
+            device=inputs.device, dtype=torch.long
+        )
+        permuted_triplet = apply_permutation_sign_gauge(
+            source_triplet,
+            permutation,
+            torch.ones(
+                source_triplet.intermediate,
+                dtype=source_triplet.up.dtype,
+                device=inputs.device,
+            ),
+        )
+    else:
+        raise ValueError(f"unsupported coupled pre-permutation: {pre_permutation}")
+
+    encoded = encode_coupled_block_hadamard(
+        permuted_triplet,
+        block_size=block_size,
+        preactivation_block_size=preactivation_block_size,
+        postactivation_block_size=postactivation_block_size,
+    )
+    transformed_inputs = block_hadamard(
+        inputs, block_size=block_size, dim=1
+    )
+    transformed_h13 = block_hadamard(
+        block_hadamard(h13, block_size=block_size, dim=0),
+        block_size=block_size,
+        dim=1,
+    )
+    h2_permutation = permutation.to(device=h2.device)
+    permuted_h2 = h2.index_select(0, h2_permutation).index_select(
+        1, h2_permutation
+    )
+    transformed_h2 = block_hadamard(
+        block_hadamard(
+            permuted_h2,
+            block_size=postactivation_block_size,
+            dim=0,
+        ),
+        block_size=postactivation_block_size,
+        dim=1,
+    )
+    transformed_identity = torch.arange(
+        source_triplet.intermediate,
+        dtype=torch.long,
+        device=inputs.device,
+    )
+
+    def decode_middle(
+        transformed_rows: torch.Tensor,
+        w1: torch.Tensor,
+        w3: torch.Tensor,
+    ) -> torch.Tensor:
+        transformed_pre = torch.cat(
+            (
+                F.linear(transformed_rows, w1),
+                F.linear(transformed_rows, w3),
+            ),
+            dim=1,
+        )
+        recovered = block_hadamard(
+            transformed_pre,
+            block_size=preactivation_block_size,
+            dim=1,
+        )
+        middle = situ(recovered[:, 0::2], recovered[:, 1::2])
+        return block_hadamard(
+            middle,
+            block_size=postactivation_block_size,
+            dim=1,
+        )
+
+    def execute_triplet(
+        transformed_rows: torch.Tensor,
+        reconstruction: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor
+        ],
+    ) -> torch.Tensor:
+        transformed_middle = decode_middle(
+            transformed_rows, reconstruction[0], reconstruction[1]
+        )
+        transformed_output = F.linear(
+            transformed_middle, reconstruction[2]
+        )
+        return block_hadamard(
+            transformed_output, block_size=block_size, dim=1
+        )
+
+    reference_output = _execute_standard_triplet(inputs, source)
+    closure_output = execute_triplet(transformed_inputs, encoded.tensors())
+    closure_relative_sse = float(
+        (closure_output.double() - reference_output.double()).square().sum()
+        / reference_output.double().square().sum().clamp_min(1e-30)
+    )
+    return CoupledSearchBasis(
+        source=encoded.tensors(),
+        h13=transformed_h13,
+        h2=transformed_h2,
+        inputs=transformed_inputs,
+        permutation=transformed_identity,
+        reference_output=reference_output,
+        decode_middle=decode_middle,
+        execute_triplet=execute_triplet,
+        evidence={
+            "basis": "coupled_interleaved_block_hadamard",
+            "block_size": block_size,
+            "preactivation_block_size": preactivation_block_size,
+            "postactivation_block_size": postactivation_block_size,
+            "pre_hadamard_neuron_permutation": pre_permutation,
+            "pre_hadamard_permutation_sha256": _permutation_sha256(
+                permutation
+            ),
+            "encoder_permutation": "identity_in_transformed_coordinates",
+            "full_precision_closure_relative_sse": closure_relative_sse,
+            "conditional_h2": (
+                "decoded_candidate_post_situ_in_transformed_coordinates_"
+                "with_adaptive_scaled_identity_shrinkage"
+            ),
+            "runtime_boundary_transforms": {
+                "foldable_shared": ["expert_input", "expert_output"],
+                "per_selected_expert": [
+                    "pre_situ_inverse",
+                    "post_situ_forward",
+                ],
+            },
+        },
+    )
+
+
 def _k2_menu_selector_stats(
     errors: Mapping[str, torch.Tensor],
     *,
@@ -2909,10 +3093,31 @@ def _prepare_weighted_functional_target(
     *,
     inputs: torch.Tensor,
     gates: torch.Tensor,
+    execute_triplet: TripletExecutor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    middle = situ(F.linear(inputs, source[0]), F.linear(inputs, source[1]))
-    reference = F.linear(middle, source[2])
+    if execute_triplet is None:
+        reference = _execute_standard_triplet(inputs, source)
+    else:
+        reference = execute_triplet(inputs, source)
     return reference, gates.float().square().unsqueeze(1)
+
+
+def _decode_standard_middle(
+    inputs: torch.Tensor,
+    w1: torch.Tensor,
+    w3: torch.Tensor,
+) -> torch.Tensor:
+    return situ(F.linear(inputs, w1), F.linear(inputs, w3))
+
+
+def _execute_standard_triplet(
+    inputs: torch.Tensor,
+    reconstruction: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    middle = _decode_standard_middle(
+        inputs, reconstruction[0], reconstruction[1]
+    )
+    return F.linear(middle, reconstruction[2])
 
 
 def _weighted_functional_sse(
@@ -2921,12 +3126,13 @@ def _weighted_functional_sse(
     inputs: torch.Tensor,
     reference: torch.Tensor,
     route_weights: torch.Tensor,
+    execute_triplet: TripletExecutor | None = None,
 ) -> float:
-    middle = situ(
-        F.linear(inputs, reconstruction[0]),
-        F.linear(inputs, reconstruction[1]),
+    candidate = (
+        _execute_standard_triplet(inputs, reconstruction)
+        if execute_triplet is None
+        else execute_triplet(inputs, reconstruction)
     )
-    candidate = F.linear(middle, reconstruction[2])
     return float(
         ((candidate - reference).square() * route_weights).sum(dtype=torch.float64)
     )
@@ -2953,8 +3159,19 @@ def _qsrt_308_search(
     include_tile_fractions: bool,
     max_donors: int,
     scale_closure: bool,
+    decode_middle: MiddleDecoder | None = None,
+    execute_triplet: TripletExecutor | None = None,
+    reference_output: torch.Tensor | None = None,
+    representation: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Compare exact 74-bit record schedules and optional tile-funded schedules."""
+
+    middle_decoder = (
+        _decode_standard_middle if decode_middle is None else decode_middle
+    )
+    triplet_executor = (
+        _execute_standard_triplet if execute_triplet is None else execute_triplet
+    )
 
     expert_weight_count = 3 * 3072 * 3584
     strip_count = 8 * 224
@@ -3073,7 +3290,7 @@ def _qsrt_308_search(
         w3 = encoded["w3"][upstream_name]["reconstruction"]
         if not isinstance(w1, torch.Tensor) or not isinstance(w3, torch.Tensor):
             raise TypeError("3.08-bpw upstream reconstruction is not a tensor")
-        decoded_middle = situ(F.linear(fit_inputs, w1), F.linear(fit_inputs, w3))
+        decoded_middle = middle_decoder(fit_inputs, w1, w3)
         _, candidate_h2, evidence = build_expert_hessians(
             fit_inputs,
             fit_gates,
@@ -3103,9 +3320,7 @@ def _qsrt_308_search(
         baseline_w3, torch.Tensor
     ):
         raise TypeError("uniform K3 upstream reconstruction is not a tensor")
-    baseline_middle = situ(
-        F.linear(fit_inputs, baseline_w1), F.linear(fit_inputs, baseline_w3)
-    )
+    baseline_middle = middle_decoder(fit_inputs, baseline_w1, baseline_w3)
     _, baseline_h2, baseline_h2_evidence = build_expert_hessians(
         fit_inputs,
         fit_gates,
@@ -3136,14 +3351,14 @@ def _qsrt_308_search(
         prepared=prepared_baseline_down,
     )
 
-    fit_target, fit_weights = _prepare_weighted_functional_target(
-        source, inputs=inputs[fit_mask], gates=gates[fit_mask]
-    )
-    confirmation_target, confirmation_weights = _prepare_weighted_functional_target(
-        source,
-        inputs=inputs[confirmation_mask],
-        gates=gates[confirmation_mask],
-    )
+    if reference_output is None:
+        reference_output = triplet_executor(inputs, source)
+    if reference_output.shape != (inputs.shape[0], source[2].shape[0]):
+        raise ValueError("reference output does not align with the expert rows")
+    fit_target = reference_output[fit_mask]
+    confirmation_target = reference_output[confirmation_mask]
+    fit_weights = gates[fit_mask].float().square().unsqueeze(1)
+    confirmation_weights = gates[confirmation_mask].float().square().unsqueeze(1)
     fit_reference_energy = float(
         (fit_target.square() * fit_weights).sum(dtype=torch.float64)
     )
@@ -3163,12 +3378,14 @@ def _qsrt_308_search(
         inputs=inputs[fit_mask],
         reference=fit_target,
         route_weights=fit_weights,
+        execute_triplet=triplet_executor,
     )
     baseline_confirmation_sse = _weighted_functional_sse(
         baseline_reconstruction,  # type: ignore[arg-type]
         inputs=inputs[confirmation_mask],
         reference=confirmation_target,
         route_weights=confirmation_weights,
+        execute_triplet=triplet_executor,
     )
     scores: dict[str, dict[str, dict[str, float]]] = {}
     for upstream_name in upstream_maps:
@@ -3186,12 +3403,14 @@ def _qsrt_308_search(
                 inputs=inputs[fit_mask],
                 reference=fit_target,
                 route_weights=fit_weights,
+                execute_triplet=triplet_executor,
             )
             confirmation_sse = _weighted_functional_sse(
                 (w1, w3, w2),
                 inputs=inputs[confirmation_mask],
                 reference=confirmation_target,
                 route_weights=confirmation_weights,
+                execute_triplet=triplet_executor,
             )
             scores[key] = {
                 "fit": {
@@ -3263,7 +3482,7 @@ def _qsrt_308_search(
         w3 = serial_upstream["w3"]["reconstruction"]
         if not isinstance(w1, torch.Tensor) or not isinstance(w3, torch.Tensor):
             raise TypeError("serial upstream reconstruction is not a tensor")
-        decoded_middle = situ(F.linear(fit_inputs, w1), F.linear(fit_inputs, w3))
+        decoded_middle = middle_decoder(fit_inputs, w1, w3)
         _, serial_h2, serial_h2_evidence = build_expert_hessians(
             fit_inputs,
             fit_gates,
@@ -3295,12 +3514,14 @@ def _qsrt_308_search(
             inputs=inputs[fit_mask],
             reference=fit_target,
             route_weights=fit_weights,
+            execute_triplet=triplet_executor,
         )
         confirmation_sse = _weighted_functional_sse(
             (w1, w3, w2),
             inputs=inputs[confirmation_mask],
             reference=confirmation_target,
             route_weights=confirmation_weights,
+            execute_triplet=triplet_executor,
         )
         batch_upstream = {
             matrix: (
@@ -3496,6 +3717,7 @@ def _qsrt_308_search(
                     inputs=fit_inputs,
                     reference=fit_target,
                     route_weights=fit_weights,
+                    execute_triplet=triplet_executor,
                 )
         upstream_flat = int(torch.argmin(upstream_fit))
         width = len(SCALE_CLOSURE_MULTIPLIERS)
@@ -3507,7 +3729,7 @@ def _qsrt_308_search(
         if not isinstance(w1, torch.Tensor) or not isinstance(w3, torch.Tensor):
             raise TypeError("scale-closure upstream reconstruction is not a tensor")
 
-        decoded_middle = situ(F.linear(fit_inputs, w1), F.linear(fit_inputs, w3))
+        decoded_middle = middle_decoder(fit_inputs, w1, w3)
         _, closed_h2, closed_h2_evidence = build_expert_hessians(
             fit_inputs,
             fit_gates,
@@ -3544,6 +3766,7 @@ def _qsrt_308_search(
                 inputs=fit_inputs,
                 reference=fit_target,
                 route_weights=fit_weights,
+                execute_triplet=triplet_executor,
             )
         w2_index = int(torch.argmin(down_fit))
         selected_w2 = down_variants[w2_index]
@@ -3555,6 +3778,7 @@ def _qsrt_308_search(
             inputs=inputs[confirmation_mask],
             reference=confirmation_target,
             route_weights=confirmation_weights,
+            execute_triplet=triplet_executor,
         )
         fit_sse = float(down_fit[w2_index])
         return {
@@ -3619,6 +3843,14 @@ def _qsrt_308_search(
             ),
         }
     return {
+        "representation": (
+            dict(representation)
+            if representation is not None
+            else {
+                "basis": "ordinary_expert_coordinates",
+                "execution": "SiTU(w1*x,w3*x)_then_w2",
+            }
+        ),
         "payload_trellis_bits_per_weight": payload_bpw,
         "storage_summary": {
             "expert_weight_count": expert_weight_count,
@@ -4560,7 +4792,7 @@ def _run_expert(
         codec_features=codec_features.to(device=geometry_scores.device),
     )
 
-    if coupled_hadamard_k2:
+    if coupled_hadamard_k2 and not qsrt_308_search:
         return {
             "skipped": False,
             "support": {
@@ -4637,10 +4869,44 @@ def _run_expert(
             ),
         }
 
+    coupled_search_basis: CoupledSearchBasis | None = None
+    research_source = source
+    research_h13 = h13
+    research_h2 = h2
+    research_inputs = inputs
+    research_permutation = selected_permutation
+    research_reference_output: torch.Tensor | None = None
+    research_decode_middle: MiddleDecoder | None = None
+    research_execute_triplet: TripletExecutor | None = None
+    if coupled_hadamard_k2:
+        coupled_search_basis = _prepare_coupled_search_basis(
+            source,
+            h13=h13,
+            h2=h2,
+            inputs=inputs,
+            selected_permutation=selected_permutation,
+            block_size=coupled_hadamard_block_size,
+            preactivation_block_size=(
+                coupled_hadamard_preactivation_block_size
+            ),
+            postactivation_block_size=(
+                coupled_hadamard_postactivation_block_size
+            ),
+            pre_permutation=coupled_hadamard_pre_permutation,
+        )
+        research_source = coupled_search_basis.source
+        research_h13 = coupled_search_basis.h13
+        research_h2 = coupled_search_basis.h2
+        research_inputs = coupled_search_basis.inputs
+        research_permutation = coupled_search_basis.permutation
+        research_reference_output = coupled_search_basis.reference_output
+        research_decode_middle = coupled_search_basis.decode_middle
+        research_execute_triplet = coupled_search_basis.execute_triplet
+
     uniform: dict[str, dict[int, dict[str, object]]] = {}
     targets: dict[str, torch.Tensor] = {}
     errors: dict[str, dict[int, torch.Tensor]] = {}
-    for matrix, source_matrix in zip(MATRICES, source, strict=True):
+    for matrix, source_matrix in zip(MATRICES, research_source, strict=True):
         weight_shape = (3584, 3072) if matrix in ("w1", "w3") else (3072, 3584)
         uniform_maps = {
             f"k{bits}": _uniform_tile_map(weight_shape, bits)
@@ -4648,7 +4914,7 @@ def _run_expert(
         }
         candidates, encoder_weight = _quantize_maps(
             source_matrix,
-            h2 if matrix == "w2" else h13,
+            research_h2 if matrix == "w2" else research_h13,
             contexts,
             matrix=matrix,
             maps=uniform_maps,
@@ -4657,7 +4923,7 @@ def _run_expert(
             device=device,
             quantizer_module=quantizer_module,
             ldlq_tf32=ldlq_tf32,
-            permutation_override=selected_permutation,
+            permutation_override=research_permutation,
         )
         by_bits = {bits: candidates[f"k{bits}"] for bits in (2, 3, 4)}
         uniform[matrix] = by_bits
@@ -4670,7 +4936,9 @@ def _run_expert(
         errors[matrix] = _tile_errors(targets[matrix], by_bits)
 
     allocation_errors: Mapping[str, Mapping[int, torch.Tensor]] = errors
-    if qsrt_308_tile_fractions or qsrt_308_boundary_proxy_search:
+    if (
+        qsrt_308_tile_fractions or qsrt_308_boundary_proxy_search
+    ) and coupled_search_basis is None:
         functional_proxy = _functional_proxy_tile_errors(
             source,
             uniform,
@@ -4691,25 +4959,33 @@ def _run_expert(
 
     if qsrt_308_search:
         qsrt_308 = _qsrt_308_search(
-            source,
+            research_source,
             uniform,
             allocation_errors,
-            h13=h13,
-            h2=h2,
+            h13=research_h13,
+            h2=research_h2,
             contexts=contexts,
             layer=layer,
             expert=expert,
             device=device,
             quantizer_module=quantizer_module,
             ldlq_tf32=ldlq_tf32,
-            inputs=inputs,
+            inputs=research_inputs,
             gates=gates,
             fit_mask=fit_mask,
             confirmation_mask=confirmation_mask,
-            permutation_override=selected_permutation,
-                include_tile_fractions=qsrt_308_tile_fractions,
-                max_donors=qsrt_308_max_donors,
-                scale_closure=qsrt_308_scale_closure,
+            permutation_override=research_permutation,
+            include_tile_fractions=qsrt_308_tile_fractions,
+            max_donors=qsrt_308_max_donors,
+            scale_closure=qsrt_308_scale_closure,
+            decode_middle=research_decode_middle,
+            execute_triplet=research_execute_triplet,
+            reference_output=research_reference_output,
+            representation=(
+                coupled_search_basis.evidence
+                if coupled_search_basis is not None
+                else None
+            ),
         )
         payload = {
             "skipped": False,
@@ -4735,6 +5011,15 @@ def _run_expert(
             ],
             "rate_response_clustering": rate_response_evidence,
             "tile_funding_alignment": tile_funding_alignment_evidence,
+            "tile_funding_proposal_metric": (
+                "regularized_weight_tile_sse_in_coupled_basis"
+                if coupled_search_basis is not None
+                else (
+                    "fit_only_complete_expert_linearized_functional_proxy"
+                    if qsrt_308_tile_fractions
+                    else "regularized_weight_tile_sse"
+                )
+            ),
             "qsrt_308": qsrt_308,
         }
         if qsrt_308_boundary_tile_search or qsrt_308_boundary_proxy_search:
@@ -5238,7 +5523,7 @@ def run(args: argparse.Namespace) -> dict:
         payload["results"][str(expert)] = result
         _atomic_write(args.output, payload)
         if not result["skipped"]:
-            if args.coupled_hadamard_k2:
+            if args.coupled_hadamard_k2 and not args.qsrt_308_search:
                 coupled = result["coupled_hadamard_k2"]
                 print(
                     f"layer {args.layer} expert {expert}: "
@@ -5351,7 +5636,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "compare production-basis and coupled-boundary uniform K2 with "
-            "candidate-local dense H2 and held-out functional scoring"
+            "candidate-local dense H2 and held-out functional scoring; with "
+            "--qsrt-308-search, run that allocator entirely in the coupled "
+            "basis instead"
         ),
     )
     parser.add_argument(
@@ -5451,18 +5738,27 @@ def parse_args() -> argparse.Namespace:
         parser.error("--qsrt-308-scale-closure requires --qsrt-308-search")
     if args.qsrt_308_boundary_tile_search and args.qsrt_308_boundary_proxy_search:
         parser.error("choose exact or proxy boundary proposals, not both")
+    if args.coupled_hadamard_k2 and (
+        args.qsrt_308_boundary_tile_search
+        or args.qsrt_308_boundary_proxy_search
+    ):
+        parser.error(
+            "coupled-Hadamard 3.08 research does not yet support the separate "
+            "boundary-tile search"
+        )
     experiment_count = sum(
         (
             args.functional_tile_search,
             args.qsrt_308_search,
             args.k2_codebook_menu,
-            args.coupled_hadamard_k2,
+            args.coupled_hadamard_k2 and not args.qsrt_308_search,
         )
     )
     if experiment_count > 1:
         parser.error(
-            "functional tile, 3.08-bpw, K2 codebook-menu, and coupled-Hadamard "
-            "searches are separate experiments"
+            "functional tile, 3.08-bpw, and K2 codebook-menu searches are "
+            "separate experiments; coupled Hadamard may qualify the 3.08-bpw "
+            "search or run as its own uniform-K2 control"
         )
     return args
 

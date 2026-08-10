@@ -11,6 +11,7 @@ from scripts.explore_qsrt_k2_allocation import (
     _k2_menu_selector_stats,
     _permutation_tile_geometry,
     _p24_band_aligned_permutation,
+    _prepare_coupled_search_basis,
     _priority_shape_clustered_group_order,
     _quantize_maps,
     _record_clustered_group_order,
@@ -20,6 +21,7 @@ from scripts.explore_qsrt_k2_allocation import (
     _shape_clustered_group_order,
     _tile_balanced_group_order,
     _top2_band_aligned_permutation,
+    _weighted_functional_sse,
 )
 
 
@@ -60,6 +62,49 @@ def _functional_band_surfaces() -> dict[str, dict[int, torch.Tensor]]:
             4: down_k3 - 0.25 * torch.rand(down_k3.shape, generator=generator),
         },
     }
+
+
+def test_coupled_search_basis_closes_and_scores_in_original_output_basis() -> None:
+    generator = torch.Generator().manual_seed(8704)
+    hidden = 8
+    intermediate = 8
+    rows = 11
+    source = (
+        torch.randn(intermediate, hidden, generator=generator),
+        torch.randn(intermediate, hidden, generator=generator),
+        torch.randn(hidden, intermediate, generator=generator),
+    )
+    inputs = torch.randn(rows, hidden, generator=generator)
+    h13_samples = torch.randn(17, hidden, generator=generator)
+    h2_samples = torch.randn(17, intermediate, generator=generator)
+    h13 = h13_samples.T @ h13_samples
+    h2 = h2_samples.T @ h2_samples
+    permutation = torch.tensor((3, 5, 0, 7, 1, 6, 2, 4))
+
+    basis = _prepare_coupled_search_basis(
+        source,
+        h13=h13,
+        h2=h2,
+        inputs=inputs,
+        selected_permutation=permutation,
+        block_size=4,
+        preactivation_block_size=4,
+        postactivation_block_size=4,
+        pre_permutation="selected",
+    )
+
+    assert basis.evidence["full_precision_closure_relative_sse"] < 1e-11
+    assert torch.equal(basis.permutation, torch.arange(intermediate))
+    assert torch.allclose(basis.h13, basis.h13.T, rtol=1e-5, atol=1e-5)
+    assert torch.allclose(basis.h2, basis.h2.T, rtol=1e-5, atol=1e-5)
+    route_weights = torch.ones(rows, 1)
+    assert _weighted_functional_sse(
+        basis.source,
+        inputs=basis.inputs,
+        reference=basis.reference_output,
+        route_weights=route_weights,
+        execute_triplet=basis.execute_triplet,
+    ) == pytest.approx(0.0, abs=2e-8)
 
 
 def test_k2_menu_selector_counts_shared_triplet_winners() -> None:
