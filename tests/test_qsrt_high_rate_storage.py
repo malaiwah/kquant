@@ -4,6 +4,7 @@ import torch
 
 from kquant.pack.qsrt_atoms_v2 import (
     assemble_candidate_records,
+    assemble_coupled_k2_atoms,
     assemble_record_pair_atoms,
     disassemble_candidate_records,
     pack_local_scale_rate_records,
@@ -243,6 +244,55 @@ def test_pure_k2_records_and_candidate_bundle_round_trip() -> None:
         pair_bits=(2, 2),
     )
     assert atoms.shape == (8, 1, P22_ATOM_BUNDLE_BYTES)
+
+
+def test_coupled_k2_atoms_colocate_preactivation_and_down_coordinates() -> None:
+    generator = torch.Generator().manual_seed(9191)
+    tensors = {}
+    local_scales = {
+        "w1": torch.arange(3072, dtype=torch.float32).remainder(997).to(torch.float16),
+        "w3": (
+            torch.arange(3072, dtype=torch.float32).remainder(991) + 1000
+        ).to(torch.float16),
+        "w2": (
+            torch.arange(3072, dtype=torch.float32).remainder(983) + 2000
+        ).to(torch.float16),
+    }
+    for matrix, rate_axis in (("w1", "k"), ("w3", "k"), ("w2", "n")):
+        descriptor = _k2_descriptor(rate_axis)
+        shared_part = "svh" if matrix == "w2" else "suh"
+        local_part = "suh" if matrix == "w2" else "svh"
+        tensors[matrix] = {
+            "trellis": torch.randint(
+                -32768,
+                32768,
+                (descriptor.payload_words,),
+                dtype=torch.int16,
+                generator=generator,
+            ),
+            shared_part: torch.ones(3584, dtype=torch.float16),
+            local_part: local_scales[matrix],
+        }
+    records, _ = assemble_candidate_records(tensors=tensors, mode=K2)
+    atoms = assemble_coupled_k2_atoms(records[2].unsqueeze(0))
+    assert atoms.shape == (96, 1, P22_ATOM_BUNDLE_BYTES)
+
+    scale_base = 3 * (P22_ATOM_BUNDLE_BYTES - 192) // 3
+    scales = (
+        atoms[:, 0, scale_base:]
+        .contiguous()
+        .view(torch.float16)
+        .reshape(96, 3, 32)
+    )
+    pre = torch.cat((local_scales["w1"], local_scales["w3"]))
+    for atom in (0, 1, 47, 48, 95):
+        assert torch.equal(scales[atom, 0], pre[64 * atom : 64 * atom + 32])
+        assert torch.equal(
+            scales[atom, 1], pre[64 * atom + 32 : 64 * atom + 64]
+        )
+        assert torch.equal(
+            scales[atom, 2], local_scales["w2"][32 * atom : 32 * atom + 32]
+        )
 
 
 def test_pure_k2_atoms_v2_header_and_draw_section_are_canonical() -> None:

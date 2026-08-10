@@ -56,6 +56,12 @@ def block_hadamard(values: Tensor, *, block_size: int, dim: int = -1) -> Tensor:
     axis = dim % values.ndim
     if values.shape[axis] % block_size:
         raise ValueError("Hadamard axis must be divisible by block_size")
+    # Naturally routed experts can have an empty fit or confirmation fold.
+    # The transform is linear, so its action on an empty batch is the empty
+    # float32 tensor with the same shape.  Returning before the butterfly
+    # reshape also avoids an ambiguous ``-1`` inference when numel is zero.
+    if values.numel() == 0:
+        return values.float().contiguous().clone()
     output = values.float().movedim(axis, -1).contiguous().clone()
     shape = output.shape
     output = output.reshape(*shape[:-1], shape[-1] // block_size, block_size)

@@ -37,7 +37,9 @@ from kquant.pack.qsrt_materialize import (
 from kquant.pack.qsrt_validate import validate_qsrt_artifact
 from kquant.qsrt import FORMAT_X4T, PHASE1_MODE_IDS, ExpertFormatSpec
 from kquant.qsrt_atoms_v2 import PROFILE as ATOMS_V2_PROFILE
+from kquant.qsrt_atoms_v2 import PURE_K2_PROFILE as ATOMS_V2_PURE_K2_PROFILE
 from kquant.qsrt_atoms_v2 import SCHEMA as ATOMS_V2_SCHEMA
+from kquant.qsrt_atoms_v2 import SUPPORTED_PROFILES as ATOMS_V2_PROFILES
 from kquant.pack.qsrt_atoms_v2 import QSRTAtomsV2Reader, layer_filename
 
 
@@ -130,15 +132,21 @@ def qsrt_quantization_config(allocation: dict) -> dict:
     }
 
 
-def qsrt_atoms_v2_quantization_config() -> dict:
-    """Return the runtime contract for the all-QSRT H308 atom revision."""
+def qsrt_atoms_v2_quantization_config(
+    profile: str = ATOMS_V2_PROFILE,
+) -> dict:
+    """Return the runtime contract for one all-QSRT atoms-v2 profile."""
+
+    if profile not in ATOMS_V2_PROFILES:
+        raise ValueError(f"unsupported QSRT atoms-v2 profile {profile!r}")
+    bits = 2 if profile == ATOMS_V2_PURE_K2_PROFILE else 3
 
     return {
         "quant_method": "modelopt",
         "quant_algo": "NVFP4",
         "group_size": 16,
         "hybrid_bit_map": {
-            str(layer): [3] * C.NUM_EXPERTS for layer in C.MOE_LAYERS
+            str(layer): [bits] * C.NUM_EXPERTS for layer in C.MOE_LAYERS
         },
         "kept_format": "mxfp4_e8m0k32",
         "kept_storage": "x4t",
@@ -149,6 +157,7 @@ def qsrt_atoms_v2_quantization_config() -> dict:
             "encoding": "qsrt_sqg_e4m3",
             "codebook": "sqg_xor_cheb_t12",
             "artifact_manifest": QSRT_MANIFEST_FILENAME,
+            "profile": profile,
         },
         "dense_format": "mxfp8",
         "ignored_layers": list(IGNORED_DENSE_LAYERS),
@@ -160,6 +169,9 @@ def validate_qsrt_atoms_v2_artifact(root: str | Path) -> dict:
 
     root = Path(root).resolve()
     manifest = _read_json(root / QSRT_MANIFEST_FILENAME)
+    profile = manifest.get("profile")
+    if profile not in ATOMS_V2_PROFILES:
+        raise ValueError(f"unsupported QSRT atoms-v2 profile {profile!r}")
     expected = {
         "kind": "kquant_kimi_k3_qsrt_artifact",
         "schema_version": 2,
@@ -167,7 +179,7 @@ def validate_qsrt_atoms_v2_artifact(root: str | Path) -> dict:
         "complete": True,
         "storage_schema": ATOMS_V2_SCHEMA,
         "storage_format": "qsrt_atoms_v2",
-        "profile": ATOMS_V2_PROFILE,
+        "profile": profile,
         "tensor_parallel_independent": True,
         "all_experts_qsrt": True,
         "layer_count": C.NUM_MOE_LAYERS,
@@ -192,6 +204,8 @@ def validate_qsrt_atoms_v2_artifact(root: str | Path) -> dict:
         with QSRTAtomsV2Reader(path) as reader:
             if reader.header.layer != layer:
                 raise ValueError(f"QSRT atoms-v2 layer {layer} identity drifted")
+            if reader.header.layout.profile != profile:
+                raise ValueError(f"QSRT atoms-v2 layer {layer} profile drifted")
             disk_bytes = reader.header.layout.disk_bytes
         if path.stat().st_size != disk_bytes or entry.get("atom_disk_bytes") != disk_bytes:
             raise ValueError(f"QSRT atoms-v2 layer {layer} byte count drifted")
@@ -208,7 +222,7 @@ def validate_qsrt_atoms_v2_artifact(root: str | Path) -> dict:
         "x4t_experts": 0,
         "container_bytes": total_bytes,
         "storage_schema": ATOMS_V2_SCHEMA,
-        "profile": ATOMS_V2_PROFILE,
+        "profile": profile,
         "tensor_parallel_independent": True,
     }
 
@@ -217,7 +231,7 @@ def _artifact_runtime_contract(artifact: Path) -> tuple[dict, dict]:
     manifest = _read_json(artifact / QSRT_MANIFEST_FILENAME)
     if manifest.get("storage_schema") == ATOMS_V2_SCHEMA:
         return validate_qsrt_atoms_v2_artifact(artifact), (
-            qsrt_atoms_v2_quantization_config()
+            qsrt_atoms_v2_quantization_config(str(manifest.get("profile")))
         )
     validation = validate_qsrt_artifact(
         artifact,

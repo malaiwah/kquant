@@ -51,6 +51,7 @@ from kquant.qsrt_atoms_v2 import (
     unpack_atoms_v2_format_section,
 )
 from kquant.qsrt_storage import (
+    ATOMS_PER_EXPERT,
     ATOMS_PER_RECORD_PAIR,
     MATRIX_ATOM_SCALE_BYTES,
 )
@@ -472,6 +473,118 @@ def assemble_record_pair_atoms(
     return output
 
 
+def assemble_coupled_k2_atoms(records: torch.Tensor) -> torch.Tensor:
+    """Return TP-localizable pure-K2 atoms for the coupled H128 boundary.
+
+    ``records`` is ``[experts, 24, record_bytes]`` in logical intermediate
+    order.  A pure-K2 atom owns 32 consecutive post-SiTU coordinates.  Its two
+    upstream matrix slots instead carry the corresponding 64 consecutive
+    coordinates of the interleaved gate/up preactivation vector.  Consequently
+    two adjacent atoms close one complete 128-point preactivation Hadamard and
+    four adjacent atoms close one complete 128-point postactivation Hadamard.
+
+    This profile-specific placement is what makes a balanced atom extent
+    directly executable at arbitrary supported TP without an intermediate-axis
+    collective.  The three matrix slots retain their existing byte sizes; only
+    their coupled-coordinate interpretation changes.
+    """
+
+    if (
+        records.dtype != torch.uint8
+        or records.ndim != 3
+        or tuple(records.shape[1:])
+        != (_RECORD_COUNTS[2], _RECORD_BUNDLE_BYTES[2])
+    ):
+        raise ValueError(
+            "pure-K2 records must be uint8 "
+            f"[experts, {_RECORD_COUNTS[2]}, {_RECORD_BUNDLE_BYTES[2]}]"
+        )
+    experts = int(records.shape[0])
+    if experts <= 0:
+        raise ValueError("pure-K2 atom assembly requires at least one expert")
+
+    flattened = records.reshape(experts * _RECORD_COUNTS[2], -1)
+
+    def chunks(matrix: str, *, scales: bool) -> torch.Tensor:
+        stripes = (
+            _scale_stripes(flattened, matrix=matrix, bits=2)
+            if scales
+            else _trellis_stripes(flattened, matrix=matrix, bits=2)
+        )
+        # [8 stripes, E*24 records, stripe_bytes] ->
+        # [E, 24 records, 4 contiguous 32-channel chunks, chunk_bytes].
+        stripe_bytes = int(stripes.shape[-1])
+        shaped = stripes.reshape(
+            ATOMS_PER_RECORD_PAIR,
+            experts,
+            _RECORD_COUNTS[2],
+            stripe_bytes,
+        ).permute(1, 2, 0, 3)
+        return (
+            shaped.reshape(experts, _RECORD_COUNTS[2], 4, 2, stripe_bytes)
+            .reshape(experts, ATOMS_PER_EXPERT, 2 * stripe_bytes)
+            .contiguous()
+        )
+
+    w1 = chunks("w1", scales=False)
+    w3 = chunks("w3", scales=False)
+    w2 = chunks("w2", scales=False)
+    w1_scale = chunks("w1", scales=True)
+    w3_scale = chunks("w3", scales=True)
+    w2_scale = chunks("w2", scales=True)
+
+    if tuple(w1.shape[1:]) != (ATOMS_PER_EXPERT, P22_MATRIX_TRELLIS_BYTES):
+        raise AssertionError("pure-K2 trellis chunk accounting drifted")
+    if tuple(w1_scale.shape[1:]) != (
+        ATOMS_PER_EXPERT,
+        MATRIX_ATOM_SCALE_BYTES,
+    ):
+        raise AssertionError("pure-K2 scale chunk accounting drifted")
+
+    # The encoded upstream matrices are the two halves of one length-2I
+    # transformed vector, not semantic gate/up matrices.  Consecutive pairs of
+    # 32-coordinate chunks become the two FC1 slots of the owning 32-neuron
+    # atom.  W2 remains in consecutive postactivation order.
+    pre = torch.cat((w1, w3), dim=1)
+    pre_scale = torch.cat((w1_scale, w3_scale), dim=1)
+    output = torch.empty(
+        (ATOMS_PER_EXPERT, experts, P22_ATOM_BUNDLE_BYTES), dtype=torch.uint8
+    )
+    for atom in range(ATOMS_PER_EXPERT):
+        output[atom, :, 0:P22_MATRIX_TRELLIS_BYTES].copy_(pre[:, 2 * atom])
+        output[
+            atom,
+            :,
+            P22_MATRIX_TRELLIS_BYTES : 2 * P22_MATRIX_TRELLIS_BYTES,
+        ].copy_(pre[:, 2 * atom + 1])
+        output[
+            atom,
+            :,
+            2 * P22_MATRIX_TRELLIS_BYTES : 3 * P22_MATRIX_TRELLIS_BYTES,
+        ].copy_(w2[:, atom])
+        scale_base = 3 * P22_MATRIX_TRELLIS_BYTES
+        output[
+            atom,
+            :,
+            scale_base : scale_base + MATRIX_ATOM_SCALE_BYTES,
+        ].copy_(pre_scale[:, 2 * atom])
+        output[
+            atom,
+            :,
+            scale_base
+            + MATRIX_ATOM_SCALE_BYTES : scale_base
+            + 2 * MATRIX_ATOM_SCALE_BYTES,
+        ].copy_(pre_scale[:, 2 * atom + 1])
+        output[
+            atom,
+            :,
+            scale_base
+            + 2 * MATRIX_ATOM_SCALE_BYTES : scale_base
+            + 3 * MATRIX_ATOM_SCALE_BYTES,
+        ].copy_(w2_scale[:, atom])
+    return output
+
+
 def _pwrite_exact(descriptor: int, payload: torch.Tensor | bytes, offset: int) -> None:
     data = payload if isinstance(payload, bytes) else payload.numpy().tobytes()
     cursor = 0
@@ -546,6 +659,7 @@ def materialize_atoms_v2_layer(
                     tuple[int, bool],
                     list[tuple[int, torch.Tensor, torch.Tensor]],
                 ] = {}
+                pure_records: list[tuple[int, torch.Tensor]] = []
                 for expert in range(first, stop):
                     tensors = {
                         matrix: {
@@ -563,29 +677,24 @@ def materialize_atoms_v2_layer(
                         reference = shared_reference.setdefault(name, value.clone())
                         if not torch.equal(reference, value):
                             raise ValueError(f"layer-shared transform {name} drifted")
+                    if layout.pure_k2:
+                        pure_records.append((expert, records[2]))
+                        continue
                     mapping = (
-                        tuple(range(RECORDS_PER_EXPERT))
-                        if layout.pure_k2
-                        else physical_to_logical_records(layer, expert)
+                        physical_to_logical_records(layer, expert)
                     )
                     for pair in range(12):
-                        if layout.pure_k2:
-                            low_bits = high_bits = 2
-                            low_index = mapping[2 * pair]
-                            high_index = mapping[2 * pair + 1]
-                            p43 = False
-                        else:
-                            low_bits, low_index = logical_rate_record_index(
-                                mapping[2 * pair]
+                        low_bits, low_index = logical_rate_record_index(
+                            mapping[2 * pair]
+                        )
+                        high_bits, high_index = logical_rate_record_index(
+                            mapping[2 * pair + 1]
+                        )
+                        p43 = low_bits == 4
+                        if high_bits != 3 or low_bits not in (3, 4):
+                            raise AssertionError(
+                                "atoms-v2 pair placement is malformed"
                             )
-                            high_bits, high_index = logical_rate_record_index(
-                                mapping[2 * pair + 1]
-                            )
-                            p43 = low_bits == 4
-                            if high_bits != 3 or low_bits not in (3, 4):
-                                raise AssertionError(
-                                    "atoms-v2 pair placement is malformed"
-                                )
                         pending.setdefault((pair, p43), []).append(
                             (
                                 expert,
@@ -593,6 +702,25 @@ def materialize_atoms_v2_layer(
                                 records[high_bits][high_index],
                             )
                         )
+
+                if layout.pure_k2:
+                    if [expert for expert, _ in pure_records] != list(
+                        range(first, stop)
+                    ):
+                        raise AssertionError("pure-K2 expert batch is not contiguous")
+                    atoms = assemble_coupled_k2_atoms(
+                        torch.stack(
+                            [records for _, records in pure_records]
+                        ).contiguous()
+                    )
+                    for physical_atom in range(ATOMS_PER_EXPERT):
+                        _pwrite_exact(
+                            descriptor,
+                            atoms[physical_atom],
+                            layout.group_offset(physical_atom, p43=False)
+                            + first * P22_ATOM_BUNDLE_BYTES,
+                        )
+                    continue
 
                 for (pair, p43), values in pending.items():
                     slots = [group_slots[(pair, p43)][expert] for expert, _, _ in values]
@@ -602,7 +730,6 @@ def materialize_atoms_v2_layer(
                         torch.stack([low for _, low, _ in values]).contiguous(),
                         torch.stack([high for _, _, high in values]).contiguous(),
                         p43=p43,
-                        pair_bits=(2, 2) if layout.pure_k2 else None,
                     )
                     bundle_bytes = layout.group_bundle_bytes(p43=p43)
                     for stripe in range(ATOMS_PER_RECORD_PAIR):
@@ -703,6 +830,7 @@ class QSRTAtomsV2Reader:
 __all__ = [
     "QSRTAtomsV2Reader",
     "assemble_candidate_records",
+    "assemble_coupled_k2_atoms",
     "assemble_record_pair_atoms",
     "disassemble_candidate_records",
     "layer_filename",

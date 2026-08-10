@@ -9,12 +9,22 @@ from kquant.coupled_expert_study import (
 )
 from kquant.qsrt_coupled import (
     CoupledHadamardSpec,
+    block_hadamard,
     coupled_execution,
     encode_coupled_weights,
     rotation_signs,
     signed_block_hadamard,
 )
 from kquant.tp_simulator import situ
+
+
+def test_block_hadamard_preserves_empty_routed_batches() -> None:
+    values = torch.empty((0, 7, 16), dtype=torch.float16)
+    transformed = block_hadamard(values, block_size=8, dim=2)
+
+    assert transformed.shape == values.shape
+    assert transformed.dtype == torch.float32
+    assert transformed.numel() == 0
 
 
 def test_production_coupled_transform_closes_and_matches_research_oracle() -> None:

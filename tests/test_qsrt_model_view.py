@@ -70,7 +70,17 @@ def test_qsrt_atoms_v2_model_view_is_all_qsrt_and_tp_independent() -> None:
         "encoding": "qsrt_sqg_e4m3",
         "codebook": "sqg_xor_cheb_t12",
         "artifact_manifest": "qsrt-manifest.json",
+        "profile": "k3x22_k4x2",
     }
     assert "vision_tower" not in config["ignored_layers"]
     assert "mm_projector" not in config["ignored_layers"]
     assert "tp_size" not in config
+
+
+def test_qsrt_atoms_v2_pure_k2_model_view_contract() -> None:
+    config = qsrt_atoms_v2_quantization_config("k2_coupled_h512_h128")
+    assert all(
+        bits == [2] * C.NUM_EXPERTS
+        for bits in config["hybrid_bit_map"].values()
+    )
+    assert config["qsrt"]["profile"] == "k2_coupled_h512_h128"
