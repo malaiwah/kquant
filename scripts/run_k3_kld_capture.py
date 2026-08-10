@@ -148,9 +148,23 @@ def build_server_environment(
             "K3_PORT": str(port),
             "K3_TP_SIZE": str(tp_size),
             "K3_DSPARK": "0",
+            # KLD is text-only.  Do not instantiate or load the multimodal
+            # tower merely because the checkpoint retains a multimodal config.
+            "K3_LANGUAGE_MODEL_ONLY": "1",
+            # KLD is a numerical correctness run.  Avoid retaining CUDA-graph
+            # pools on checkpoints that leave little transient headroom.
+            "K3_ENFORCE_EAGER": "1",
+            # FlashKDA allocates a large transient prefill workspace that does
+            # not fit beside the TP8 model.  The Triton KDA prefill backend is
+            # the established low-workspace path; MLA decode remains B12X.
+            "K3_ADDITIONAL_CONFIG": '{"kda_prefill_backend":"triton"}',
             "K3_KLD_CAPTURE_DIR": str(capture_dir),
-            "K3_MAX_NUM_BATCHED_TOKENS": "256",
+            # The aligned Kimi Mamba block has a 1,536-token scheduler
+            # granularity in the current vLLM stack.
+            "K3_MAX_NUM_BATCHED_TOKENS": "2048",
             "K3_MAX_NUM_SEQS": "1",
+            # Leave enough transient headroom for the 2,048-token KLD prefill.
+            "K3_KV_CACHE_MEMORY_BYTES": str(1 << 30),
             # Emit one post-start repeat-check record from the actual MoE
             # execution path.  The kernel audit must be backed by runtime
             # evidence rather than merely by checkpoint-loader messages.
@@ -298,9 +312,13 @@ def main() -> int:
         "K3_PORT",
         "K3_TP_SIZE",
         "K3_DSPARK",
+        "K3_LANGUAGE_MODEL_ONLY",
+        "K3_ENFORCE_EAGER",
+        "K3_ADDITIONAL_CONFIG",
         "K3_KLD_CAPTURE_DIR",
         "K3_MAX_NUM_BATCHED_TOKENS",
         "K3_MAX_NUM_SEQS",
+        "K3_KV_CACHE_MEMORY_BYTES",
         "B12X_MOE_FORCE_A16",
         "B12X_MOE_REPEAT_CHECK",
         "B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START",

@@ -145,8 +145,12 @@ def test_kld_server_environment_is_capture_only_and_sets_tp_size(
     assert env["CUDA_VISIBLE_DEVICES"] == ",".join(gpus)
     assert env["K3_KLD_CAPTURE_DIR"] == str(tmp_path / "chunks")
     assert env["K3_TP_SIZE"] == "8"
-    assert env["K3_MAX_NUM_BATCHED_TOKENS"] == "256"
+    assert env["K3_LANGUAGE_MODEL_ONLY"] == "1"
+    assert env["K3_ENFORCE_EAGER"] == "1"
+    assert env["K3_ADDITIONAL_CONFIG"] == '{"kda_prefill_backend":"triton"}'
+    assert env["K3_MAX_NUM_BATCHED_TOKENS"] == "2048"
     assert env["K3_DSPARK"] == "0"
+    assert env["K3_KV_CACHE_MEMORY_BYTES"] == str(1 << 30)
     assert env["B12X_MOE_REPEAT_CHECK"] == "1"
     assert env["B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START"] == "1"
     assert env["B12X_MOE_REPEAT_CHECK_MAX_REPORTS"] == "1"
