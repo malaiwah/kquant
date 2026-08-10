@@ -117,7 +117,12 @@ FRUIT_PUBLICATIONS = {
         quality_limitations=(
             "- **Compact proxy, not the 754B teacher.** Capability, knowledge, "
             "and long-tail behavior can differ from the full GLM-5.2 model; "
-            "evaluate it on your workload."
+            "evaluate it on your workload.\n"
+            "- **No absolute assistant-quality claim.** In the sealed eight-probe "
+            "suite, BF16, SIQ, and QSRT each passed 0/8 behavior contracts: code, "
+            "reasoning, instruction following, debugging, structured output, SQL, "
+            "security, and needle recall. The publication gates establish relative "
+            "QSRT fidelity, not general assistant capability."
         ),
         fruit_audit_rows=(
             "| [Fruit Instruct BF16](https://huggingface.co/malaiwah/"
