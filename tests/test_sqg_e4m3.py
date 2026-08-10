@@ -8,7 +8,6 @@ import torch
 from kquant.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    CODEBOOK_SQG_CHEB,
     CODEBOOK_SQG_NORMAL_E4M3,
     decode_qsrt_regularized_weight,
     decode_regularized_weight,
@@ -24,7 +23,6 @@ from kquant.sqg_e4m3 import (
     sqg_e4m3_bytes_from_rank_lut,
     sqg_e4m3_codebook,
     sqg_e4m3_codebook_from_rank_lut,
-    sqg_k2_eight_stratum_rank_permutation,
     sqg_rank_permutation,
 )
 
@@ -34,6 +32,8 @@ _SQG_XOR_CHEB_T12_SHA256 = {
     2: "62027916386245a84c86156a0a08b6cf07e41548871af0e56fb40780558f6293",
     3: "afe7b3633e7d243b00b379b18ec4dca573722b3727cafef47fcb6470d7e7e6c9",
     4: "5a9620f0c4d8f0a60d0b6fbea921dcecbd193e6febf31043aaa6403c20389c2f",
+    5: "a1caf5572c67d4face423478f423e1ed6149a8c920be5c28d4702946c93cae2f",
+    6: "8e0edc92e20eb92f5287dbdadc8e870fc500fc03c5eed996cae0781d197ebcb0",
 }
 
 
@@ -48,7 +48,7 @@ def test_primary_sqg_xor_cheb_t12_matches_runtime_contract() -> None:
     assert _sha256(table) == _SQG_XOR_CHEB_T12_SHA256["t12"]
 
 
-@pytest.mark.parametrize("bits", (2, 3, 4))
+@pytest.mark.parametrize("bits", (2, 3, 4, 5, 6))
 def test_primary_sqg_xor_cheb_t12_graph_and_labels_match_runtime_contract(
     bits: int,
 ) -> None:
@@ -69,7 +69,7 @@ def test_primary_sqg_xor_cheb_t12_graph_and_labels_match_runtime_contract(
     assert _sha256(labels) == _SQG_XOR_CHEB_T12_SHA256[bits]
 
 
-@pytest.mark.parametrize("bits", (2, 3, 4))
+@pytest.mark.parametrize("bits", (2, 3, 4, 5, 6))
 def test_sqg_preprojection_mapping_is_a_permutation(bits: int) -> None:
     ranks = sqg_rank_permutation(bits)
     assert ranks.dtype == torch.int64
@@ -77,7 +77,7 @@ def test_sqg_preprojection_mapping_is_a_permutation(bits: int) -> None:
     assert torch.equal(torch.sort(ranks).values, torch.arange(1 << 16))
 
 
-@pytest.mark.parametrize("bits", (2, 3, 4))
+@pytest.mark.parametrize("bits", (2, 3, 4, 5, 6))
 def test_sqg_codebook_round_trips_exact_e4m3(bits: int) -> None:
     raw = sqg_e4m3_bytes(bits, "normal")
     codebook = sqg_e4m3_codebook(bits, "normal")
@@ -88,7 +88,7 @@ def test_sqg_codebook_round_trips_exact_e4m3(bits: int) -> None:
     assert bool(torch.isfinite(codebook).all())
 
 
-@pytest.mark.parametrize("bits", (2, 3, 4))
+@pytest.mark.parametrize("bits", (2, 3, 4, 5, 6))
 def test_sqg_each_state_spans_all_coarse_strata(bits: int) -> None:
     ranks = sqg_rank_permutation(bits)
     width = 16 - bits
@@ -97,7 +97,7 @@ def test_sqg_each_state_spans_all_coarse_strata(bits: int) -> None:
     assert torch.equal(torch.sort(strata, dim=1).values, expected)
 
 
-@pytest.mark.parametrize("bits", (2, 3, 4))
+@pytest.mark.parametrize("bits", (2, 3, 4, 5, 6))
 def test_shared_rank_lut_preserves_one_graph_for_every_rate(bits: int) -> None:
     rank_lut = torch.arange(1 << 16, dtype=torch.int64).remainder(126).to(torch.uint8)
     raw = sqg_e4m3_bytes_from_rank_lut(bits, rank_lut)
@@ -118,7 +118,7 @@ def test_shared_rank_lut_rejects_nonfinite_e4m3() -> None:
         sqg_e4m3_bytes_from_rank_lut(2, rank_lut)
 
 
-@pytest.mark.parametrize("bits", (2, 3, 4))
+@pytest.mark.parametrize("bits", (2, 3, 4, 5, 6))
 def test_sqg_cheb_normal_named_codebook_uses_exact_shared_rank_law(bits: int) -> None:
     expected = sqg_cheb_normal_rank_e4m3_bytes().index_select(
         0, sqg_rank_permutation(bits)
@@ -130,34 +130,6 @@ def test_sqg_cheb_normal_named_codebook_uses_exact_shared_rank_law(bits: int) ->
     assert not torch.equal(
         expected, sqg_codebook_bytes(bits, CODEBOOK_SQG_NORMAL_E4M3)
     )
-
-
-@pytest.mark.parametrize("bits", (2, 3, 4))
-@pytest.mark.parametrize("rate_axis", ("k", "n"))
-def test_w2_k2_q8h4_profile_changes_only_k_axis_k2(
-    bits: int, rate_axis: str
-) -> None:
-    actual = sqg_codebook_bytes(
-        bits,
-        CODEBOOK_SQG_CHEB,
-        rate_axis=rate_axis,
-    )
-    rank_lut = sqg_cheb_normal_rank_e4m3_bytes()
-    ranks = (
-        sqg_k2_eight_stratum_rank_permutation(4)
-        if bits == 2 and rate_axis == "k"
-        else sqg_rank_permutation(bits)
-    )
-    assert torch.equal(actual, rank_lut.index_select(0, ranks))
-    if bits == 2 and rate_axis == "k":
-        assert not torch.equal(
-            actual, sqg_codebook_bytes(bits, CODEBOOK_SQG_CHEB_NORMAL_E4M3)
-        )
-
-
-def test_w2_k2_q8h4_profile_requires_rate_axis() -> None:
-    with pytest.raises(ValueError, match="requires rate_axis"):
-        sqg_codebook_bytes(2, CODEBOOK_SQG_CHEB)
 
 
 def test_reference_decoder_accepts_custom_codebook() -> None:
@@ -200,35 +172,28 @@ def test_reference_decoder_applies_rate_specific_sqg_tables(rate_axis: str) -> N
     assert torch.equal(decoded, expected)
 
 
-def test_reference_decoder_applies_w2_only_k2_q8h4_profile() -> None:
+def test_reference_decoder_applies_two_dimensional_tile_rate_map() -> None:
     states = torch.arange(3 * 3 * 256, dtype=torch.int32).to(torch.int16).reshape(
         3, 3, 256
     )
-    tile_bits = (2, 3, 4)
-    down = decode_qsrt_regularized_weight(
+    tile_bits = (2, 3, 4, 4, 2, 3, 3, 4, 2)
+    decoded = decode_qsrt_regularized_weight(
         states,
-        rate_axis="k",
+        rate_axis="tile",
         tile_bits=tile_bits,
-        codebook=CODEBOOK_SQG_CHEB,
+        codebook=CODEBOOK_SQG_NORMAL_E4M3,
     )
-    upstream = decode_qsrt_regularized_weight(
-        states,
-        rate_axis="n",
-        tile_bits=tile_bits,
-        codebook=CODEBOOK_SQG_CHEB,
-    )
-    native_down = decode_qsrt_regularized_weight(
-        states,
-        rate_axis="k",
-        tile_bits=tile_bits,
-        codebook=CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    )
-    native_upstream = decode_qsrt_regularized_weight(
-        states,
-        rate_axis="n",
-        tile_bits=tile_bits,
-        codebook=CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    )
-    assert not torch.equal(down[:16], native_down[:16])
-    assert torch.equal(down[16:], native_down[16:])
-    assert torch.equal(upstream, native_upstream)
+    rows = []
+    for tile_k in range(3):
+        columns = []
+        for tile_n in range(3):
+            position = tile_k * 3 + tile_n
+            columns.append(
+                decode_regularized_weight(
+                    states[tile_k : tile_k + 1, tile_n : tile_n + 1],
+                    codebook=CODEBOOK_SQG_NORMAL_E4M3,
+                    bits=tile_bits[position],
+                )
+            )
+        rows.append(torch.cat(columns, dim=1))
+    assert torch.equal(decoded, torch.cat(rows, dim=0))

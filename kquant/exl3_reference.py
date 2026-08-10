@@ -8,7 +8,6 @@ import torch
 
 from kquant.sqg_e4m3 import (
     SQG_XOR_CHEB_T12,
-    SQG_CHEB,
     SQG_CHEB_NORMAL_E4M3,
     SQG_NORMAL_E4M3,
     sqg_codebook,
@@ -20,18 +19,16 @@ HADAMARD_BLOCK = 128
 CODEBOOK_SQG_NORMAL_E4M3 = SQG_NORMAL_E4M3
 CODEBOOK_SQG_XOR_CHEB_T12 = SQG_XOR_CHEB_T12
 CODEBOOK_SQG_CHEB_NORMAL_E4M3 = SQG_CHEB_NORMAL_E4M3
-CODEBOOK_SQG_CHEB = SQG_CHEB
 QSRT_CODEBOOKS = (
     CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_NORMAL_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    CODEBOOK_SQG_CHEB,
 )
 
 
 def _validate_bits(bits: int) -> None:
-    if isinstance(bits, bool) or not isinstance(bits, int) or bits not in (2, 3, 4):
-        raise ValueError("the QSRT reference supports K=2, K=3, or K=4")
+    if isinstance(bits, bool) or not isinstance(bits, int) or bits not in range(2, 7):
+        raise ValueError("the uniform SQG reference supports K=2 through K=6")
 
 
 def reconstruct_trellis_states(
@@ -158,10 +155,15 @@ def decode_qsrt_regularized_weight(
 
     if states.ndim != 3 or states.shape[-1] != TILE_VALUES:
         raise ValueError("states must have shape [K/16, N/16, 256]")
-    if rate_axis not in ("k", "n"):
-        raise ValueError("rate_axis must be 'k' or 'n'")
+    if rate_axis not in ("k", "n", "tile"):
+        raise ValueError("rate_axis must be 'k', 'n', or 'tile'")
     axis = 0 if rate_axis == "k" else 1
-    if len(tile_bits) != states.shape[axis]:
+    expected_bits = (
+        states.shape[0] * states.shape[1]
+        if rate_axis == "tile"
+        else states.shape[axis]
+    )
+    if len(tile_bits) != expected_bits:
         raise ValueError("tile_bits length does not match the selected rate axis")
     if any(
         isinstance(value, bool) or not isinstance(value, int) or value not in (2, 3, 4)
@@ -173,13 +175,24 @@ def decode_qsrt_regularized_weight(
 
     decoded_tiles = torch.empty_like(states, dtype=torch.float32)
     bits_tensor = torch.tensor(tile_bits, dtype=torch.long, device=states.device)
-    for bits in sorted(set(tile_bits)):
-        positions = torch.nonzero(bits_tensor == bits).flatten()
-        selected = states.index_select(axis, positions)
-        values = _decode_codebook_states(
-            selected, codebook, bits=bits, rate_axis=rate_axis
-        ).float()
-        decoded_tiles.index_copy_(axis, positions, values)
+    if rate_axis == "tile":
+        flat_states = states.reshape(-1, TILE_VALUES)
+        flat_decoded = decoded_tiles.reshape(-1, TILE_VALUES)
+        for bits in sorted(set(tile_bits)):
+            positions = torch.nonzero(bits_tensor == bits).flatten()
+            selected = flat_states.index_select(0, positions)
+            values = _decode_codebook_states(
+                selected, codebook, bits=bits, rate_axis=None
+            ).float()
+            flat_decoded.index_copy_(0, positions, values)
+    else:
+        for bits in sorted(set(tile_bits)):
+            positions = torch.nonzero(bits_tensor == bits).flatten()
+            selected = states.index_select(axis, positions)
+            values = _decode_codebook_states(
+                selected, codebook, bits=bits, rate_axis=rate_axis
+            ).float()
+            decoded_tiles.index_copy_(axis, positions, values)
 
     inverse = torch.argsort(tensor_core_permutation(states.device))
     decoded_tiles = decoded_tiles.index_select(-1, inverse)

@@ -26,15 +26,25 @@ import torch
 import torch.nn.functional as F
 
 from kquant import constants as C
-from kquant.capture import LayerSamples, load_layer_hessians, load_layer_samples
+from kquant.capture import (
+    LayerSamples,
+    index_cached_layer_samples,
+    load_layer_hessians,
+    load_layer_samples,
+)
 from kquant.exl3_loader import load_qsrt_encoder
-from kquant.exl3_reference import decode_exl3_weight
+from kquant.exl3_reference import (
+    CODEBOOK_SQG_XOR_CHEB_T12,
+    decode_exl3_weight,
+    decode_qsrt_weight,
+)
 from kquant.sqg_e4m3 import (
     SQG_CHEB_NORMAL_E4M3,
     SQG_NORMAL_E4M3,
     sqg_e4m3_bytes,
     sqg_e4m3_bytes_from_rank_lut,
     sqg_e4m3_codebook,
+    sqg_xor_cheb_t12_bytes,
 )
 from kquant.sqg_quantizer import install_sqg_quantizer
 from kquant.qsrt_candidates import (
@@ -45,7 +55,13 @@ from kquant.qsrt_candidates import (
     request_documents,
     select_expert_rows,
 )
-from kquant.qsrt import RATE_TRANSFER_MODES, unpack_trellis_states
+from kquant.qsrt import (
+    RATE_TRANSFER_MODES,
+    RECORDS_PER_EXPERT,
+    TILES_PER_RECORD_AXIS,
+    matrix_rate_axis,
+    unpack_trellis_states,
+)
 from kquant.ldlq import SIGMA_REG, make_shared_h
 from kquant.pack.qsrt_encoder import plan_qsrt_matrix
 from kquant.source_weights import OfficialMXFP4Store
@@ -55,7 +71,11 @@ from kquant.tp_simulator import comparison_metrics, situ
 MATRICES = C.EXPERT_MATRICES
 
 
-STUDY_CODEBOOKS = (SQG_NORMAL_E4M3, SQG_CHEB_NORMAL_E4M3)
+STUDY_CODEBOOKS = (
+    SQG_NORMAL_E4M3,
+    SQG_CHEB_NORMAL_E4M3,
+    CODEBOOK_SQG_XOR_CHEB_T12,
+)
 
 
 def _read_json(path: Path) -> dict:
@@ -237,6 +257,10 @@ def _parse_rates(value: str) -> tuple[int, ...]:
     return values
 
 
+def _parse_k4_record_counts(value: str) -> tuple[int, ...]:
+    return _parse_ints(value, minimum=0, maximum=RECORDS_PER_EXPERT)
+
+
 def _parse_codebooks(value: str) -> tuple[str, ...]:
     values = tuple(part.strip() for part in value.split(",") if part.strip())
     if not values or len(set(values)) != len(values):
@@ -405,6 +429,10 @@ def _quantize_uniform_matrix(
         custom_codebook = sqg_e4m3_codebook(
             bits, mode, device=device, dtype=torch.float16
         )
+    elif codebook == CODEBOOK_SQG_XOR_CHEB_T12:
+        quant_args["sqg_e4m3_lut"] = sqg_xor_cheb_t12_bytes(
+            bits, device=device
+        )
     else:
         raise ValueError(f"unsupported codebook: {codebook}")
     if matrix in ("w1", "w3"):
@@ -484,6 +512,131 @@ def _quantize_uniform_matrix(
         },
     }
     return reconstruction, evidence
+
+
+def _quantize_k3_k4_matrix(
+    source: torch.Tensor,
+    contexts: torch.Tensor,
+    *,
+    matrix: str,
+    k4_records: int,
+    hessian: torch.Tensor,
+    layer: int,
+    expert: int,
+    device: torch.device,
+    quantizer_module,
+    ldlq_tf32: bool,
+    tailbite_context: int,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Encode one Kimi matrix with its highest-priority records at K4."""
+
+    if not 0 <= k4_records <= RECORDS_PER_EXPERT:
+        raise ValueError("K4 record count is outside the 24-record Kimi axis")
+    weight, encoder_hessian, permutation = _encoder_coordinates(
+        source, hessian, contexts, matrix=matrix
+    )
+    shared_h = make_shared_h(weight.shape[0], device, encoder_hessian)
+    record_bits = (3,) * (RECORDS_PER_EXPERT - k4_records) + (4,) * k4_records
+    tile_bits = tuple(
+        bits for bits in record_bits for _ in range(TILES_PER_RECORD_AXIS)
+    )
+    rate_axis = matrix_rate_axis(matrix)
+    transform_seed = layer * 1_000_000 + MATRICES.index(matrix)
+    quant_args: dict[str, object] = {
+        "K": 3,
+        "seed": transform_seed,
+        "sv_seed": transform_seed + 499_979,
+        "sigma_reg": SIGMA_REG,
+        "devices": [str(device)],
+        "device_ratios": None,
+        "apply_out_scales": False,
+        "ldlq_tf32": bool(ldlq_tf32),
+        "tailbite_context": int(tailbite_context),
+        "mixed_rate_axis": rate_axis,
+        "mixed_tile_bits": tile_bits,
+        "sqg_e4m3_luts_by_bits": {
+            bits: sqg_xor_cheb_t12_bytes(bits, device=device)
+            for bits in (2, 3, 4)
+        },
+    }
+    if matrix in ("w1", "w3"):
+        quant_args["shared_input_scales_key"] = (
+            "k3-k4-rate-frontier",
+            layer,
+            expert,
+            matrix,
+            k4_records,
+        )
+        quant_args["g_scale_into_sv"] = True
+
+    raw_groups = quantizer_module.quantize_qsrt_batch(
+        [weight],
+        [shared_h],
+        [[quant_args]],
+        return_weight_q=True,
+    )
+    if len(raw_groups) != 1 or len(raw_groups[0]) != 1:
+        raise ValueError("mixed K3/K4 encoder returned the wrong candidate count")
+    raw = raw_groups[0][0]
+    states = raw["encoded"].contiguous()
+    suh = raw["suh"].contiguous()
+    svh = raw["svh"].contiguous()
+    stored_encoder_weight = decode_qsrt_weight(
+        states,
+        suh,
+        svh,
+        rate_axis=rate_axis,
+        tile_bits=tile_bits,
+        codebook=CODEBOOK_SQG_XOR_CHEB_T12,
+    )
+    reconstruction = _canonical_reconstruction(
+        stored_encoder_weight, source, permutation, matrix=matrix
+    )
+    dense_numerator, dense_denominator = _dense_h_terms(
+        source,
+        reconstruction,
+        hessian,
+        quantizer_module=quantizer_module,
+        device=device,
+    )
+    raw_error = (reconstruction.double() - source.double()).square().sum()
+    raw_energy = source.double().square().sum()
+    total_trellis_bits = source.numel() * sum(record_bits) // len(record_bits)
+    if total_trellis_bits % 8:
+        raise ValueError("mixed K3/K4 trellis payload is not byte aligned")
+    trellis_bytes = total_trellis_bits // 8
+    scale_bytes = (suh.numel() + svh.numel()) * torch.float16.itemsize
+    closure = comparison_metrics(raw["weight_q"], stored_encoder_weight)
+    if not all(math.isfinite(value) for value in closure.values()):
+        raise ValueError("stored K3/K4 reconstruction closure is non-finite")
+    mean_bits = sum(record_bits) / len(record_bits)
+    return reconstruction, {
+        "matrix": matrix,
+        "bits": mean_bits,
+        "codebook": CODEBOOK_SQG_XOR_CHEB_T12,
+        "record_bits": list(record_bits),
+        "k4_records": k4_records,
+        "weight_nmse": float(raw_error / raw_energy),
+        "weight_squared_error": float(raw_error),
+        "weight_reference_energy": float(raw_energy),
+        "captured_dense_h_nmse": dense_numerator / dense_denominator,
+        "captured_dense_h_numerator": dense_numerator,
+        "captured_dense_h_denominator": dense_denominator,
+        "encoder_regularized_dense_h_proxy": float(raw["proxy"]),
+        "trellis_bytes": trellis_bytes,
+        "scale_bytes_before_layer_deduplication": scale_bytes,
+        "bytes_before_layer_deduplication": trellis_bytes + scale_bytes,
+        "trellis_bpw": mean_bits,
+        "trellis_and_scale_bpw_before_layer_deduplication": (
+            (trellis_bytes + scale_bytes) * 8 / source.numel()
+        ),
+        "stored_fp16_scale_closure_vs_encoder_float_scales": closure,
+        "tensor_shapes": {
+            "suh": list(suh.shape),
+            "svh": list(svh.shape),
+            "states": list(states.shape),
+        },
+    }
 
 
 def _aggregate_matrix_evidence(
@@ -696,13 +849,37 @@ def _signature(
         "layer": args.layer,
         "experts": list(args.experts),
         "rates": list(args.rates),
+        "k4_record_counts": (
+            None
+            if args.k4_record_counts is None
+            else list(args.k4_record_counts)
+        ),
         "codebooks": list(args.codebooks),
+        "sample_cache": (
+            None if args.sample_cache is None else str(args.sample_cache.resolve())
+        ),
+        "validation_sample_cache": (
+            None
+            if args.validation_sample_cache is None
+            else str(args.validation_sample_cache.resolve())
+        ),
         "ldlq_tf32": args.ldlq_tf32,
         "tailbite_context": args.tailbite_context,
         "compact": args.compact,
         "sqg_rank_lut": dict(sqg_rank_lut) if sqg_rank_lut is not None else None,
         "provenance": provenance,
     }
+
+
+def _load_study_samples(
+    capture: Path, cache: Path | None, layer: int
+) -> LayerSamples:
+    if cache is None:
+        return load_layer_samples(capture, layer)
+    manifest = _read_json(cache / "manifest.json")
+    if Path(str(manifest.get("source_capture", ""))).resolve() != capture.resolve():
+        raise ValueError("sample cache does not come from the requested capture")
+    return index_cached_layer_samples(cache, [layer]).pop(layer)
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -716,9 +893,11 @@ def run(args: argparse.Namespace) -> dict:
         args, training_report, validation_report
     )
     partition = _fit_contract(args, training_requests)
-    training_samples = load_layer_samples(args.capture, args.layer - 1)
-    validation_samples = load_layer_samples(
-        args.validation_capture, args.layer - 1
+    training_samples = _load_study_samples(
+        args.capture, args.sample_cache, args.layer - 1
+    )
+    validation_samples = _load_study_samples(
+        args.validation_capture, args.validation_sample_cache, args.layer - 1
     )
     global_h13, global_h2 = load_layer_hessians(args.hessians, args.layer)
     external_sqg_luts: dict[int, torch.Tensor] | None = None
@@ -751,7 +930,11 @@ def run(args: argparse.Namespace) -> dict:
         if args.output.exists():
             raise FileExistsError(args.output)
         payload = {
-            "kind": "kquant_uniform_k_mxfp4_endpoint_study",
+            "kind": (
+                "kquant_k3_k4_record_frontier_study"
+                if args.k4_record_counts is not None
+                else "kquant_uniform_k_mxfp4_endpoint_study"
+            ),
             "schema_version": 1,
             "signature": signature,
             "metric_target": (
@@ -834,29 +1017,62 @@ def run(args: argparse.Namespace) -> dict:
             )
         contexts = contexts.to(device=device, dtype=torch.long)
         candidates: dict[str, dict] = {}
-        for codebook in args.codebooks:
-            for bits in args.rates:
-                candidate_key = f"{codebook}:K{bits}"
+        if args.k4_record_counts is None:
+            candidate_specs = tuple(
+                (f"{codebook}:K{bits}", codebook, bits, None)
+                for codebook in args.codebooks
+                for bits in args.rates
+            )
+        else:
+            candidate_specs = tuple(
+                (
+                    (
+                        f"{CODEBOOK_SQG_XOR_CHEB_T12}:K3"
+                        if count == 0
+                        else f"{CODEBOOK_SQG_XOR_CHEB_T12}:K3+{count}K4"
+                    ),
+                    CODEBOOK_SQG_XOR_CHEB_T12,
+                    3.0 + count / RECORDS_PER_EXPERT,
+                    count,
+                )
+                for count in args.k4_record_counts
+            )
+        for candidate_key, codebook, bits, k4_records in candidate_specs:
                 reconstructions = []
                 matrix_evidence = []
                 torch.cuda.synchronize(device)
                 started = time.perf_counter()
                 for matrix, source_matrix in zip(MATRICES, source, strict=True):
-                    reconstruction, evidence = _quantize_uniform_matrix(
-                        source_matrix,
-                        contexts,
-                        matrix=matrix,
-                        bits=bits,
-                        codebook=codebook,
-                        hessian=h2 if matrix == "w2" else h13,
-                        layer=args.layer,
-                        expert=expert,
-                        device=device,
-                        quantizer_module=quantizer_module,
-                        ldlq_tf32=args.ldlq_tf32,
-                        tailbite_context=args.tailbite_context,
-                        external_sqg_luts=external_sqg_luts,
-                    )
+                    if k4_records is None:
+                        reconstruction, evidence = _quantize_uniform_matrix(
+                            source_matrix,
+                            contexts,
+                            matrix=matrix,
+                            bits=int(bits),
+                            codebook=codebook,
+                            hessian=h2 if matrix == "w2" else h13,
+                            layer=args.layer,
+                            expert=expert,
+                            device=device,
+                            quantizer_module=quantizer_module,
+                            ldlq_tf32=args.ldlq_tf32,
+                            tailbite_context=args.tailbite_context,
+                            external_sqg_luts=external_sqg_luts,
+                        )
+                    else:
+                        reconstruction, evidence = _quantize_k3_k4_matrix(
+                            source_matrix,
+                            contexts,
+                            matrix=matrix,
+                            k4_records=k4_records,
+                            hessian=h2 if matrix == "w2" else h13,
+                            layer=args.layer,
+                            expert=expert,
+                            device=device,
+                            quantizer_module=quantizer_module,
+                            ldlq_tf32=args.ldlq_tf32,
+                            tailbite_context=args.tailbite_context,
+                        )
                     reconstructions.append(reconstruction)
                     matrix_evidence.append(evidence)
                 torch.cuda.synchronize(device)
@@ -874,6 +1090,7 @@ def run(args: argparse.Namespace) -> dict:
                 candidates[candidate_key] = {
                     "codebook": codebook,
                     "bits": bits,
+                    "k4_records": k4_records,
                     "matrix_evidence": matrix_evidence,
                     "aggregate": _aggregate_matrix_evidence(matrix_evidence),
                     "routed_function": functional,
@@ -917,6 +1134,45 @@ def run(args: argparse.Namespace) -> dict:
                 )
             comparisons[codebook] = comparison
 
+        frontier: dict[str, dict[str, object]] = {}
+        if args.k4_record_counts is not None:
+            baseline_key = f"{CODEBOOK_SQG_XOR_CHEB_T12}:K3"
+            baseline = candidates[baseline_key]
+            for count in args.k4_record_counts:
+                if count == 0:
+                    continue
+                trial_key = f"{CODEBOOK_SQG_XOR_CHEB_T12}:K3+{count}K4"
+                trial = candidates[trial_key]
+                comparison = {
+                    "trellis_bpw": 3.0 + count / RECORDS_PER_EXPERT,
+                    "weight_error_ratio_over_k3": (
+                        float(trial["aggregate"]["weight_nmse"])
+                        / float(baseline["aggregate"]["weight_nmse"])
+                    ),
+                    "dense_h_error_ratio_over_k3": (
+                        float(trial["aggregate"]["captured_dense_h_nmse"])
+                        / float(baseline["aggregate"]["captured_dense_h_nmse"])
+                    ),
+                }
+                for fold in ("train", "confirmation", "validation"):
+                    base_fold = baseline["routed_function"].get(fold)
+                    trial_fold = trial["routed_function"].get(fold)
+                    if base_fold is None or trial_fold is None:
+                        continue
+                    comparison[f"{fold}_routed_error_ratio_over_k3"] = (
+                        float(trial_fold["route_weighted_squared_error"])
+                        / float(base_fold["route_weighted_squared_error"])
+                    )
+                    comparison[f"{fold}_paired_document_improvement"] = (
+                        _document_improvement(
+                            base_fold,
+                            trial_fold,
+                            replicates=args.bootstrap_replicates,
+                            seed=args.layer * 1_000_000 + expert * 100 + count,
+                        )
+                    )
+                frontier[str(count)] = comparison
+
         if args.compact:
             _compact_functional_evidence(candidates)
 
@@ -931,6 +1187,7 @@ def run(args: argparse.Namespace) -> dict:
             },
             "candidates": candidates,
             "k4_vs_k3": comparisons,
+            "k3_k4_frontier": frontier,
         }
         _atomic_write(args.output, payload)
         del source, fit_inputs, fit_gates, source_middle, h13, h2, contexts
@@ -960,6 +1217,16 @@ def parse_args() -> argparse.Namespace:
         default=Path("/data/kquant/k3-codec-diverse-validation-v3-128k.kqcapture"),
     )
     parser.add_argument(
+        "--sample-cache",
+        type=Path,
+        help="optional directly addressable cache for --capture",
+    )
+    parser.add_argument(
+        "--validation-sample-cache",
+        type=Path,
+        help="optional directly addressable cache for --validation-capture",
+    )
+    parser.add_argument(
         "--hessians",
         type=Path,
         default=Path("/data/kquant/k3-codec-diverse-train-v2-fit3of4-all.kqhess"),
@@ -979,6 +1246,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--experts", type=_parse_experts, required=True)
     parser.add_argument("--rates", type=_parse_rates, default=(2, 3, 4))
+    parser.add_argument(
+        "--k4-record-counts",
+        type=_parse_k4_record_counts,
+        help=(
+            "study K3 with the specified counts of highest-priority 128-channel "
+            "records promoted to K4; requires 0 and the production T12 codebook"
+        ),
+    )
     parser.add_argument(
         "--codebooks",
         type=_parse_codebooks,
@@ -1025,6 +1300,13 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             f"--sqg-rank-lut is required for {SQG_CHEB_NORMAL_E4M3}"
         )
+    if args.k4_record_counts is not None:
+        if 0 not in args.k4_record_counts:
+            parser.error("--k4-record-counts must include the uniform-K3 zero arm")
+        if args.codebooks != (CODEBOOK_SQG_XOR_CHEB_T12,):
+            parser.error(
+                "--k4-record-counts requires --codebooks sqg_xor_cheb_t12"
+            )
     return args
 
 

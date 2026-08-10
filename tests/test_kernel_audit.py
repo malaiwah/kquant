@@ -59,13 +59,30 @@ def test_qsrt_audit_requires_canonical_atom_reader() -> None:
     log = "\n".join(
         (
             "quantization=kquant_hybrid",
-            "Loaded QSRT atom layer 1 shard 0: 800 compressed, 96 X4T",
-            "target=some.module.W4A16FusedMoeKernel",
-            "repeat implementation=w4a16",
+            "Loaded QSRT layer 1 shard 0/12: 800 compressed, 96 X4T experts",
+            "B12X MoE repeat check: finite=True max_abs=0 "
+            "quant_mode=w4a16 implementation=w4a16",
         )
     )
 
     assert audit_kernel_path(log, "qsrt")["pass"] is True
+
+
+def test_qsrt_audit_rejects_loader_only_evidence() -> None:
+    log = "\n".join(
+        (
+            "quantization=kquant_hybrid",
+            "Loaded QSRT layer 1 shard 0/12: 800 compressed, 96 X4T experts",
+        )
+    )
+
+    report = audit_kernel_path(log, "qsrt")
+
+    assert report["pass"] is False
+    assert set(report["missing_evidence"]) == {
+        "w4a16_runtime",
+        "repeat_check_w4a16",
+    }
 
 
 def test_kernel_audit_rejects_unknown_path() -> None:

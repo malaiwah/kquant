@@ -56,6 +56,8 @@ from kquant.qsrt_rotations import (
     load_qsrt_rotation_plan,
 )
 from kquant.qsrt import (
+    FIXED_HIGH_RATE_TRELLIS_BYTES,
+    H308,
     INTERMEDIATE_CHANNELS,
     LATENT_CHANNELS,
     LOGICAL_CANDIDATE_SCHEMAS,
@@ -202,6 +204,24 @@ def _atomic_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
 
 
 def _candidate_payload_specs(layer: int, experts: list[int]) -> tuple[TensorSpec, ...]:
+    return _candidate_payload_specs_with_trellis_bytes(
+        layer, experts, MATRIX_TRELLIS_BYTES
+    )
+
+
+def _candidate_payload_specs_for_modes(
+    layer: int, experts: list[int], mode_ids: tuple[int, ...]
+) -> tuple[TensorSpec, ...]:
+    if mode_ids != (H308.mode_id,):
+        return _candidate_payload_specs(layer, experts)
+    return _candidate_payload_specs_with_trellis_bytes(
+        layer, experts, FIXED_HIGH_RATE_TRELLIS_BYTES
+    )
+
+
+def _candidate_payload_specs_with_trellis_bytes(
+    layer: int, experts: list[int], trellis_bytes: int
+) -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = []
     for expert in experts:
         for matrix in C.EXPERT_MATRICES:
@@ -209,7 +229,7 @@ def _candidate_payload_specs(layer: int, experts: list[int]) -> tuple[TensorSpec
                 TensorSpec(
                     candidate_tensor_name(layer, expert, matrix, "trellis"),
                     torch.int16,
-                    (MATRIX_TRELLIS_BYTES // torch.int16.itemsize,),
+                    (trellis_bytes // torch.int16.itemsize,),
                 )
             )
             suh = INTERMEDIATE_CHANNELS if matrix == "w2" else LATENT_CHANNELS
@@ -249,9 +269,64 @@ def _parse_ints(value: str) -> tuple[int, ...]:
 
 def _parse_modes(value: str) -> tuple[int, ...]:
     modes = _parse_ints(value)
-    if modes[0] != 0 or any(not 0 <= mode <= 12 for mode in modes):
-        raise argparse.ArgumentTypeError("mode IDs must begin with 0 and lie in 0..12")
+    if modes == (H308.mode_id,):
+        return modes
+    if modes[0] != 0 or any(mode not in (0, 1, 2) for mode in modes):
+        raise argparse.ArgumentTypeError(
+            "mode IDs must be H308 alone (3) or begin with R0 and lie in 0..2"
+        )
     return modes
+
+
+def _format_label(r13: int, r2: int) -> str:
+    if r13 == r2 == H308.mode_id:
+        return H308.name
+    return f"R{r13}/R{r2}"
+
+
+def _selection_contract(args: argparse.Namespace) -> dict[str, object]:
+    fixed_high_rate = args.mode_ids == (H308.mode_id,)
+    if fixed_high_rate:
+        return {
+            "mode_ids": [H308.mode_id],
+            "format_grid": "fixed_h308",
+            "shared_r": True,
+            "candidate_construction_fold": "fit",
+            "mode_selection_fold": "none",
+            "mode_proposal_metric": "none",
+            "mode_acceptance": "fixed_22k3_2k4_high_rate_profile",
+            "external_validation_used": False,
+        }
+    return {
+        "mode_ids": list(args.mode_ids),
+        "format_grid": "cartesian_r13_r2",
+        "shared_r": False,
+        "candidate_construction_fold": "fit",
+        "mode_selection_fold": "confirmation",
+        "mode_proposal_metric": "confirmation_routed_functional_sse",
+        "mode_acceptance": "paired_document_bootstrap_lower_bound_vs_r0",
+        "external_validation_used": False,
+    }
+
+
+def _h2_contract(args: argparse.Namespace) -> dict[str, object]:
+    fixed_high_rate = args.mode_ids == (H308.mode_id,)
+    return {
+        "basis": PHASE1_H2_LOCAL_BASIS,
+        "indexed_by": (
+            "expert_upstream_profile" if fixed_high_rate else "expert_r13"
+        ),
+        "shrinkage_policy": PHASE1_H2_SHRINKAGE_POLICY,
+        "maximum_local_alpha": PHASE1_H2_EXPERT_LOCAL_ALPHA,
+        "prior": "expert_local_trace_scaled_identity",
+        "unsupported_expert_fallback": "identity",
+        "router_weighting": "applied_gate_squared",
+        "down_candidate_grid": (
+            "one_decoded_upstream_conditioned_h308"
+            if fixed_high_rate
+            else "w2_r13_r2"
+        ),
+    }
 
 
 def _layer_stem(layer: int, experts: list[int]) -> str:
@@ -899,7 +974,7 @@ def encode_layer(
     started = time.time()
     with AtomicSafetensorsWriter(
         payload_path,
-        _candidate_payload_specs(layer, experts),
+        _candidate_payload_specs_for_modes(layer, experts, args.mode_ids),
         metadata={
             "kind": KIND,
             "schema_version": str(SCHEMA_VERSION),
@@ -994,9 +1069,14 @@ def encode_layer(
                 zip(actual_experts, candidates)
             ):
                 row = batch_begin + batch_row
-                selected_payload = selected_candidate_tensors(
-                    layer, expert, candidate
-                )
+                try:
+                    selected_payload = selected_candidate_tensors(
+                        layer, expert, candidate
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"layer {layer} expert {expert} payload closure failed"
+                    ) from exc
                 payload_writer.write_many(selected_payload)
                 del selected_payload
                 _store_metrics(metrics, row, args.mode_ids, candidate)
@@ -1038,7 +1118,7 @@ def encode_layer(
 
     _atomic_safetensors(metrics_path, metrics)
     selected_histogram = {
-        f"R{r13}/R{r2}": int(
+        _format_label(r13, r2): int(
             (
                 (metrics["selected_r13"] == r13)
                 & (metrics["selected_r2"] == r2)
@@ -1063,31 +1143,15 @@ def encode_layer(
         "hessian_policy": args.hessian_policy,
         "permutation_policy": getattr(args, "permutation_policy", "h2_reverse"),
         "folded_scale_power": float(getattr(args, "folded_scale_power", 0.0)),
-        "h2_contract": {
-            "basis": PHASE1_H2_LOCAL_BASIS,
-            "indexed_by": "expert_r13",
-            "shrinkage_policy": PHASE1_H2_SHRINKAGE_POLICY,
-            "maximum_local_alpha": PHASE1_H2_EXPERT_LOCAL_ALPHA,
-            "prior": "expert_local_trace_scaled_identity",
-            "unsupported_expert_fallback": "identity",
-            "router_weighting": "applied_gate_squared",
-            "down_candidate_grid": "w2_r13_r2",
-        },
+        "h2_contract": _h2_contract(args),
         "selection_contract": {
-            "mode_ids": list(args.mode_ids),
-            "format_grid": "cartesian_r13_r2",
-            "shared_r": False,
-            "candidate_construction_fold": "fit",
-            "mode_selection_fold": "confirmation",
-            "mode_proposal_metric": "confirmation_routed_functional_sse",
-            "mode_acceptance": "paired_document_bootstrap_lower_bound_vs_r0",
+            **_selection_contract(args),
             "fit_documents": len(partition.fit),
             "confirmation_documents": len(partition.confirmation),
             "min_fit_documents": args.min_fit_documents,
             "min_confirmation_documents": args.min_confirmation_documents,
             "minimum_improvement": args.minimum_improvement,
             "bootstrap_replicates": args.bootstrap_replicates,
-            "external_validation_used": False,
         },
         "damage_contract": {
             "metric": OFFICIAL_SOURCE_DAMAGE_METRIC,
@@ -1141,11 +1205,12 @@ def _validate_canonical_payload(
     layer: int,
     codebook: str,
     tailbite_context: int,
+    mode_ids: tuple[int, ...],
 ) -> None:
     expected = {
         spec.name: (spec.dtype, spec.shape)
-        for spec in _candidate_payload_specs(
-            layer, list(range(C.NUM_EXPERTS))
+        for spec in _candidate_payload_specs_for_modes(
+            layer, list(range(C.NUM_EXPERTS)), mode_ids
         )
     }
     with safe_open(str(path), framework="pt", device="cpu") as handle:
@@ -1204,7 +1269,9 @@ def _merge_scheduled_layer(
             AtomicSafetensorsWriter.discard_stale_partial(payload_path)
         with AtomicSafetensorsWriter(
             payload_path,
-            _candidate_payload_specs(layer, list(range(C.NUM_EXPERTS))),
+            _candidate_payload_specs_for_modes(
+                layer, list(range(C.NUM_EXPERTS)), args.mode_ids
+            ),
             metadata={
                 "kind": KIND,
                 "schema_version": str(SCHEMA_VERSION),
@@ -1218,7 +1285,9 @@ def _merge_scheduled_layer(
                 source_path = candidate_dir / f"{stem}.safetensors"
                 expected_names = {
                     spec.name
-                    for spec in _candidate_payload_specs(layer, list(job.experts))
+                    for spec in _candidate_payload_specs_for_modes(
+                        layer, list(job.experts), args.mode_ids
+                    )
                 }
                 with safe_open(
                     str(source_path), framework="pt", device="cpu"
@@ -1236,8 +1305,8 @@ def _merge_scheduled_layer(
                         raise ValueError(
                             f"subset payload tail-biting context drifted: {source_path}"
                         )
-                    for spec in _candidate_payload_specs(
-                        layer, list(job.experts)
+                    for spec in _candidate_payload_specs_for_modes(
+                        layer, list(job.experts), args.mode_ids
                     ):
                         writer.write(spec.name, handle.get_tensor(spec.name))
     _validate_canonical_payload(
@@ -1245,6 +1314,7 @@ def _merge_scheduled_layer(
         layer=layer,
         codebook=args.codebook,
         tailbite_context=args.tailbite_context,
+        mode_ids=args.mode_ids,
     )
 
     if not metrics_path.exists():
@@ -1338,7 +1408,7 @@ def _merge_scheduled_layer(
             raise ValueError(f"layer {layer} merged selections are incomplete")
         metrics = load_file(str(metrics_path), device="cpu")
         selected_histogram = {
-            f"R{r13}/R{r2}": int(
+            _format_label(r13, r2): int(
                 (
                     (metrics["selected_r13"] == r13)
                     & (metrics["selected_r2"] == r2)
@@ -1497,28 +1567,12 @@ def _manifest(args: argparse.Namespace) -> dict:
         "hessian_policy": args.hessian_policy,
         "permutation_policy": getattr(args, "permutation_policy", "h2_reverse"),
         "folded_scale_power": float(getattr(args, "folded_scale_power", 0.0)),
-        "h2_contract": {
-            "basis": PHASE1_H2_LOCAL_BASIS,
-            "indexed_by": "expert_r13",
-            "shrinkage_policy": PHASE1_H2_SHRINKAGE_POLICY,
-            "maximum_local_alpha": PHASE1_H2_EXPERT_LOCAL_ALPHA,
-            "prior": "expert_local_trace_scaled_identity",
-            "unsupported_expert_fallback": "identity",
-            "router_weighting": "applied_gate_squared",
-            "down_candidate_grid": "w2_r13_r2",
-        },
-        "mode_ids": list(args.mode_ids),
-        "format_grid": "cartesian_r13_r2",
-        "shared_r": False,
-        "candidate_construction_fold": "fit",
-        "mode_selection_fold": "confirmation",
-        "mode_proposal_metric": "confirmation_routed_functional_sse",
-        "mode_acceptance": "paired_document_bootstrap_lower_bound_vs_r0",
+        "h2_contract": _h2_contract(args),
+        **_selection_contract(args),
         "min_fit_documents": args.min_fit_documents,
         "min_confirmation_documents": args.min_confirmation_documents,
         "minimum_improvement": args.minimum_improvement,
         "bootstrap_replicates": args.bootstrap_replicates,
-        "external_validation_used": False,
         "damage_metric": OFFICIAL_SOURCE_DAMAGE_METRIC,
         "damage_already_natural_route_and_gate_weighted": True,
         "random_transform_contract": (
@@ -1577,9 +1631,10 @@ def parent(args: argparse.Namespace) -> None:
         capture=args.capture,
         teacher_checkpoint=args.teacher_checkpoint,
     )
+    fixed_high_rate = args.mode_ids == (H308.mode_id,)
     max_mode = max(args.mode_ids)
-    r0_work = 72
-    full_work = r0_work if max_mode == 0 else 96 + 8 * max_mode
+    r0_work = 74 if fixed_high_rate else 72
+    full_work = r0_work if fixed_high_rate or max_mode == 0 else 96 + 8 * max_mode
     if schedule_path.exists():
         if not args.resume:
             raise FileExistsError(schedule_path)

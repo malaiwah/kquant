@@ -252,6 +252,143 @@ The mode is `(r13, r2)`. `w1` and `w3` share `r13` for fused execution;
 `w2` selects `r2` independently. The common physical neuron permutation does
 not require the three matrices to share a rate schedule.
 
+### Allocation coordinate invariant
+
+The neuron permutation and the rate allocator act at different granularities
+and must be composed in a fixed order. First freeze one bijection $P$ over the
+3,072 intermediate coordinates and apply it identically to `w1`, `w3`, and
+`w2` as above. Then define every record or tile rate decision in that encoder
+coordinate system. The same $P$ must be used to construct K2/K3/K4 candidate
+errors, select the rate map, rerun BlockLDLQ with the selected map, and score
+the reconstructed expert after undoing $P$.
+
+The present conditioning search is a restricted subset of those bijections:
+it moves indivisible contiguous four-channel groups and forms each 16-channel
+neuron band from exactly four such groups. Each neuron band intersects all 224
+orthogonal 16-channel bands, producing 224 distinct 16x16 coefficient tiles;
+the funding decision belongs to one such intersection, not to the neuron band
+alone. This restriction preserves the encoder's score and packing unit. It
+must not be described as a tile permutation: one group move changes every
+orthogonal tile incident on those four channels. The rate allocator sees only
+the completed post-permutation tile grid and cannot move, split, or reinterpret
+a group.
+
+Conditioning policies span exact sensitivity order, within-record balancing,
+source-shape clustering, and joint sensitivity/rate-response clustering. A
+rate-response feature for one four-channel group is computed only after a
+preliminary K2/K3/K4 encode and contains its regularized K3 error and K2/K3
+and K3/K4 error ratios across every one of the 224 incident orthogonal bands,
+separately for upstream and down. The current search preserves each
+128-channel importance population and clusters only the 32 four-channel groups
+inside that record. It does not move a favorable local group into a different
+donor or recipient population. This is a fixed fit-only proposal rule, not a
+fitted continuous hyperparameter.
+
+A tile allocator is not allowed to change $P$. Searching a conditioning
+permutation is an outer discrete experiment: each proposed $P$ receives a
+complete, independently encoded and validated rate-allocation search. Within
+a fixed 128-channel record, a conditioning policy may reorder its eight
+16-channel stripes without changing record membership. Moving a channel
+between records changes both the candidate basis and its donor/recipient
+population and therefore requires rebuilding all rate-error surfaces.
+
+Formally, let $A_{13}$ be the shared gate/up tile-rate map and $A_2$ the down
+tile-rate map. The experiment is bilevel:
+
+$$
+(A_{13}^*(P),A_2^*(P))
+=\arg\min_{A_{13},A_2}D_{\mathrm{fit}}(P,A_{13},A_2),
+$$
+
+followed by comparison of
+
+$$
+D_{\mathrm{confirm}}
+\left(P,A_{13}^*(P),A_2^*(P)\right).
+$$
+
+The confirmation partition never selects a tile, a permutation, or a prefix.
+When selecting the permutation policy itself, aggregate fit evidence across
+training experts and report its result on held-out experts; do not choose the
+policy from the same experts' confirmation scores. Every reported candidate
+uses a complete BlockLDLQ re-encode and an independently fitted scale. Local
+tile errors and single-toggle functional deltas are proposal statistics only,
+because the channel permutation and BlockLDLQ feedback couple many tiles.
+
+Gate and up share an intermediate-axis rate map. Down uses an independent map
+over its matching intermediate axis because its orthogonal 16-channel tile
+coordinate has different functional meaning. A tile-funding experiment may
+therefore share a bitmap between `w1` and `w3`, but it must not silently reuse
+that bitmap for `w2`. All compared candidates record the frozen permutation
+identity, and the research encoder rejects implicit or mismatched permutation
+bases.
+
+### Constant-payload 3.083-bpw allocation
+
+For 24 intermediate-axis records, an all-QSRT allocation with two more K4
+records than K2 records satisfies
+
+$$
+N K2 + (22-2N)K3 + (N+2)K4 = 74
+$$
+
+trellis bits per 24 coefficients, or $74/24=3.083\overline{3}$ trellis bpw.
+At record granularity this is one P44 pair, $N$ P24 pairs, and $11-N$ P33
+pairs. At tile granularity the same identity is enforced independently for
+every 16-channel strip after the neuron permutation is frozen. The shared
+gate/up map and independent down map must each sum to 74 bits in every strip.
+
+Two fixed-stride selector grammars were evaluated as research controls. The
+paired grammar stores one 32-bit word per strip containing eleven P33/P24 bits
+for gate/up and eleven for down. Across 1,792 strips this costs 7,168 bytes per
+expert, or 0.001736 bpw over all three expert matrices. A top-two-K4 grammar
+also stores one 32-bit word per strip: each of the gate/up and down K4-record
+pairs is one of $\binom{24}{2}=276$ possibilities and therefore needs nine
+bits. This likewise costs 7,168 bytes, or 0.001736 bpw. Its disposable
+rank-local serving view may expand the canonical word into two 24-bit masks,
+but those 14,336 prepared bytes are not checkpoint payload. Both grammars have
+a trellis-plus-selector rate of 3.085069 bpw.
+Scale and container metadata are accounted separately by exact serialized
+bytes.
+
+The current numerical gate uses `h2_reverse` as the frozen permutation. A
+four-expert layer-24 screen compared two allocation-conditioned permutations
+that moved only intact 16-channel bands within fixed 128-channel records. The
+P24-pair objective and top-two-K4 objective improved their fit proxies, but
+their isolated serial confirmation SSE regressed by 0.277% and 0.293%
+respectively. A preceding 24-expert split likewise rejected rate-response
+clustering by 0.205% on held-out experts. These policies remain research
+controls; tile allocation does not authorize changing the production neuron
+ordering.
+
+A 24-expert panel spanning layers 1, 24, and 40 used fit documents for every
+schedule decision and document-disjoint confirmation rows for the final
+comparison. The isolated confirmation results were:
+
+| 3.083-bpw schedule | Pooled SSE | Change from K3 |
+| --- | ---: | ---: |
+| K3 on all 24 records | 3.335706 | baseline |
+| Fixed 22 K3 + 2 K4 records | 2.938512 | -11.907% |
+| Tile-top-two K4 for gate/up only | 2.941872 | -11.807% |
+| Tile-top-two K4 for down only | 2.944253 | -11.735% |
+| Tile-top-two K4 for both axes | 2.950014 | -11.563% |
+
+The fixed record schedule is therefore the qualified first 3.083-bpw profile.
+It is slightly better than every tile-top-two selector while requiring no
+selector payload, no tile-local rate bookkeeping, and no new kernel grammar.
+An exploratory broad schedule search reached 2.932161 pooled SSE, only 0.216%
+below the fixed schedule, but its candidate shortlist was formed from batched
+fit proxies and is not production evidence. It does not justify the added
+metadata or runtime surface.
+
+All 24 fixed-schedule experts improved over K3. On a four-expert scale-control
+subset, separately closing both sides left the high-rate schedules 17.79%
+below scale-closed K3. The five-point path-aware schedule-specific scale search
+regressed the high-rate pooled result by 0.113% and improved K3 by 0.174%, so
+the profile retains the source-local scale fitted by the uniform-K3 procedure.
+The serialized trellis rate is exactly $74/24=3.083\overline{3}$ bpw before
+the existing scale and container metadata.
+
 ## TP-independent balanced-atom storage
 
 Tensor parallelism is a view over the checkpoint, not part of the codec. The
@@ -318,19 +455,26 @@ $$
 
 The rotation is defined over the model-global atom axis and contains no TP
 rank. It rotates complete record pairs, leaves the stripe index unchanged,
-and is bijective for every layer/expert. The on-disk compressed tensor is
+and is bijective for every layer/expert. Both on-disk revisions are
 atom-major:
 
 ```text
-[96 physical atom slots, compressed experts, 129216 bytes]
+atoms-v1: [96 physical atom slots, compressed experts, 129216 bytes]
+atoms-v2: [96 physical atom slots, fixed padded row stride]
 ```
 
 The layer file is a standards-valid safetensors container. Its tensors are the
-atom slab above, a 4 KiB expert-format section, and a 24 KiB shared-scale
-section. The safetensors header itself occupies a fixed 4 KiB. Each physical
-atom row is padded once to a 4 KiB boundary, at most 4,095 bytes per slot per
-layer rather than per expert. These fixed offsets permit direct range loading
-of physical atom rows without parsing or copying unrelated payload bytes.
+atom slab, a 4 KiB expert-format section, and a 24 KiB shared-scale section.
+The safetensors header itself occupies a fixed 4 KiB. Each physical atom row
+is padded once to a 4 KiB boundary, at most 4,095 bytes per slot per layer
+rather than per expert. These fixed offsets permit direct range loading of
+physical atom rows without parsing or copying unrelated payload bytes.
+
+Atoms-v1 uses a uniform 129,216-byte bundle for each three-bit QSRT expert.
+Atoms-v2 retains the same 96-row container and atom ownership, but permits a
+fixed profile to divide each row into compact groups with different bundle
+widths. Group membership is a deterministic function of layer, expert, and
+physical record pair; it is not serialized as a TP-specific map.
 
 ### Shard views
 
@@ -373,6 +517,48 @@ are disposable caches and are never checkpoint files.
 
 The canonical implementation and byte-accounting reference are in
 `kquant/qsrt_storage.py`.
+
+### Fixed high-rate `atoms_v2` profile
+
+The 3.083-bpw all-QSRT profile has no P24 pairs or tile selector. In logical
+importance order, records 0 through 21 are K3 and records 22 and 23 are K4.
+The checkpoint then applies one expert-static permutation of complete
+128-channel records, shared by `w1` rows, `w3` rows, and `w2` columns. This is
+the exact symmetry
+
+$$
+W_1'=PW_1,\qquad W_3'=PW_3,\qquad W_2'=W_2P^\mathsf{T}.
+$$
+
+No channel, 16-channel tile, or transformed block is split by this placement.
+Because the encoder's intermediate transform is block-128, moving complete
+records commutes with that transform. The rate schedule, reconstructed expert
+function, and source-local scales are therefore unchanged by physical
+balancing.
+
+The two K4 records are placed in distinct physical record pairs. The pair
+assignment is rotated by
+
+$$
+\rho_{\ell,e}=(5e+\ell)\bmod12,
+$$
+
+which balances K4 work across serving shards without serializing a TP count.
+The profile uses the atoms-v2 revision of the canonical atom container. Every
+physical record pair contributes eight consecutive atom rows. Within each
+row, experts using P33 are stored first in ascending expert order with a
+129,216-byte bundle; experts using P43 follow in ascending expert order with a
+150,720-byte bundle. The common row stride is the 4-KiB-aligned maximum over
+all 96 rows. The layer, expert, and physical-pair rotation determines group
+membership exactly, so the file stores neither a TP count nor an expert mode
+bitmap.
+
+A rank owns complete contiguous atom rows; at TP12 it reads eight rows, or 256
+intermediate channels. The canonical expert-layer container size is
+1,051,056,799,744 bytes across 92 layers, including safetensors headers and row
+padding. Load preparation removes the group layout into a disposable compact
+P33/P43 operand pool. The canonical layout and exact accounting are in
+`kquant/qsrt_atoms_v2.py`.
 
 ## Dense-H encoding and statistical selection
 
@@ -568,31 +754,14 @@ staircase, or per-expert codebook selector. Those names may appear in archived
 measurements and offline research controls, but they are not valid payload or
 kernel profile identities.
 
-The preceding profile-5 decision was supported by a confirmation study on 384 unseen,
-support-stratified experts from layers 1, 24, and 40. It used production
-Hadamard ordering, TF32 dense-H BlockLDLQ, decoded-upstream conditional `H2`,
-the complete `R0/R1/R2` grid, and document-disjoint confirmation and external
-validation:
-
-| Complete mode | Validation SSE improvement | Wins | Layer-stratified expert 95% interval |
-| --- | ---: | ---: | ---: |
-| fixed `R0/R1` | +0.04249% | 236 / 384 | crosses zero |
-| fixed `R0/R2` | **+0.13345%** | **269 / 384** | **+0.07707% to +0.19738%** |
-| fixed `R2/R2` | +0.06896% | 260 / 384 | +0.01682% to +0.12203% |
-
-The document-cluster bootstrap for fixed `R0/R2` used 223 active documents
-and produced a +0.07074% to +0.20312% interval. Every fit-support quartile
-improved. The native K2 profile's aggregate fixed `R0/R2` exchange was
-slightly harmful relative to its own `R0/R0`; Q8H4 made it beneficial.
-
-That study remains evidence for QSRT's rate-shift architecture and calibration
-policy, but its stored paths are not reusable under the new graph. The next
-encoder contract uses the `qsrt_sqg_e4m3` encoding profile with the
-`sqg_xor_cheb_t12` codebook, rotation draw zero, `h2_reverse`,
-folded-scale power zero, decoded-upstream conditional expert-local `H2`, and
-TF32 dense-H LDLQ. The profile-5 pool is now a teacher/comparison artifact;
-the serving candidate pool must be re-encoded because changing continuation
-geometry changes Viterbi paths.
+Rate shifting was checked on 384 unseen, support-stratified experts from layers
+1, 24, and 40 using production Hadamard ordering, TF32 dense-H BlockLDLQ,
+decoded-upstream conditional `H2`, the complete `R0/R1/R2` grid, and
+document-disjoint confirmation and external validation. The native
+`sqg_xor_cheb_t12` law retained 89 shifted experts, including 88 with `w2`
+R1+ and 77 with `w2=R2`, at a pooled selected external SSE of 68.5222868.
+This establishes the native four-stratum K2 mapping as the sole encoder
+contract. No matrix- or rate-specific reconstruction-law selector is used.
 
 ### Offline trellis-encoder optimization
 
@@ -628,41 +797,31 @@ arbitrary-record search.  The current production build remains C128 end to
 end; C32 may be revisited only as a shortlist generator followed by exact C128
 re-encoding after a substantially broader audit.
 
-### Interim all-expert mode-selection evidence
+### All-expert mode selection
 
-The profile-ID-5 production pool was built at
-`/models/Kimi-K3-QSRT-CHEB-Q8H4-CANDIDATES-v1`.  At the 2026-08-05 04:59 PDT
-snapshot, 44 complete atomic selection sidecars contained 27,176 unique
-experts across 33 partly or fully represented layers.  A nonzero mode was
-retained only when its paired, document-clustered confirmation lower bound
-cleared the zero-improvement margin.
+The sealed production candidate pool at
+`/data/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-CANDIDATES-v1` contains all 92
+MoE layers and 82,432 experts. A nonzero mode is retained only when its paired,
+document-clustered confirmation lower bound clears the zero-improvement
+margin.
 
 | Selected `(r13,r2)` | Experts | Share |
 | --- | ---: | ---: |
-| `R0/R0` | 20,485 | 75.379% |
-| `R0/R1` | 266 | 0.979% |
-| `R0/R2` | 894 | 3.290% |
-| `R1/R0` | 125 | 0.460% |
-| `R1/R1` | 974 | 3.584% |
-| `R1/R2` | 2,763 | 10.167% |
-| `R2/R0` | 9 | 0.033% |
-| `R2/R1` | 18 | 0.066% |
-| `R2/R2` | 1,642 | 6.042% |
+| `R0/R0` | 73,053 | 88.622% |
+| `R0/R1` | 1,007 | 1.222% |
+| `R0/R2` | 1,231 | 1.493% |
+| `R1/R0` | 213 | 0.258% |
+| `R1/R1` | 1,252 | 1.519% |
+| `R1/R2` | 3,428 | 4.159% |
+| `R2/R0` | 10 | 0.012% |
+| `R2/R1` | 30 | 0.036% |
+| `R2/R2` | 2,208 | 2.679% |
 
-In aggregate, 6,691 experts, or 24.621%, selected a confirmed nonzero shift.
-The down projection selected R1+ in 6,557 experts (24.128%), while the coupled
-gate/up pair selected R1+ in 5,531 (20.353%).  R2 appeared on at least one
-axis in 5,326 experts (19.598%).  The large `R1/R2` and `R2/R2` populations
-show that the recovered effect is not confined to a few marginal R1 choices:
-the down axis remains the more frequent shifter, and joint `w13`/`w2` shifts
-are also common.
-
-This snapshot is historical confirmation-stage incidence, not a final model-wide mode
-distribution or a quality result.  The work-balanced schedule makes the set
-of completed layers nonuniform, incomplete sidecars are excluded, untouched
-validation did not turn it into a QSRT-E4M3 pool, and X4T endpoint allocation
-is a separate exact-byte optimization. A new all-expert encode must recompute
-the rate modes under the current graph and staircase.
+In aggregate, 9,379 experts (11.378%) select a confirmed nonzero shift. The
+down projection selects R1+ in 9,156 experts (11.107%), the coupled gate/up
+pair selects R1+ in 7,141 (8.663%), and R2 appears on at least one axis in
+6,907 experts (8.379%). X4T endpoint allocation is a separate exact-byte
+optimization over these sealed candidates.
 
 ## Execution checklist
 

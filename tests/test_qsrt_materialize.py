@@ -12,10 +12,12 @@ from kquant.qsrt import PHASE1_MODE_IDS
 from kquant.pack.qsrt_pool import QSRTCandidatePool
 from kquant.pack.qsrt_allocation import (
     choose_qsrt_lagrangian,
+    make_qsrt_fixed_allocation,
     qsrt_allocation_document,
 )
 from kquant.pack.qsrt_materialize import (
     qsrt_materialization_build_document,
+    qsrt_structural_layer_closure,
     validate_qsrt_materialization_allocation,
 )
 from kquant.pack.x4t_index import (
@@ -104,6 +106,51 @@ def test_qsrt_materialization_rejects_byte_and_mode_drift(tmp_path) -> None:
     document["layers"]["1"]["format_codes"][8] = 0
     with pytest.raises(ValueError, match="selected trellis candidate"):
         validate_qsrt_materialization_allocation(document, pool, index)
+
+
+def test_qsrt_materialization_accepts_authenticated_fixed_set(tmp_path) -> None:
+    pool, index = _fixtures(tmp_path)
+    mask = np.zeros_like(pool.damage, dtype=np.bool_)
+    mask[0, [7, 8]] = True
+    allocation = make_qsrt_fixed_allocation(
+        pool.damage,
+        index.expert_storage_bytes,
+        mask,
+    )
+    document = qsrt_allocation_document(
+        pool,
+        index,
+        allocation,
+        fixed_selection_provenance={
+            "policy": "test_fixed_set",
+            "requested_x4t_experts": 2,
+        },
+    )
+
+    plan = validate_qsrt_materialization_allocation(document, pool, index)
+
+    assert plan.x4t_experts == 2
+    assert plan.layers[0].x4t == (7, 8)
+    document["meta"]["fixed_x4t_mask_sha256"] = "00" * 32
+    with pytest.raises(ValueError, match="mask digest"):
+        validate_qsrt_materialization_allocation(document, pool, index)
+
+
+def test_qsrt_structural_closure_is_not_bit_exact() -> None:
+    structural = {
+        "layer_container_bytes": 123,
+        "compressed_experts": 800,
+        "x4t_experts": 96,
+    }
+
+    closure = qsrt_structural_layer_closure(structural)
+
+    assert closure == {
+        **structural,
+        "payload_closure": "structural_only",
+        "compressed_experts_verified": 0,
+        "x4t_experts_verified": 0,
+    }
 
 
 def test_qsrt_build_freezes_allocation_damage_provenance(tmp_path) -> None:

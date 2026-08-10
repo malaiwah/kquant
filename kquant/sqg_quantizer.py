@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 from functools import lru_cache
 from pathlib import Path
 from collections.abc import Mapping
@@ -12,11 +14,41 @@ from torch.utils.cpp_extension import load
 from kquant.sqg_e4m3 import sqg_e4m3_bytes
 
 
+def _debug_check_trellis_closure(indices: torch.Tensor, bits: int) -> None:
+    """Fail at the CUDA boundary if a tile contains an inconsistent state.
+
+    This is intentionally opt-in because it adds a device synchronization to
+    every tile-quantizer call.  It distinguishes an invalid state written by
+    the traceback kernel from corruption introduced later while mixed-rate
+    candidates are assembled and scored.
+    """
+
+    edges = indices.to(torch.int64) & ((1 << bits) - 1)
+    expected = torch.zeros_like(edges)
+    for lag in range(math.ceil(16 / bits)):
+        expected |= torch.roll(edges, shifts=lag, dims=-1) << (lag * bits)
+    expected = (expected & 0xFFFF).to(torch.int16)
+    mismatch = indices != expected
+    if bool(torch.any(mismatch)):
+        count = int(torch.count_nonzero(mismatch))
+        first = tuple(
+            int(value)
+            for value in torch.nonzero(mismatch, as_tuple=False)[0].cpu().tolist()
+        )
+        encoded = int(indices[first].to(torch.int32).cpu())
+        reconstructed = int(expected[first].to(torch.int32).cpu())
+        raise RuntimeError(
+            "SQG tile kernel emitted a non-closing trellis state: "
+            f"K{bits}, {count} states differ; first at {first}, "
+            f"encoded={encoded}, reconstructed={reconstructed}"
+        )
+
+
 @lru_cache(maxsize=1)
 def _extension():
     project = Path(__file__).resolve().parents[1]
     return load(
-        name="kquant_sqg_quantize_ext_v22",
+        name="kquant_sqg_quantize_ext_v25",
         sources=[
             str(project / "kquant/csrc/sqg_quantize.cpp"),
             str(project / "kquant/csrc/sqg_quantize.cu"),
@@ -42,7 +74,7 @@ def _sqg_temp_buffers(device: torch.device, bits: int):
 
     multiprocessors = torch.cuda.get_device_properties(device).multi_processor_count
     edges = 65536 >> bits
-    decisions = edges // (4 if bits == 2 else 2)
+    decisions = edges // 4 if bits == 2 else edges // 2 if bits <= 4 else edges
     free_bytes, _ = torch.cuda.mem_get_info(device)
     decision_bytes_per_tile = 256 * decisions
     affordable = max(256, int(free_bytes * 0.5) // decision_bytes_per_tile)
@@ -77,16 +109,52 @@ def install_sqg_quantizer(quantizer_module) -> None:
 
     def quantize_tiles(tiles: torch.Tensor, quant_args: dict):
         codebook = quant_args.get("sqg_e4m3_lut")
+        fp16_codebook = quant_args.get("sqg_fp16_lut")
         rate_codebooks = quant_args.get("sqg_e4m3_luts_by_bits")
         mode = quant_args.get("sqg_e4m3_mode")
-        if codebook is None and rate_codebooks is None and mode is None:
+        if (
+            codebook is None
+            and fp16_codebook is None
+            and rate_codebooks is None
+            and mode is None
+        ):
             return original(tiles, quant_args)
+        if fp16_codebook is not None and (
+            codebook is not None or rate_codebooks is not None or mode is not None
+        ):
+            raise ValueError("an FP16 SQG table cannot be combined with another codebook")
         if len(quant_args["devices"]) != 1:
             raise ValueError("the SQG validation hook currently requires one CUDA device")
         tiles = tiles.contiguous()
         if tiles.dtype != torch.float32 or tiles.ndim != 2 or tiles.shape[1] != 256:
             raise ValueError("SQG tiles must be contiguous FP32 [N, 256]")
         bits = int(quant_args["K"])
+        if fp16_codebook is not None:
+            output = torch.empty_like(tiles)
+            indices = torch.empty_like(tiles, dtype=torch.int16)
+            costs, edges = _sqg_temp_buffers(tiles.device, bits)
+            lut = fp16_codebook.to(
+                device=tiles.device, dtype=torch.float16
+            ).contiguous()
+            if lut.ndim != 1 or lut.numel() != 65536 or not bool(
+                torch.isfinite(lut).all()
+            ):
+                raise ValueError(
+                    "an experimental FP16 SQG table must contain 65,536 finite values"
+                )
+            _extension().quantize_tiles_fp16(
+                tiles,
+                output,
+                indices,
+                costs,
+                edges,
+                lut,
+                bits,
+                int(quant_args.get("tailbite_context", 128)),
+            )
+            if os.environ.get("KQUANT_QSRT_DEBUG_TILE_CLOSURE") == "1":
+                _debug_check_trellis_closure(indices, bits)
+            return output, indices
         if rate_codebooks is not None:
             if codebook is not None or mode is not None:
                 raise ValueError(
@@ -158,6 +226,8 @@ def install_sqg_quantizer(quantizer_module) -> None:
             bits,
             int(quant_args.get("tailbite_context", 128)),
         )
+        if os.environ.get("KQUANT_QSRT_DEBUG_TILE_CLOSURE") == "1":
+            _debug_check_trellis_closure(indices, bits)
         return output, indices
 
     quantizer_module.quantize_tiles = quantize_tiles

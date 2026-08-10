@@ -37,16 +37,12 @@ or external EXL encoder APIs.
   SHA-256 identities for the T12 table and all three rate tables against B12X.
   `sqg-normal-e4m3` and the exact profile-5 mappings remain offline controls
   only; they are not valid materialized runtime profiles.
-- The prior profile-ID-5 candidate pool is at
-  `/models/Kimi-K3-QSRT-CHEB-Q8H4-CANDIDATES-v1`. At the 2026-08-05 04:59 PDT
-  snapshot, 44 complete atomic selection sidecars covered 27,176 experts in
-  33 partly or fully represented layers. The document-confirmation gate
-  accepted a nonzero rate shift for 6,691 experts (24.62%); `w2` selected R1+
-  for 24.13% and coupled `w13` selected R1+ for 20.35%. This is substantial
-  evidence that rate shifting remains useful with the conditional dense-H
-  path, but it is not reusable under `sqg_xor_cheb_t12` and is not the final
-  82,432-expert frequency:
-  the work-balanced partial schedule is not a uniform layer sample.
+- The sealed `sqg_xor_cheb_t12` candidate pool is at
+  `/data/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-CANDIDATES-v1`. It contains all
+  92 MoE layers and 82,432 experts. The confirmation gate retained a nonzero
+  rate shift for 9,379 experts (11.38%); `w2` selected R1+ for 11.11%, coupled
+  `w13` selected R1+ for 8.66%, and at least one axis selected R2 for 8.38%.
+  K2 uses the native four-stratum graph. There is no alternate K2 labelling.
 - X4T is the exact endpoint. There is no raw-MXFP4 or old variable-rate X4 tier
   in a QSRT artifact.
 - X4T promotion remains a whole-expert decision. The rejected matrix-granular
@@ -81,12 +77,25 @@ or external EXL encoder APIs.
   comparison it put every C128 confirmation winner in its top three, but that
   evidence is not broad enough to change production policy. Candidate
   construction and final selection for the next pool remain full `C128`.
-- The next pool keeps `h2_reverse` neuron ordering, rotation draw zero, and
-  `folded_scale_power=0`. On the 24-expert production panel, identity,
-  energy-balanced, and stratified-energy-balanced permutations all lost to
+- Current candidate construction keeps `h2_reverse` neuron ordering, rotation
+  draw zero, and `folded_scale_power=0`. On the 24-expert production panel,
+  identity, energy-balanced, and stratified-energy-balanced permutations lost to
   `h2_reverse`; every tested nonzero folded-scale strength (`0.25`, `0.5`,
   `1.0`) also increased routed validation SSE. Keep those alternatives as
   research controls rather than silently enabling them in production.
+- The first qualified all-QSRT high-rate profile is a fixed 3.083333-bpw
+  schedule with 22 complete K3 records and two complete K4 records. On the
+  24-expert document-disjoint confirmation panel it reduced pooled SSE by
+  11.907% from uniform K3 and slightly beat tile-local top-two-K4 funding on
+  gate/up, down, and both axes. It therefore needs no tile selector or
+  channel-dependent funding grammar. The complete 4M-backed candidate pool is
+  sealed at
+  `/data/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-3p08-CANDIDATES-v1`.
+  Its canonical TP-independent 92-layer materialization is sealed at
+  `/data/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-3p08-v2`. It uses the
+  `atoms_v2` revision of the same 96-row atom-major container: each row groups
+  its P33 expert bundles followed by its P43 expert bundles and serializes no
+  TP count.
 - Build `sqg_xor_cheb_t12` only into a fresh candidate pool. Do not resume or mix the
   profile-ID-5 or R44 candidate shards into the new artifact; changing the
   graph changes the Viterbi paths and requires full re-encoding.

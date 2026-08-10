@@ -33,14 +33,19 @@ SRC = "/models/Kimi-K3-EXL3-3p09"
 DEST = "/models/Kimi-K3-mxfp8-nonexpert"
 BLOCK = MXFP8_BLOCK_SIZE
 
-# Mirrors the serving overlay: linear+shared_experts -> mxfp8, minus ignores.
+# Mirrors the serving overlay: text linears, shared experts, vision linears,
+# and the multimodal projector -> MXFP8, minus the explicit exclusions below.
 TARGET = re.compile(
+    r"(?:"
     r"language_model\.model\.layers\.\d+\."
-    r"(self_attn\.(q_proj|k_proj|v_proj|o_proj|q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_a_proj"
+    r"(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj|q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_a_proj"
     r"|q_a_layernorm)\.weight$"
-    r"|(mlp|block_sparse_moe)\.shared_experts\.(gate_proj|up_proj|down_proj)"
+    r"|(?:mlp|block_sparse_moe)\.shared_experts\.(?:gate_proj|up_proj|down_proj)"
     r"\.weight$"
-    r"|mlp\.(gate_proj|up_proj|down_proj)\.weight$)"
+    r"|mlp\.(?:gate_proj|up_proj|down_proj)\.weight$)"
+    r"|vision_tower\..*\.weight$"
+    r"|mm_projector\..*\.weight$"
+    r")"
 )
 EXCLUDE = re.compile(
     r"kv_b_proj|conv1d|\.b_proj|\.g_proj|f_a_proj|f_b_proj|lm_head"
@@ -64,10 +69,16 @@ def process_shard(args: tuple) -> str:
         for name in sf.keys():  # noqa: SIM118 - safe_open is not iterable
             t = sf.get_tensor(name)
             if is_target(name, tuple(t.shape)):
-                q8, scale = mxfp8_quantize_cpu(t)
-                out[name] = q8
-                out[name.replace(".weight", ".weight_scale")] = scale
-                n_baked += 1
+                # Existing overlays may already contain serialized MXFP8 text
+                # linears. Preserve those bytes and their companion scales;
+                # only convert still-floating BF16/FP16/FP32 matrices.
+                if t.dtype == torch.float8_e4m3fn:
+                    out[name] = t
+                else:
+                    q8, scale = mxfp8_quantize_cpu(t)
+                    out[name] = q8
+                    out[name.replace(".weight", ".weight_scale")] = scale
+                    n_baked += 1
             else:
                 out[name] = t
     dest = Path(dest_dir) / Path(src_file).name

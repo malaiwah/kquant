@@ -34,9 +34,13 @@ _REQUIRED: Mapping[str, Mapping[str, tuple[str, ...]]] = {
     },
     QSRT: {
         "hybrid_quantization": ("quantization=kquant_hybrid",),
-        "qsrt_atom_reader": ("Loaded QSRT atom layer",),
-        "w4a16_kernel_family": ("W4A16FusedMoeKernel",),
-        "repeat_check_w4a16": ("implementation=w4a16",),
+        "qsrt_atom_reader": ("Loaded QSRT layer",),
+        "w4a16_runtime": (
+            "B12X MoE repeat check:",
+        ),
+        "repeat_check_w4a16": (
+            "quant_mode=w4a16 implementation=w4a16",
+        ),
     },
 }
 

@@ -25,7 +25,6 @@ import torch
 from kquant.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    CODEBOOK_SQG_CHEB,
     CODEBOOK_SQG_NORMAL_E4M3,
     QSRT_CODEBOOKS,
     decode_qsrt_weight,
@@ -33,8 +32,6 @@ from kquant.exl3_reference import (
 from kquant.sqg_e4m3 import (
     sqg_xor_cheb_t12_bytes,
     sqg_cheb_normal_e4m3_bytes,
-    sqg_cheb_normal_rank_e4m3_bytes,
-    sqg_k2_eight_stratum_e4m3_bytes_from_rank_lut,
 )
 
 from kquant.qsrt import (
@@ -521,16 +518,6 @@ def _qsrt_quant_args(
                 sqg_e4m3_luts_by_bits = {
                     bits: sqg_cheb_normal_e4m3_bytes(bits) for bits in (2, 3, 4)
                 }
-            elif codebook == CODEBOOK_SQG_CHEB:
-                sqg_e4m3_luts_by_bits = {
-                    bits: sqg_cheb_normal_e4m3_bytes(bits) for bits in (2, 3, 4)
-                }
-                if matrix == "w2":
-                    sqg_e4m3_luts_by_bits[2] = (
-                        sqg_k2_eight_stratum_e4m3_bytes_from_rank_lut(
-                            sqg_cheb_normal_rank_e4m3_bytes(), history_bit=4
-                        )
-                    )
             else:
                 raise AssertionError("QSRT codebook dispatch is incomplete")
         if set(sqg_e4m3_luts_by_bits) != {2, 3, 4}:
@@ -1027,8 +1014,13 @@ def finalize_qsrt_matrix_candidate(
         tensors[name].numel() * tensors[name].element_size() * 8
         for name in ("suh", "svh")
     )
-    if index_bits != reconstruction.numel() * 3:
-        raise ValueError("QSRT payload is not exactly three trellis bpw")
+    expected_index_bits = (
+        reconstruction.numel()
+        * sum(plan.mode.context_bits)
+        // len(plan.mode.context_bits)
+    )
+    if index_bits != expected_index_bits:
+        raise ValueError("QSRT payload does not match its fixed record-rate schedule")
     coding: dict[str, object] = {
         "proxy": candidate.proxy,
         "scale_bits": scale_bits,
@@ -1258,8 +1250,13 @@ def quantize_qsrt_matrix(
         tensors[name].numel() * tensors[name].element_size() * 8
         for name in ("suh", "svh")
     )
-    if index_bits != source.numel() * 3:
-        raise ValueError("QSRT payload is not exactly three trellis bpw")
+    expected_index_bits = (
+        source.numel()
+        * sum(plan.mode.context_bits)
+        // len(plan.mode.context_bits)
+    )
+    if index_bits != expected_index_bits:
+        raise ValueError("QSRT payload does not match its fixed record-rate schedule")
     if not torch.equal(tensors["trellis"], packed.payload):
         raise ValueError("quantizer returned a different trellis payload")
 

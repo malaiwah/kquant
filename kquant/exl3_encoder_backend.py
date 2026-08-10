@@ -510,20 +510,25 @@ def mixed_rate_spec(size_k: int, size_n: int, quant_args: dict):
 
     ``mixed_rate_axis`` names the logical EXL tile axis whose entries receive
     distinct trellis rates.  ``mixed_tile_bits`` contains one K value per tile
-    on that axis.  The rate map changes only the tile quantizer; the LDLQ
-    recursion remains one dense traversal over the complete input Hessian.
+    on that axis.  The research-only ``tile`` axis accepts a row-major value
+    for every 16x16 tile.  The rate map changes only the tile quantizer; the
+    LDLQ recursion remains one dense traversal over the complete input
+    Hessian.
     """
 
     rate_axis = quant_args.get("mixed_rate_axis")
-    if rate_axis not in ("k", "n"):
-        raise ValueError("mixed_rate_axis must be 'k' or 'n'")
+    if rate_axis not in ("k", "n", "tile"):
+        raise ValueError("mixed_rate_axis must be 'k', 'n', or 'tile'")
     if size_k % 16 or size_n % 16:
         raise ValueError("mixed-rate LDLQ input must be 16x16 tile aligned")
     raw_tile_bits = quant_args.get("mixed_tile_bits")
     if raw_tile_bits is None:
         raise ValueError("mixed_tile_bits is required for mixed-rate LDLQ")
     tile_bits = tuple(raw_tile_bits)
-    rate_tiles = size_k // 16 if rate_axis == "k" else size_n // 16
+    if rate_axis == "tile":
+        rate_tiles = (size_k // 16) * (size_n // 16)
+    else:
+        rate_tiles = size_k // 16 if rate_axis == "k" else size_n // 16
     if len(tile_bits) != rate_tiles:
         raise ValueError(
             f"mixed_tile_bits has {len(tile_bits)} entries; expected {rate_tiles}"
@@ -534,6 +539,71 @@ def mixed_rate_spec(size_k: int, size_n: int, quant_args: dict):
     ):
         raise ValueError("mixed-rate LDLQ supports only integer K2, K3, and K4")
     return rate_axis, tile_bits
+
+
+def mixed_codebook_spec(
+    size_k: int,
+    size_n: int,
+    quant_args: dict,
+    *,
+    rate_axis: str,
+    tile_bits: tuple[int, ...],
+):
+    """Validate an optional codebook-bank selector aligned with the rate map.
+
+    This is an offline research hook for measuring whether two K2
+    reconstruction staircases are complementary at tile granularity.  It does
+    not change the trellis rate or the LDLQ dependency graph: each tile merely
+    selects one LUT from the bank associated with its existing K value.
+    """
+
+    raw_ids = quant_args.get("mixed_tile_codebook_ids")
+    banks = quant_args.get("sqg_e4m3_lut_banks_by_bits")
+    if raw_ids is None and banks is None:
+        return None
+    if raw_ids is None or banks is None:
+        raise ValueError(
+            "mixed_tile_codebook_ids and sqg_e4m3_lut_banks_by_bits "
+            "must be supplied together"
+        )
+    if rate_axis not in ("k", "n", "tile"):
+        raise ValueError("mixed codebooks require a valid mixed-rate axis")
+    ids = tuple(raw_ids)
+    if len(ids) != len(tile_bits):
+        raise ValueError("mixed tile codebook IDs do not align with tile bits")
+    if not isinstance(banks, dict) or set(banks) - {2, 3, 4}:
+        raise ValueError("SQG LUT banks must be keyed only by K2, K3, or K4")
+    for bits, codebook_id in zip(tile_bits, ids, strict=True):
+        if (
+            isinstance(codebook_id, bool)
+            or not isinstance(codebook_id, int)
+            or codebook_id < 0
+        ):
+            raise ValueError("mixed tile codebook IDs must be nonnegative integers")
+        bank = banks.get(bits)
+        if bank is None or codebook_id >= len(bank):
+            raise ValueError(f"missing SQG K{bits} codebook bank entry {codebook_id}")
+    return ids
+
+
+def _mixed_quantizer_key(bits: int, codebook_id: int | None):
+    return bits if codebook_id is None else (bits, codebook_id)
+
+
+def _select_mixed_codebook(quant_args: dict, key) -> dict:
+    """Return tile-quantizer arguments for one (rate, codebook) group."""
+
+    local_args = dict(quant_args)
+    if isinstance(key, tuple):
+        bit_width, codebook_id = key
+        banks = local_args.pop("sqg_e4m3_lut_banks_by_bits")
+        local_args.pop("mixed_tile_codebook_ids", None)
+        local_args.pop("sqg_e4m3_luts_by_bits", None)
+        local_args["sqg_e4m3_lut"] = banks[bit_width][codebook_id]
+    else:
+        bit_width = key
+    local_args["K"] = bit_width
+    return local_args
 
 
 def ldlq_mixed(
@@ -562,6 +632,13 @@ def ldlq_mixed(
         buffer_device = weight.device
         size_k, size_n = weight.shape
         rate_axis, tile_bits = mixed_rate_spec(size_k, size_n, quant_args)
+        tile_codebooks = mixed_codebook_spec(
+            size_k,
+            size_n,
+            quant_args,
+            rate_axis=rate_axis,
+            tile_bits=tile_bits,
+        )
         tiles_k = size_k // 16
         tiles_n = size_n // 16
 
@@ -582,10 +659,20 @@ def ldlq_mixed(
         perm_i = tensor_core_perm_i(device)
         n_positions = None
         if rate_axis == "n":
-            bits_tensor = torch.tensor(tile_bits, dtype=torch.int64, device=device)
+            keys = tuple(
+                _mixed_quantizer_key(
+                    bits,
+                    None if tile_codebooks is None else tile_codebooks[position],
+                )
+                for position, bits in enumerate(tile_bits)
+            )
             n_positions = {
-                bit_width: torch.nonzero(bits_tensor == bit_width).flatten()
-                for bit_width in sorted(set(tile_bits))
+                key: torch.tensor(
+                    [position for position, value in enumerate(keys) if value == key],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                for key in sorted(set(keys))
             }
 
         progress_row = 0
@@ -626,16 +713,52 @@ def ldlq_mixed(
                 tiles = tiles[:, perm]
 
                 if rate_axis == "k":
-                    local_args = dict(quant_args)
-                    local_args["K"] = tile_bits[(begin + block_begin) // 16]
+                    rate_tile = (begin + block_begin) // 16
+                    local_args = _select_mixed_codebook(
+                        quant_args,
+                        _mixed_quantizer_key(
+                            tile_bits[rate_tile],
+                            None
+                            if tile_codebooks is None
+                            else tile_codebooks[rate_tile],
+                        ),
+                    )
                     quantized, indices = quantize_tiles_multigpu(tiles, local_args)
                 else:
                     quantized = torch.empty_like(tiles)
                     indices = torch.empty_like(tiles, dtype=torch.int16)
-                    assert n_positions is not None
-                    for bit_width, positions in n_positions.items():
-                        local_args = dict(quant_args)
-                        local_args["K"] = bit_width
+                    if rate_axis == "n":
+                        assert n_positions is not None
+                        positions_by_width = n_positions
+                    else:
+                        rate_tile = (begin + block_begin) // 16
+                        begin_tile = rate_tile * tiles_n
+                        end_tile = begin_tile + tiles_n
+                        row_keys = tuple(
+                            _mixed_quantizer_key(
+                                bits,
+                                None
+                                if tile_codebooks is None
+                                else tile_codebooks[begin_tile + offset],
+                            )
+                            for offset, bits in enumerate(
+                                tile_bits[begin_tile:end_tile]
+                            )
+                        )
+                        positions_by_width = {
+                            key: torch.tensor(
+                                [
+                                    position
+                                    for position, value in enumerate(row_keys)
+                                    if value == key
+                                ],
+                                dtype=torch.int64,
+                                device=device,
+                            )
+                            for key in sorted(set(row_keys))
+                        }
+                    for key, positions in positions_by_width.items():
+                        local_args = _select_mixed_codebook(quant_args, key)
                         local_quantized, local_indices = quantize_tiles_multigpu(
                             tiles.index_select(0, positions), local_args
                         )
@@ -668,24 +791,24 @@ def ldlq_mixed(
 def _make_mixed_ldlq_grouping(position_bits, device):
     """Build one immutable gather plan outside CUDA graph capture."""
 
-    values = tuple(int(value) for value in position_bits)
-    widths = tuple(sorted(set(values)))
-    if len(widths) == 1:
-        return None, None, ((widths[0], 0, len(values)),)
+    values = tuple(position_bits)
+    keys = tuple(sorted(set(values)))
+    if len(keys) == 1:
+        return None, None, ((keys[0], 0, len(values)),)
     order = tuple(
         position
-        for bit_width in widths
+        for key in keys
         for position, value in enumerate(values)
-        if value == bit_width
+        if value == key
     )
     inverse = [0] * len(order)
     for grouped, original in enumerate(order):
         inverse[original] = grouped
     slices = []
     begin = 0
-    for bit_width in widths:
-        end = begin + values.count(bit_width)
-        slices.append((bit_width, begin, end))
+    for key in keys:
+        end = begin + values.count(key)
+        slices.append((key, begin, end))
         begin = end
     return (
         torch.tensor(order, dtype=torch.int64, device=device),
@@ -694,11 +817,32 @@ def _make_mixed_ldlq_grouping(position_bits, device):
     )
 
 
-def _prepare_mixed_ldlq_groupings(rate_axis, tile_bits, tiles_k, tiles_n, device):
+def _prepare_mixed_ldlq_groupings(
+    rate_axis,
+    tile_bits,
+    tiles_k,
+    tiles_n,
+    device,
+    tile_codebooks=None,
+):
+    def member_keys(member, member_index):
+        ids = None if tile_codebooks is None else tile_codebooks[member_index]
+        return tuple(
+            _mixed_quantizer_key(
+                bits,
+                None if ids is None else ids[position],
+            )
+            for position, bits in enumerate(member)
+        )
+
+    keyed_members = tuple(
+        member_keys(member, member_index)
+        for member_index, member in enumerate(tile_bits)
+    )
     if rate_axis == "n":
         return (
             _make_mixed_ldlq_grouping(
-                (value for member in tile_bits for value in member), device
+                (value for member in keyed_members for value in member), device
             ),
             None,
         )
@@ -706,18 +850,25 @@ def _prepare_mixed_ldlq_groupings(rate_axis, tile_bits, tiles_k, tiles_n, device
     grouping_cache = {}
     input_groupings = []
     for rate_tile in range(tiles_k):
-        member_bits = tuple(bits[rate_tile] for bits in tile_bits)
-        grouping = grouping_cache.get(member_bits)
-        if grouping is None:
-            grouping = _make_mixed_ldlq_grouping(
-                (
-                    bit_width
-                    for bit_width in member_bits
-                    for _ in range(tiles_n)
-                ),
-                device,
+        if rate_axis == "tile":
+            position_bits = tuple(
+                key
+                for keys in keyed_members
+                for key in keys[
+                    rate_tile * tiles_n : (rate_tile + 1) * tiles_n
+                ]
             )
-            grouping_cache[member_bits] = grouping
+        else:
+            member_bits = tuple(keys[rate_tile] for keys in keyed_members)
+            position_bits = tuple(
+                bit_width
+                for bit_width in member_bits
+                for _ in range(tiles_n)
+            )
+        grouping = grouping_cache.get(position_bits)
+        if grouping is None:
+            grouping = _make_mixed_ldlq_grouping(position_bits, device)
+            grouping_cache[position_bits] = grouping
         input_groupings.append(grouping)
     return None, input_groupings
 
@@ -768,8 +919,12 @@ def ldlq_mixed_batched(
     ``process_begin``/``process_end`` optionally restrict the backwards
     traversal to one buffer-aligned K interval.  A lower interval must receive
     all three state tensors returned by an earlier upper-interval call.  This
-    supports exact common-prefix reuse across several rate candidates without
-    approximating or resetting dense-H error feedback.
+    supports algebraically exact common-prefix reuse across several rate
+    candidates without resetting dense-H error feedback.  It is not a
+    bit-exact batching contract: TF32/FP32 GEMM launch shapes may perturb the
+    feedback product, and hard trellis decisions can amplify that perturbation.
+    Callers must score and pack the exact returned states rather than assuming
+    they equal a later one-candidate re-encode.
 
     Ordinarily ``weights`` and ``Ls`` use shapes ``[B, k, n]`` and
     ``[B, k, k]``.  A continuation trie can instead retain one immutable
@@ -826,6 +981,24 @@ def ldlq_mixed_batched(
     if any(axis != rate_axis for axis, _ in normalized):
         raise ValueError("batched mixed LDLQ members must share one rate axis")
     tile_bits = [bits for _, bits in normalized]
+    tile_codebooks = [
+        mixed_codebook_spec(
+            size_k,
+            size_n,
+            args,
+            rate_axis=axis,
+            tile_bits=bits,
+        )
+        for args, (axis, bits) in zip(quant_args_list, normalized, strict=True)
+    ]
+    if any(ids is not None for ids in tile_codebooks) and not all(
+        ids is not None for ids in tile_codebooks
+    ):
+        raise ValueError("batched mixed LDLQ cannot mix banked and unbanked members")
+    if tile_codebooks[0] is not None and len(quant_args_list) != 1:
+        raise ValueError(
+            "selector-aware mixed LDLQ currently accepts exactly one candidate"
+        )
     tiles_k = size_k // 16
     tiles_n = size_n // 16
     buffer_rows = max(quant_args_list[0].get("buf_size_k", 128), 16)
@@ -860,7 +1033,12 @@ def ldlq_mixed_batched(
 
     if prepared_groupings is None:
         static_grouping, input_groupings = _prepare_mixed_ldlq_groupings(
-            rate_axis, tile_bits, tiles_k, tiles_n, device
+            rate_axis,
+            tile_bits,
+            tiles_k,
+            tiles_n,
+            device,
+            None if tile_codebooks[0] is None else tile_codebooks,
         )
     else:
         static_grouping, input_groupings = prepared_groupings
@@ -934,9 +1112,8 @@ def ldlq_mixed_batched(
                 grouped_tiles = tiles if order is None else tiles.index_select(0, order)
                 quantized_parts = []
                 index_parts = []
-                for bit_width, part_begin, part_end in rate_slices:
-                    local_args = dict(quant_args_list[0])
-                    local_args["K"] = bit_width
+                for key, part_begin, part_end in rate_slices:
+                    local_args = _select_mixed_codebook(quant_args_list[0], key)
                     local_quantized, local_indices = quantize_tiles_multigpu(
                         grouped_tiles[part_begin:part_end], local_args
                     )
@@ -1004,12 +1181,12 @@ def ldlq_mixed_n_candidates_reuse(
     """Encode output-axis candidates while reusing their common K3 tiles.
 
     LDLQ error feedback couples rows of the EXL-oriented matrix (the input
-    axis), but output columns are independent.  Consequently two candidates
-    that differ only in ``mixed_tile_bits`` on the ``n`` axis produce exactly
-    the same reconstruction and trellis states for every unchanged output
-    tile.  The phase-one R0/R1/R2 ladder can therefore encode the full K3
-    matrix once, encode the union of its K2/K4 replacement records once, and
-    assemble all candidates without changing their LDLQ graphs.
+    axis), but output columns are algebraically independent.  The phase-one
+    R0/R1/R2 ladder can therefore encode the full K3 matrix once, encode the
+    union of its K2/K4 replacement records once, and assemble all candidates
+    without changing their mathematical LDLQ graphs.  CUDA GEMM batching is
+    not promised to be bit-exact; the returned reconstruction and states are
+    the candidate that callers must score and persist together.
 
     The helper intentionally accepts only an all-K3 first candidate and
     rejects maps that assign more than one non-K3 width to the same tile.  It
@@ -1171,8 +1348,11 @@ def ldlq_mixed_k_candidates_prefix_reuse(
     on the EXL K axis.  LDLQ traverses that suffix first.  We quantize it once,
     retain the complete reconstruction and dense-H product cache, fan those
     states out source-major across candidates, and continue the remaining K
-    rows independently.  The result is numerically identical to independent
-    full traversals in the same coordinate order.
+    rows independently.  The reuse preserves the mathematical traversal, but
+    changing the CUDA GEMM batch shape can perturb TF32/FP32 feedback and send
+    a hard Viterbi search down another path.  The returned reconstruction and
+    states form one candidate and must be scored and persisted together; a
+    later one-candidate re-encode is a different candidate.
 
     This is particularly useful for an R0--R5 layout that places the ten
     donor/recipient records below the fourteen common K3 records: record work
@@ -1585,6 +1765,123 @@ def ldlq_batched(
 
 finalize_capture_H_mutex = threading.Lock()
 
+def _prepare_capture_H(H_data: dict, quant_args: dict, verbose: bool):
+    """Normalize and damp a captured Hessian without choosing its basis.
+
+    The ordinary EXL3 path immediately applies its random input signs and
+    Hadamard transform.  QSRT additionally chooses nonuniform input-channel
+    scales from the source weight.  Those scales are part of the decoder's
+    input transform, so QSRT must defer the congruence transform and LDL
+    factorization until :func:`regularize` has produced the complete ``su``.
+    """
+
+    H = H_data["H"]
+    count = H_data["count"]
+    if count == 0:
+        q_fallback = True
+        diag_mean = 0.0
+    else:
+        H /= count
+        diag_mean = torch.diag(H).mean()
+        q_fallback = diag_mean.item() < 1e-20
+
+    H.diagonal().add_(quant_args.get("sigma_reg", 0.025) * diag_mean)
+    diag = H.diagonal().clone()
+
+    if verbose:
+        print(f"     - H min/max: {H.min().item():.6f}   {H.max().item():.6f}")
+        print(f"     - H mean/std: {H.mean().item():.6f}   {H.std().item():.6f}")
+        print(f"     - H diag min/max: {diag.min():.6f}   {diag.max():.6f} ")
+
+    k = H.shape[0]
+    su = (
+        (torch.randn(k, device=H.device).sign() + 1e-5)
+        .sign()
+        .to(torch.float)
+        .unsqueeze(1)
+    )
+    H_data["su"] = su
+    H_data["diag"] = diag
+    H_data["q_fallback"] = q_fallback
+    return q_fallback, H, su, diag
+
+
+def _factor_capture_H(
+    H_data: dict,
+    H: torch.Tensor,
+    su: torch.Tensor,
+    quant_args: dict,
+    verbose: bool,
+):
+    """Apply the exact decoder-input congruence and block-factor the metric."""
+
+    if su.shape != (H.shape[0], 1) or su.dtype != torch.float:
+        raise ValueError("input conditioning must be float32 [input, 1]")
+    if su.device != H.device:
+        su = su.to(H.device)
+
+    # If decoded error is D_su H_k E_work, its exact work-coordinate metric is
+    # H_k.T D_su H_capture D_su H_k.  The normalized Hadamard is symmetric,
+    # and the four in-place operations below are precisely that congruence.
+    H *= su.T
+    blockwise_preapply_had_r_(H, had_k)
+    H *= su
+    blockwise_preapply_had_l_(H, had_k)
+
+    q_fallback = bool(H_data["q_fallback"])
+    if q_fallback:
+        L = None
+    else:
+        L, H = block_ldl(H, 16, quant_args, verbose)
+        diagonal = torch.arange(H.shape[0])
+        L[diagonal, diagonal] = 0
+
+    H_data["L"] = L
+    H = H.cpu()
+    H_data["H"] = H
+    H_data["su"] = su
+    H_data["finalized"] = True
+    return q_fallback, H, L, su, H_data["diag"]
+
+
+def prepare_capture_H_for_conditioning(
+    H_data: dict, quant_args: dict, verbose: bool
+):
+    """Begin the two-stage Hessian preparation used by QSRT batching."""
+
+    with finalize_capture_H_mutex:
+        if H_data["H"].is_meta:
+            raise ValueError("conditioned QSRT requires a materialized dense Hessian")
+        if "H_swap_device" in H_data:
+            H_data["H"] = H_data["H"].to(H_data["H_swap_device"])
+            del H_data["H_swap_device"]
+        if H_data.get("_conditioning_pending"):
+            raise ValueError("conditioned Hessian preparation is already pending")
+        if H_data["finalized"]:
+            raise ValueError("conditioned QSRT Hessian was already finalized")
+        q_fallback, H, su, diag = _prepare_capture_H(
+            H_data, quant_args, verbose
+        )
+        H_data["_conditioning_pending"] = True
+        return q_fallback, H, su, diag
+
+
+def finalize_capture_H_with_conditioning(
+    H_data: dict,
+    su: torch.Tensor,
+    quant_args: dict,
+    verbose: bool,
+):
+    """Finish QSRT Hessian preparation with regularize's complete ``su``."""
+
+    with finalize_capture_H_mutex:
+        if not H_data.pop("_conditioning_pending", False):
+            raise ValueError("conditioned Hessian preparation was not started")
+        return _factor_capture_H(
+            H_data, H_data["H"], su, quant_args, verbose
+        )
+
+
 def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
     with finalize_capture_H_mutex:
 
@@ -1609,58 +1906,13 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         H = H_data["H"]
         if H_data["finalized"]:
             return H_data["q_fallback"], H, H_data["L"], H_data["su"], H_data["diag"]
+        if H_data.get("_conditioning_pending"):
+            raise ValueError("cannot use ordinary finalization during QSRT conditioning")
 
-        # Mean of samples summed up during forward pass
-        # Switch to uncalibrated fallback if no input activations or diagonal is too small (few activations)
-        count = H_data["count"]
-        if count == 0:
-            q_fallback = True
-            diag_mean = 0.0
-        else:
-            H /= count
-            diag_mean = torch.diag(H).mean()
-            q_fallback = diag_mean.item() < 1e-20
-
-        # Regularize diagonal
-        H.diagonal().add_(quant_args.get("sigma_reg", 0.025) * diag_mean)
-
-        # Some tests
-        diag = H.diagonal().clone()
-
-        if verbose:
-            print(f"     - H min/max: {H.min().item():.6f}   {H.max().item():.6f}")
-            print(f"     - H mean/std: {H.mean().item():.6f}   {H.std().item():.6f}")
-            print(f"     - H diag min/max: {diag.min():.6f}   {diag.max():.6f} ")
-
-        # Random sign flips for input channel, fixed for the first linear layer to quantize with this H
-        k = H.shape[0]
-        su = (torch.randn(k, device = H.device).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
-        H_data["su"] = su
-
-        # Input had
-        H *= su.T
-        blockwise_preapply_had_r_(H, had_k)
-        H *= su
-        blockwise_preapply_had_l_(H, had_k)
-
-        # Get block LDL decomposition of H, zero diagonal
-        if q_fallback:
-            L = None
-        else:
-            L, H = block_ldl(H, 16, quant_args, verbose)
-            dr = torch.arange(k)
-            L[dr, dr] = 0
-
-        H_data["L"] = L
-
-        # H is no longer needed except to compute proxy error so move to CPU
-        H = H.cpu()
-        H_data["H"] = H.cpu()
-
-        H_data["finalized"] = True
-        H_data["diag"] = diag
-        H_data["q_fallback"] = q_fallback
-        return q_fallback, H, L, su, diag
+        q_fallback, H, su, _ = _prepare_capture_H(
+            H_data, quant_args, verbose
+        )
+        return _factor_capture_H(H_data, H, su, quant_args, verbose)
 
 
 def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
@@ -1976,7 +2228,16 @@ def regularize(
 
     # Determine best scale for matrix by test quantizing a sample of tiles along a wrapped diagonal
     if not skip_g_scale:
-        g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
+        override = quant_args.get("g_scale_override")
+        if override is None:
+            g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
+        else:
+            if isinstance(override, bool) or not isinstance(override, (int, float)):
+                raise TypeError("g_scale_override must be a real number")
+            g_scale = float(override)
+            if not math.isfinite(g_scale) or g_scale <= 0.0:
+                raise ValueError("g_scale_override must be positive and finite")
+            mse_scale = torch.tensor(float("nan"), device=weight.device)
     else:
         g_scale = 1.0
     weight, su, sv = apply_g_scale(
@@ -2330,16 +2591,14 @@ def quantize_qsrt_batch(
         args = group[0]
         if "seed" in args:
             torch.manual_seed(args["seed"])
-        q_fallback, H, L, su, H_diag = finalize_capture_H(H_data, args, verbose)
-        if q_fallback or H is None or L is None:
+        q_fallback, _, su, H_diag = prepare_capture_H_for_conditioning(
+            H_data, args, verbose
+        )
+        if q_fallback:
             raise ValueError("mixed-rate batching requires a non-fallback dense Hessian")
-        H = H.to(device)
-        L = L.to(device)
         su = su.to(device)
         if H_diag is not None:
             H_diag = H_diag.to(device)
-        if H_data["L"] is not None:
-            H_data["L"] = H_data["L"].cpu()
         sv = output_signs(weight.shape[1], device, args)
         apply_out_scales, weight_r, _, su, sv = regularize(
             weight,
@@ -2352,6 +2611,18 @@ def quantize_qsrt_batch(
             skip_g_scale=True,
             q_fallback=False,
         )
+        q_fallback, H, L, su, H_diag = finalize_capture_H_with_conditioning(
+            H_data, su, args, verbose
+        )
+        if q_fallback or H is None or L is None:
+            raise ValueError("mixed-rate batching requires a non-fallback dense Hessian")
+        H = H.to(device)
+        L = L.to(device)
+        su = su.to(device)
+        if H_diag is not None:
+            H_diag = H_diag.to(device)
+        if H_data["L"] is not None:
+            H_data["L"] = H_data["L"].cpu()
         prepared.append(
             {
                 "source": source,
@@ -2412,7 +2683,12 @@ def quantize_qsrt_batch(
         for source, group in enumerate(quant_args_groups)
         for candidate in range(len(group))
     ]
-    can_reuse_output_tiles = all(
+    has_tile_codebooks = any(
+        args.get("mixed_tile_codebook_ids") is not None
+        for group in quant_args_groups
+        for args in group
+    )
+    can_reuse_output_tiles = not has_tile_codebooks and all(
         all(
             mixed_rate_spec(shape[0], shape[1], args)[0] == "n"
             for args in group
@@ -2430,7 +2706,9 @@ def quantize_qsrt_batch(
             quant_args_groups,
         )
         del source_Ls
-    elif any(len(group) > 1 for group in quant_args_groups) and all(
+    elif not has_tile_codebooks and any(
+        len(group) > 1 for group in quant_args_groups
+    ) and all(
         all(
             mixed_rate_spec(shape[0], shape[1], args)[0] == "k"
             for args in group

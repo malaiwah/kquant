@@ -1,13 +1,15 @@
 # QSRT calibration and dense-H workflow
 
 This document defines the calibration contract for the next
-`Kimi-K3-QSRT` checkpoint. The resident interim EXL3 checkpoint supplies
-routing and activation observations. The official Kimi-K3 checkpoint remains
-the offline source of canonical MXFP4 expert weights.
+`Kimi-K3-QSRT` checkpoint. A sealed pure-QSRT checkpoint supplies routing and
+activation observations. The official Kimi-K3 checkpoint remains the offline
+source of canonical MXFP4 expert weights and is never loaded as the resident
+capture model.
 
-The immediate job is a 1,000,000-token training capture. It is a large pilot
-and an implementation gate, not the final production corpus. Mode selection
-and final validation use separate whole-document folds and fresh captures.
+The 1,000,000-token training capture is the proved implementation pilot. The
+next training capture targets 4,000,000 prompt tokens from a broader,
+prose-balanced corpus. Mode selection and final validation use separate
+whole-document folds and fresh captures.
 
 ## Why the capture exists
 
@@ -115,9 +117,11 @@ The immediate training command follows this shape:
   --source <math.jsonl=weight@cap> \
   --source <multilingual.jsonl=weight@cap> \
   --source <agent.jsonl=weight@cap> \
-  --target-tokens 1000000 \
+  --target-tokens 4000000 \
   --fold-modulus <N> --fold-index <I> --fold-mode exclude \
-  --model-dir /models/Kimi-K3-EXL3-3p09-serve \
+  --model-dir /models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-PURE-v1-model \
+  --allow-other-teacher-layout \
+  --expected-capture-source pure_qsrt_sqg_xor_cheb_t12 \
   --capture-dir <fresh-training-capture> \
   --report <fresh-training-report> \
   --dry-run
@@ -129,9 +133,11 @@ Do not infer semantic breadth from filenames alone.
 ## Resident teacher capture
 
 Launch the matching TP12 vLLM tree with a fresh `K3_KQUANT_CAPTURE_DIR` and the
-interim EXL3 model. Capture mode must disable prefix-cache reuse and speculative
-drafting while preserving the ordinary TP12 execution path and CUDA graph
-replay. Do not enable expert parallelism.
+sealed pure-QSRT checkpoint. Capture mode must disable prefix-cache reuse and
+speculative drafting while preserving the ordinary TP12 execution path and
+CUDA graph replay. Do not enable expert parallelism. The capture manifest must
+bind the exact model directory and identify the source as
+`pure_qsrt_sqg_xor_cheb_t12`.
 
 The collector has two numerical paths:
 

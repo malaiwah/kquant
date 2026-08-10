@@ -1,0 +1,649 @@
+"""Pack and read the fixed high-rate QSRT atoms-v2 revision."""
+
+from __future__ import annotations
+
+import fcntl
+import os
+from pathlib import Path
+
+import torch
+from safetensors import safe_open
+
+from kquant import constants as C
+from kquant.pack.qsrt_atoms import candidate_layer_path
+from kquant.pack.qsrt_candidates import candidate_tensor_name
+from kquant.qsrt import (
+    EXPERTS_PER_LAYER,
+    FORMAT_SECTION_BYTES,
+    H308,
+    INTERMEDIATE_CHANNELS,
+    LATENT_CHANNELS,
+    LAYER_HEADER_BYTES,
+    MATRIX_RATE_AXIS,
+    RECORDS_PER_EXPERT,
+    SHARED_SCALE_SECTION_BYTES,
+    TILE_CHANNELS,
+    ExpertFormatSpec,
+    PackedQSRTTrellis,
+    QSRTTrellisDescriptor,
+    pack_qsrt_format_section,
+    pack_qsrt_shared_scale_section,
+    record_bits,
+    unpack_qsrt_format_section,
+    unpack_qsrt_shared_scale_section,
+)
+from kquant.qsrt_atoms_v2 import (
+    K3_RECORDS,
+    K4_RECORDS,
+    P33_ATOM_BUNDLE_BYTES,
+    P33_MATRIX_TRELLIS_BYTES,
+    P43_ATOM_BUNDLE_BYTES,
+    P43_MATRIX_TRELLIS_BYTES,
+    QSRTAtomsV2Header,
+    QSRTAtomsV2Layout,
+    SCHEMA,
+    logical_rate_record_index,
+    physical_to_logical_records,
+)
+from kquant.qsrt_storage import (
+    ATOMS_PER_RECORD_PAIR,
+    MATRIX_ATOM_SCALE_BYTES,
+)
+
+
+LAYER_PREFIX = "qsrt-layer-"
+LAYER_SUFFIX = ".safetensors"
+RECORD_CHANNELS = INTERMEDIATE_CHANNELS // RECORDS_PER_EXPERT
+MATRIX_RECORD_SCALE_BYTES = RECORD_CHANNELS * torch.float16.itemsize
+MATRIX_K3_RECORD_TRELLIS_BYTES = RECORD_CHANNELS * LATENT_CHANNELS * 3 // 8
+MATRIX_K4_RECORD_TRELLIS_BYTES = RECORD_CHANNELS * LATENT_CHANNELS * 4 // 8
+K3_RECORD_TRELLIS_BYTES = 3 * MATRIX_K3_RECORD_TRELLIS_BYTES
+K4_RECORD_TRELLIS_BYTES = 3 * MATRIX_K4_RECORD_TRELLIS_BYTES
+RECORD_SCALE_BYTES = 3 * MATRIX_RECORD_SCALE_BYTES
+K3_RECORD_BUNDLE_BYTES = K3_RECORD_TRELLIS_BYTES + RECORD_SCALE_BYTES
+K4_RECORD_BUNDLE_BYTES = K4_RECORD_TRELLIS_BYTES + RECORD_SCALE_BYTES
+
+MATRIX_K3_TRELLIS_OFFSETS = {
+    matrix: index * MATRIX_K3_RECORD_TRELLIS_BYTES
+    for index, matrix in enumerate(C.EXPERT_MATRICES)
+}
+MATRIX_K4_TRELLIS_OFFSETS = {
+    matrix: index * MATRIX_K4_RECORD_TRELLIS_BYTES
+    for index, matrix in enumerate(C.EXPERT_MATRICES)
+}
+MATRIX_K3_SCALE_OFFSETS = {
+    matrix: K3_RECORD_TRELLIS_BYTES + index * MATRIX_RECORD_SCALE_BYTES
+    for index, matrix in enumerate(C.EXPERT_MATRICES)
+}
+MATRIX_K4_SCALE_OFFSETS = {
+    matrix: K4_RECORD_TRELLIS_BYTES + index * MATRIX_RECORD_SCALE_BYTES
+    for index, matrix in enumerate(C.EXPERT_MATRICES)
+}
+
+
+def layer_filename(layer: int) -> str:
+    if not 1 <= layer <= 92:
+        raise ValueError("Kimi-K3 MoE layer must lie in 1..92")
+    return f"{LAYER_PREFIX}{layer:05d}{LAYER_SUFFIX}"
+
+
+def _flat_candidate_tensor(
+    tensor: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    values: int,
+    name: str,
+) -> torch.Tensor:
+    result = tensor.detach().cpu().contiguous().reshape(-1)
+    if result.dtype != dtype or result.numel() != values:
+        raise ValueError(
+            f"{name} must contain {values} contiguous {dtype} values, got "
+            f"{result.numel()} {result.dtype} values"
+        )
+    if dtype != torch.int16 and not bool(torch.all(torch.isfinite(result))):
+        raise ValueError(f"{name} contains non-finite values")
+    return result
+
+
+def _matrix_descriptor(matrix: str) -> QSRTTrellisDescriptor:
+    rate_axis = MATRIX_RATE_AXIS[matrix]
+    return QSRTTrellisDescriptor(
+        mode_id=H308.mode_id,
+        rate_axis=rate_axis,
+        k_tiles=(INTERMEDIATE_CHANNELS if rate_axis == "k" else LATENT_CHANNELS)
+        // TILE_CHANNELS,
+        n_tiles=(LATENT_CHANNELS if rate_axis == "k" else INTERMEDIATE_CHANNELS)
+        // TILE_CHANNELS,
+    )
+
+
+def _record_word_ranges(
+    packed: PackedQSRTTrellis,
+) -> tuple[tuple[int, int, int], ...]:
+    packed.validate()
+    if packed.descriptor.mode != H308:
+        raise ValueError("atoms-v2 record packing requires H308")
+    cursor = 0
+    result = []
+    for bits in record_bits(H308):
+        words = packed.descriptor.tiles_per_record * TILE_CHANNELS * bits
+        result.append((cursor, words, bits))
+        cursor += words
+    if cursor != packed.payload.numel():
+        raise AssertionError("atoms-v2 record accounting drifted")
+    return tuple(result)
+
+
+def pack_matrix_rate_records(packed: PackedQSRTTrellis) -> dict[int, torch.Tensor]:
+    """Split one logical H308 matrix into its K3 and K4 records."""
+
+    result: dict[int, list[torch.Tensor]] = {3: [], 4: []}
+    for offset, words, bits in _record_word_ranges(packed):
+        result[bits].append(packed.payload.narrow(0, offset, words).contiguous())
+    output = {bits: torch.stack(records).contiguous() for bits, records in result.items()}
+    expected = {
+        3: (K3_RECORDS, MATRIX_K3_RECORD_TRELLIS_BYTES // 2),
+        4: (K4_RECORDS, MATRIX_K4_RECORD_TRELLIS_BYTES // 2),
+    }
+    for bits in (3, 4):
+        if tuple(output[bits].shape) != expected[bits]:
+            raise AssertionError(f"K{bits} record packing geometry drifted")
+    return output
+
+
+def unpack_matrix_rate_records(
+    records: dict[int, torch.Tensor], descriptor: QSRTTrellisDescriptor
+) -> PackedQSRTTrellis:
+    """Invert :func:`pack_matrix_rate_records` without decoding symbols."""
+
+    expected = {
+        3: (K3_RECORDS, MATRIX_K3_RECORD_TRELLIS_BYTES // 2),
+        4: (K4_RECORDS, MATRIX_K4_RECORD_TRELLIS_BYTES // 2),
+    }
+    for bits in (3, 4):
+        value = records.get(bits)
+        if (
+            value is None
+            or value.dtype != torch.int16
+            or tuple(value.shape) != expected[bits]
+            or not value.is_contiguous()
+        ):
+            raise ValueError(f"K{bits} records must be contiguous int16 {expected[bits]}")
+    packed = PackedQSRTTrellis(
+        descriptor, torch.empty(descriptor.payload_words, dtype=torch.int16)
+    )
+    cursors = {3: 0, 4: 0}
+    for offset, words, bits in _record_word_ranges(packed):
+        packed.payload.narrow(0, offset, words).copy_(records[bits][cursors[bits]])
+        cursors[bits] += 1
+    packed.validate()
+    return packed
+
+
+def pack_local_scale_rate_records(scale: torch.Tensor) -> dict[int, torch.Tensor]:
+    if (
+        scale.dtype != torch.float16
+        or tuple(scale.shape) != (INTERMEDIATE_CHANNELS,)
+        or not scale.is_contiguous()
+    ):
+        raise ValueError(
+            f"local scale must be contiguous float16 [{INTERMEDIATE_CHANNELS}]"
+        )
+    logical = scale.reshape(RECORDS_PER_EXPERT, RECORD_CHANNELS)
+    return {3: logical[:K3_RECORDS].contiguous(), 4: logical[K3_RECORDS:].contiguous()}
+
+
+def unpack_local_scale_rate_records(records: dict[int, torch.Tensor]) -> torch.Tensor:
+    expected = {3: (K3_RECORDS, RECORD_CHANNELS), 4: (K4_RECORDS, RECORD_CHANNELS)}
+    for bits in (3, 4):
+        value = records.get(bits)
+        if (
+            value is None
+            or value.dtype != torch.float16
+            or tuple(value.shape) != expected[bits]
+            or not value.is_contiguous()
+        ):
+            raise ValueError(
+                f"K{bits} scale records must be contiguous float16 {expected[bits]}"
+            )
+    return torch.cat((records[3].reshape(-1), records[4].reshape(-1))).contiguous()
+
+
+def assemble_candidate_records(
+    *, tensors: dict[str, dict[str, torch.Tensor]]
+) -> tuple[dict[int, torch.Tensor], dict[str, torch.Tensor]]:
+    """Split one H308 candidate into logical record bundles in memory."""
+
+    if set(tensors) != set(C.EXPERT_MATRICES):
+        raise ValueError("candidate must contain w1, w3, and w2")
+    bundles = {
+        3: torch.empty((K3_RECORDS, K3_RECORD_BUNDLE_BYTES), dtype=torch.uint8),
+        4: torch.empty((K4_RECORDS, K4_RECORD_BUNDLE_BYTES), dtype=torch.uint8),
+    }
+    shared: dict[str, torch.Tensor] = {}
+    for matrix in C.EXPERT_MATRICES:
+        parts = tensors[matrix]
+        if set(parts) != {"trellis", "suh", "svh"}:
+            raise ValueError(f"{matrix} candidate components are incomplete")
+        descriptor = _matrix_descriptor(matrix)
+        trellis = _flat_candidate_tensor(
+            parts["trellis"],
+            dtype=torch.int16,
+            values=descriptor.payload_words,
+            name=f"{matrix}.trellis",
+        )
+        rate_records = pack_matrix_rate_records(PackedQSRTTrellis(descriptor, trellis))
+        for bits, value in rate_records.items():
+            raw = value.view(torch.uint8).reshape(value.shape[0], -1)
+            begin = (
+                MATRIX_K3_TRELLIS_OFFSETS[matrix]
+                if bits == 3
+                else MATRIX_K4_TRELLIS_OFFSETS[matrix]
+            )
+            bundles[bits][:, begin : begin + raw.shape[1]].copy_(raw)
+
+        shared_part = "svh" if matrix == "w2" else "suh"
+        local_part = "suh" if matrix == "w2" else "svh"
+        shared[f"{matrix}.{shared_part}"] = _flat_candidate_tensor(
+            parts[shared_part],
+            dtype=torch.float16,
+            values=LATENT_CHANNELS,
+            name=f"{matrix}.{shared_part}",
+        )
+        scale_records = pack_local_scale_rate_records(
+            _flat_candidate_tensor(
+                parts[local_part],
+                dtype=torch.float16,
+                values=INTERMEDIATE_CHANNELS,
+                name=f"{matrix}.{local_part}",
+            )
+        )
+        for bits, value in scale_records.items():
+            raw = value.view(torch.uint8).reshape(value.shape[0], -1)
+            begin = (
+                MATRIX_K3_SCALE_OFFSETS[matrix]
+                if bits == 3
+                else MATRIX_K4_SCALE_OFFSETS[matrix]
+            )
+            bundles[bits][:, begin : begin + MATRIX_RECORD_SCALE_BYTES].copy_(raw)
+    return bundles, shared
+
+
+def disassemble_candidate_records(
+    *, bundles: dict[int, torch.Tensor], shared: dict[str, torch.Tensor]
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Invert :func:`assemble_candidate_records` in logical importance order."""
+
+    expected = {
+        3: (K3_RECORDS, K3_RECORD_BUNDLE_BYTES),
+        4: (K4_RECORDS, K4_RECORD_BUNDLE_BYTES),
+    }
+    for bits, shape in expected.items():
+        value = bundles.get(bits)
+        if value is None or value.dtype != torch.uint8 or tuple(value.shape) != shape:
+            raise ValueError(f"K{bits} bundles must be uint8 {shape}")
+    if set(shared) != {"w1.suh", "w3.suh", "w2.svh"}:
+        raise ValueError("shared transform inventory is incomplete")
+    result: dict[str, dict[str, torch.Tensor]] = {}
+    for matrix in C.EXPERT_MATRICES:
+        descriptor = _matrix_descriptor(matrix)
+        rate_records: dict[int, torch.Tensor] = {}
+        scale_records: dict[int, torch.Tensor] = {}
+        for bits in (3, 4):
+            trellis_begin = (
+                MATRIX_K3_TRELLIS_OFFSETS[matrix]
+                if bits == 3
+                else MATRIX_K4_TRELLIS_OFFSETS[matrix]
+            )
+            trellis_width = (
+                MATRIX_K3_RECORD_TRELLIS_BYTES
+                if bits == 3
+                else MATRIX_K4_RECORD_TRELLIS_BYTES
+            )
+            scale_begin = (
+                MATRIX_K3_SCALE_OFFSETS[matrix]
+                if bits == 3
+                else MATRIX_K4_SCALE_OFFSETS[matrix]
+            )
+            rate_records[bits] = (
+                bundles[bits][:, trellis_begin : trellis_begin + trellis_width]
+                .contiguous()
+                .view(torch.int16)
+            )
+            scale_records[bits] = (
+                bundles[bits][
+                    :, scale_begin : scale_begin + MATRIX_RECORD_SCALE_BYTES
+                ]
+                .contiguous()
+                .view(torch.float16)
+            )
+        packed = unpack_matrix_rate_records(rate_records, descriptor)
+        shared_part = "svh" if matrix == "w2" else "suh"
+        local_part = "suh" if matrix == "w2" else "svh"
+        result[matrix] = {
+            "trellis": packed.payload,
+            shared_part: _flat_candidate_tensor(
+                shared[f"{matrix}.{shared_part}"],
+                dtype=torch.float16,
+                values=LATENT_CHANNELS,
+                name=f"{matrix}.{shared_part}",
+            ),
+            local_part: unpack_local_scale_rate_records(scale_records),
+        }
+    return result
+
+
+def _trellis_stripes(
+    records: torch.Tensor, *, matrix: str, bits: int
+) -> torch.Tensor:
+    record_bytes = K3_RECORD_BUNDLE_BYTES if bits == 3 else K4_RECORD_BUNDLE_BYTES
+    begin = (
+        MATRIX_K3_TRELLIS_OFFSETS[matrix]
+        if bits == 3
+        else MATRIX_K4_TRELLIS_OFFSETS[matrix]
+    )
+    width = (
+        MATRIX_K3_RECORD_TRELLIS_BYTES
+        if bits == 3
+        else MATRIX_K4_RECORD_TRELLIS_BYTES
+    )
+    if records.dtype != torch.uint8 or records.ndim != 2 or records.shape[1] != record_bytes:
+        raise ValueError(f"K{bits} record bundles are malformed")
+    count = records.shape[0]
+    hidden_tiles = LATENT_CHANNELS // TILE_CHANNELS
+    raw = records[:, begin : begin + width].contiguous().view(torch.int16)
+    if matrix == "w2":
+        shaped = raw.reshape(count, ATOMS_PER_RECORD_PAIR, hidden_tiles, 16 * bits)
+        stripes = shaped.permute(1, 0, 2, 3)
+    else:
+        shaped = raw.reshape(count, hidden_tiles, ATOMS_PER_RECORD_PAIR, 16 * bits)
+        stripes = shaped.permute(2, 0, 1, 3)
+    return stripes.contiguous().view(torch.uint8).reshape(
+        ATOMS_PER_RECORD_PAIR, count, -1
+    )
+
+
+def _scale_stripes(records: torch.Tensor, *, matrix: str, bits: int) -> torch.Tensor:
+    record_bytes = K3_RECORD_BUNDLE_BYTES if bits == 3 else K4_RECORD_BUNDLE_BYTES
+    begin = (
+        MATRIX_K3_SCALE_OFFSETS[matrix]
+        if bits == 3
+        else MATRIX_K4_SCALE_OFFSETS[matrix]
+    )
+    if records.dtype != torch.uint8 or records.ndim != 2 or records.shape[1] != record_bytes:
+        raise ValueError(f"K{bits} record bundles are malformed")
+    count = records.shape[0]
+    raw = (
+        records[:, begin : begin + MATRIX_RECORD_SCALE_BYTES]
+        .contiguous()
+        .view(torch.float16)
+        .reshape(count, ATOMS_PER_RECORD_PAIR, 16)
+        .permute(1, 0, 2)
+        .contiguous()
+    )
+    return raw.view(torch.uint8).reshape(ATOMS_PER_RECORD_PAIR, count, -1)
+
+
+def assemble_record_pair_atoms(
+    low: torch.Tensor,
+    high: torch.Tensor,
+    *,
+    p43: bool,
+) -> torch.Tensor:
+    """Return compact ``[8, experts, bundle]`` P33 or P43 atoms."""
+
+    if low.shape[0] != high.shape[0]:
+        raise ValueError("paired record batches must contain the same experts")
+    low_bits = 4 if p43 else 3
+    matrix_bytes = P43_MATRIX_TRELLIS_BYTES if p43 else P33_MATRIX_TRELLIS_BYTES
+    bundle_bytes = P43_ATOM_BUNDLE_BYTES if p43 else P33_ATOM_BUNDLE_BYTES
+    count = low.shape[0]
+    output = torch.empty(
+        (ATOMS_PER_RECORD_PAIR, count, bundle_bytes), dtype=torch.uint8
+    )
+    for matrix_index, matrix in enumerate(C.EXPERT_MATRICES):
+        joined = torch.cat(
+            (
+                _trellis_stripes(low, matrix=matrix, bits=low_bits),
+                _trellis_stripes(high, matrix=matrix, bits=3),
+            ),
+            dim=2,
+        )
+        if joined.shape[2] != matrix_bytes:
+            raise AssertionError("atoms-v2 matrix stripe accounting drifted")
+        begin = matrix_index * matrix_bytes
+        output[:, :, begin : begin + matrix_bytes].copy_(joined)
+    scale_base = 3 * matrix_bytes
+    for matrix_index, matrix in enumerate(C.EXPERT_MATRICES):
+        joined = torch.cat(
+            (
+                _scale_stripes(low, matrix=matrix, bits=low_bits),
+                _scale_stripes(high, matrix=matrix, bits=3),
+            ),
+            dim=2,
+        )
+        if joined.shape[2] != MATRIX_ATOM_SCALE_BYTES:
+            raise AssertionError("atoms-v2 scale stripe accounting drifted")
+        begin = scale_base + matrix_index * MATRIX_ATOM_SCALE_BYTES
+        output[:, :, begin : begin + MATRIX_ATOM_SCALE_BYTES].copy_(joined)
+    return output
+
+
+def _pwrite_exact(descriptor: int, payload: torch.Tensor | bytes, offset: int) -> None:
+    data = payload if isinstance(payload, bytes) else payload.numpy().tobytes()
+    cursor = 0
+    while cursor < len(data):
+        written = os.pwrite(descriptor, data[cursor:], offset + cursor)
+        if written <= 0:
+            raise OSError("short QSRT atoms-v2 write")
+        cursor += written
+
+
+def materialize_atoms_v2_layer(
+    candidate_root: str | Path,
+    destination: str | Path,
+    layer: int,
+    *,
+    batch_size: int = 8,
+    discard_partial: bool = False,
+) -> dict[str, int | str]:
+    """Write one atoms-v2 layer directly from a sealed H308 candidate pool."""
+
+    if not 1 <= layer <= 92:
+        raise ValueError("Kimi-K3 MoE layer must lie in 1..92")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    candidate_path = candidate_layer_path(candidate_root, layer)
+    if not candidate_path.is_file():
+        raise FileNotFoundError(candidate_path)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FileExistsError(destination)
+    partial = destination.with_name(f".{destination.name}.partial")
+    if partial.exists():
+        if not discard_partial:
+            raise FileExistsError(partial)
+        partial.unlink()
+
+    layout = QSRTAtomsV2Layout(layer)
+    descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if hasattr(os, "posix_fallocate"):
+            os.posix_fallocate(descriptor, 0, layout.disk_bytes)
+        else:
+            os.ftruncate(descriptor, layout.disk_bytes)
+        _pwrite_exact(descriptor, QSRTAtomsV2Header(layer, layout).to_bytes(), 0)
+        _pwrite_exact(
+            descriptor,
+            pack_qsrt_format_section(
+                [ExpertFormatSpec.compressed(H308.mode_id)] * EXPERTS_PER_LAYER
+            ),
+            LAYER_HEADER_BYTES,
+        )
+
+        group_experts = {
+            (pair, p43): layout.group_experts(
+                pair * ATOMS_PER_RECORD_PAIR, p43=p43
+            )
+            for pair in range(12)
+            for p43 in (False, True)
+        }
+        group_slots = {
+            key: {expert: slot for slot, expert in enumerate(experts)}
+            for key, experts in group_experts.items()
+        }
+        shared_reference: dict[str, torch.Tensor] = {}
+        with safe_open(candidate_path, framework="pt", device="cpu") as handle:
+            for first in range(0, EXPERTS_PER_LAYER, batch_size):
+                stop = min(first + batch_size, EXPERTS_PER_LAYER)
+                pending: dict[
+                    tuple[int, bool],
+                    list[tuple[int, torch.Tensor, torch.Tensor]],
+                ] = {}
+                for expert in range(first, stop):
+                    tensors = {
+                        matrix: {
+                            part: handle.get_tensor(
+                                candidate_tensor_name(layer, expert, matrix, part)
+                            )
+                            for part in ("trellis", "suh", "svh")
+                        }
+                        for matrix in C.EXPERT_MATRICES
+                    }
+                    records, shared = assemble_candidate_records(tensors=tensors)
+                    for name, value in shared.items():
+                        reference = shared_reference.setdefault(name, value.clone())
+                        if not torch.equal(reference, value):
+                            raise ValueError(f"layer-shared transform {name} drifted")
+                    mapping = physical_to_logical_records(layer, expert)
+                    for pair in range(12):
+                        low_bits, low_index = logical_rate_record_index(mapping[2 * pair])
+                        high_bits, high_index = logical_rate_record_index(
+                            mapping[2 * pair + 1]
+                        )
+                        p43 = low_bits == 4
+                        if high_bits != 3 or low_bits not in (3, 4):
+                            raise AssertionError("atoms-v2 pair placement is malformed")
+                        pending.setdefault((pair, p43), []).append(
+                            (
+                                expert,
+                                records[low_bits][low_index],
+                                records[high_bits][high_index],
+                            )
+                        )
+
+                for (pair, p43), values in pending.items():
+                    slots = [group_slots[(pair, p43)][expert] for expert, _, _ in values]
+                    if slots != list(range(slots[0], slots[0] + len(slots))):
+                        raise AssertionError("batched atom group slots are not contiguous")
+                    atoms = assemble_record_pair_atoms(
+                        torch.stack([low for _, low, _ in values]).contiguous(),
+                        torch.stack([high for _, _, high in values]).contiguous(),
+                        p43=p43,
+                    )
+                    bundle_bytes = layout.group_bundle_bytes(p43=p43)
+                    for stripe in range(ATOMS_PER_RECORD_PAIR):
+                        physical_atom = pair * ATOMS_PER_RECORD_PAIR + stripe
+                        _pwrite_exact(
+                            descriptor,
+                            atoms[stripe],
+                            layout.group_offset(physical_atom, p43=p43)
+                            + slots[0] * bundle_bytes,
+                        )
+
+        if set(shared_reference) != {"w1.suh", "w3.suh", "w2.svh"}:
+            raise AssertionError("shared transform inventory did not close")
+        _pwrite_exact(
+            descriptor,
+            pack_qsrt_shared_scale_section(
+                shared_reference["w1.suh"],
+                shared_reference["w3.suh"],
+                shared_reference["w2.svh"],
+            ),
+            LAYER_HEADER_BYTES + FORMAT_SECTION_BYTES,
+        )
+        os.fsync(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        partial.unlink(missing_ok=True)
+        raise
+    else:
+        os.close(descriptor)
+    partial.replace(destination)
+    return {"schema": SCHEMA, "layer": layer, "disk_bytes": layout.disk_bytes}
+
+
+class QSRTAtomsV2Reader:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._descriptor = os.open(self.path, os.O_RDONLY)
+        try:
+            self.header = QSRTAtomsV2Header.from_bytes(
+                os.pread(self._descriptor, LAYER_HEADER_BYTES, 0)
+            )
+            if self.path.stat().st_size != self.header.layout.disk_bytes:
+                raise ValueError("QSRT atoms-v2 layer size disagrees with its header")
+            format_payload = os.pread(
+                self._descriptor, FORMAT_SECTION_BYTES, LAYER_HEADER_BYTES
+            )
+            if len(format_payload) != FORMAT_SECTION_BYTES:
+                raise ValueError("short QSRT atoms-v2 format section")
+            formats = unpack_qsrt_format_section(
+                torch.frombuffer(bytearray(format_payload), dtype=torch.uint8)
+            )
+            if formats != (H308.name,) * EXPERTS_PER_LAYER:
+                raise ValueError("QSRT atoms-v2 contains a non-H308 expert")
+            shared_offset = LAYER_HEADER_BYTES + FORMAT_SECTION_BYTES
+            shared_payload = os.pread(
+                self._descriptor, SHARED_SCALE_SECTION_BYTES, shared_offset
+            )
+            if len(shared_payload) != SHARED_SCALE_SECTION_BYTES:
+                raise ValueError("short QSRT atoms-v2 shared-scale section")
+            self.shared_scales = unpack_qsrt_shared_scale_section(
+                torch.frombuffer(bytearray(shared_payload), dtype=torch.uint8)
+            )
+        except BaseException:
+            os.close(self._descriptor)
+            raise
+
+    def close(self) -> None:
+        if self._descriptor >= 0:
+            os.close(self._descriptor)
+            self._descriptor = -1
+
+    def __enter__(self) -> "QSRTAtomsV2Reader":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def read_group(self, physical_atom: int, *, p43: bool) -> torch.Tensor:
+        experts = self.header.layout.group_experts(physical_atom, p43=p43)
+        bundle = self.header.layout.group_bundle_bytes(p43=p43)
+        size = len(experts) * bundle
+        raw = os.pread(
+            self._descriptor,
+            size,
+            self.header.layout.group_offset(physical_atom, p43=p43),
+        )
+        if len(raw) != size:
+            raise ValueError("short QSRT atoms-v2 group")
+        return torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(
+            len(experts), bundle
+        )
+
+
+__all__ = [
+    "QSRTAtomsV2Reader",
+    "assemble_candidate_records",
+    "assemble_record_pair_atoms",
+    "disassemble_candidate_records",
+    "layer_filename",
+    "materialize_atoms_v2_layer",
+    "pack_local_scale_rate_records",
+    "pack_matrix_rate_records",
+    "unpack_local_scale_rate_records",
+    "unpack_matrix_rate_records",
+]

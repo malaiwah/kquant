@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ QSRT_ALLOCATION_KIND = "kquant_kimi_k3_qsrt_allocation"
 QSRT_ALLOCATION_SCHEMA_VERSION = 2
 QSRT_ALLOCATION_FILENAME = "allocation-qsrt.json"
 HIGH_TIER_STORAGE = "x4t"
+ALLOCATION_STRATEGY_LAGRANGIAN = "damage_lagrangian"
+ALLOCATION_STRATEGY_FIXED = "fixed_x4t_set"
 
 
 @dataclass(frozen=True)
@@ -230,10 +233,52 @@ def choose_qsrt_target(
     return below
 
 
+def make_qsrt_fixed_allocation(
+    damage: np.ndarray,
+    x4t_expert_bytes: np.ndarray,
+    x4t_mask: np.ndarray,
+) -> QSRTAllocation:
+    """Account an explicitly supplied X4T set for a controlled experiment."""
+
+    damage, costs = _validate_inputs(damage, x4t_expert_bytes)
+    mask = np.asarray(x4t_mask)
+    if mask.shape != damage.shape or mask.dtype != np.bool_:
+        raise ValueError("fixed QSRT X4T mask has the wrong shape or dtype")
+    mask = mask.copy()
+    container_bytes = qsrt_total_container_bytes(mask, costs)
+    retained = float(damage[mask].sum())
+    total_damage = float(damage.sum())
+    return QSRTAllocation(
+        x4t_mask=mask,
+        target_container_bytes=None,
+        container_bytes=container_bytes,
+        # This value is not serialized for a fixed-set allocation.
+        lagrange_lambda=0.0,
+        x4t_experts=int(mask.sum()),
+        compressed_experts=int(mask.size - mask.sum()),
+        retained_damage=retained,
+        remaining_damage=total_damage - retained,
+        budget_slack_bytes=None,
+    )
+
+
+def qsrt_x4t_mask_sha256(mask: np.ndarray) -> str:
+    """Return the canonical layer-major digest of a complete X4T mask."""
+
+    mask = np.asarray(mask)
+    expected = (C.NUM_MOE_LAYERS, C.NUM_EXPERTS)
+    if mask.shape != expected or mask.dtype != np.bool_:
+        raise ValueError(f"QSRT X4T mask must be bool with shape {expected}")
+    packed = np.packbits(mask.reshape(-1), bitorder="little")
+    return hashlib.sha256(packed.tobytes()).hexdigest()
+
+
 def qsrt_allocation_document(
     pool: QSRTCandidatePool,
     x4t_index: X4TCostIndex,
     allocation: QSRTAllocation,
+    *,
+    fixed_selection_provenance: dict | None = None,
 ) -> dict:
     mask = allocation.x4t_mask
     if (
@@ -266,38 +311,56 @@ def qsrt_allocation_document(
             + int(x4t_index.expert_storage_bytes[row, mask[row]].sum()),
         }
     parameters = C.NUM_MOE_LAYERS * C.NUM_EXPERTS * 3 * 3072 * 3584
+    meta = {
+        "codec": "QSRT",
+        "high_tier_storage": HIGH_TIER_STORAGE,
+        "candidate_pool": str(pool.root),
+        "candidate_pool_content_sha256": pool.content_sha256,
+        "candidate_codebook": pool.codebook,
+        "candidate_mode_ids": list(pool.mode_ids),
+        "x4t_cost_index": str(x4t_index.root),
+        "x4t_cost_index_content_sha256": x4t_index.content_sha256,
+        "source_revision": pool.manifest["source_revision"],
+        "damage_metric": pool.damage_metric,
+        "damage_weighting": pool.damage_weighting,
+        "damage_provenance": pool.damage_provenance,
+        "x4t_experts": allocation.x4t_experts,
+        "compressed_experts": allocation.compressed_experts,
+        "realized_x4t_fraction": allocation.x4t_experts / mask.size,
+        "target_container_bytes": allocation.target_container_bytes,
+        "container_bytes": allocation.container_bytes,
+        "budget_slack_bytes": allocation.budget_slack_bytes,
+        "effective_bits_per_original_expert_weight": (
+            allocation.container_bytes * 8 / parameters
+        ),
+        "all_compressed_damage": float(pool.damage.sum()),
+        "x4t_damage_avoided": allocation.retained_damage,
+        "remaining_compressed_damage": allocation.remaining_damage,
+        "format_histogram_before_x4t": pool.format_histogram,
+    }
+    if fixed_selection_provenance is None:
+        meta.update(
+            {
+                "allocation_strategy": ALLOCATION_STRATEGY_LAGRANGIAN,
+                "lagrange_lambda_damage_per_byte": allocation.lagrange_lambda,
+                "allocation_optimality": "exact-for-reported-lagrange-multiplier",
+            }
+        )
+    else:
+        if not isinstance(fixed_selection_provenance, dict):
+            raise TypeError("fixed selection provenance must be an object")
+        meta.update(
+            {
+                "allocation_strategy": ALLOCATION_STRATEGY_FIXED,
+                "allocation_optimality": "controlled-fixed-set; not damage-optimal",
+                "fixed_x4t_mask_sha256": qsrt_x4t_mask_sha256(mask),
+                "fixed_x4t_selection_provenance": fixed_selection_provenance,
+            }
+        )
     return {
         "kind": QSRT_ALLOCATION_KIND,
         "schema_version": QSRT_ALLOCATION_SCHEMA_VERSION,
-        "meta": {
-            "codec": "QSRT",
-            "high_tier_storage": HIGH_TIER_STORAGE,
-            "candidate_pool": str(pool.root),
-            "candidate_pool_content_sha256": pool.content_sha256,
-            "candidate_codebook": pool.codebook,
-            "candidate_mode_ids": list(pool.mode_ids),
-            "x4t_cost_index": str(x4t_index.root),
-            "x4t_cost_index_content_sha256": x4t_index.content_sha256,
-            "source_revision": pool.manifest["source_revision"],
-            "damage_metric": pool.damage_metric,
-            "damage_weighting": pool.damage_weighting,
-            "damage_provenance": pool.damage_provenance,
-            "x4t_experts": allocation.x4t_experts,
-            "compressed_experts": allocation.compressed_experts,
-            "realized_x4t_fraction": allocation.x4t_experts / mask.size,
-            "target_container_bytes": allocation.target_container_bytes,
-            "container_bytes": allocation.container_bytes,
-            "budget_slack_bytes": allocation.budget_slack_bytes,
-            "effective_bits_per_original_expert_weight": (
-                allocation.container_bytes * 8 / parameters
-            ),
-            "lagrange_lambda_damage_per_byte": allocation.lagrange_lambda,
-            "allocation_optimality": "exact-for-reported-lagrange-multiplier",
-            "all_compressed_damage": float(pool.damage.sum()),
-            "x4t_damage_avoided": allocation.retained_damage,
-            "remaining_compressed_damage": allocation.remaining_damage,
-            "format_histogram_before_x4t": pool.format_histogram,
-        },
+        "meta": meta,
         "layers": layers,
     }
 

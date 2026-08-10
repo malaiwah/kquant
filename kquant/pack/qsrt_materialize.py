@@ -22,10 +22,13 @@ from safetensors import safe_open
 from kquant import constants as C
 from kquant.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
 from kquant.pack.qsrt_allocation import (
+    ALLOCATION_STRATEGY_FIXED,
+    ALLOCATION_STRATEGY_LAGRANGIAN,
     HIGH_TIER_STORAGE,
     QSRT_ALLOCATION_KIND,
     QSRT_ALLOCATION_SCHEMA_VERSION,
     choose_qsrt_lagrangian,
+    qsrt_x4t_mask_sha256,
     qsrt_total_container_bytes,
     qsrt_trellis_layer_bytes,
 )
@@ -229,7 +232,6 @@ def validate_qsrt_materialization_allocation(
         "candidate_mode_ids": list(PHASE1_MODE_IDS),
         "x4t_cost_index_content_sha256": x4t_index.content_sha256,
         "source_revision": pool.manifest.get("source_revision"),
-        "allocation_optimality": "exact-for-reported-lagrange-multiplier",
         "format_histogram_before_x4t": pool.format_histogram,
     }
     for name, expected in expected_meta.items():
@@ -328,17 +330,47 @@ def validate_qsrt_materialization_allocation(
         total_atoms += expected_atoms
         total_x4t += expected_x4t
 
-    lagrange_lambda = _finite(
-        meta.get("lagrange_lambda_damage_per_byte"), "QSRT Lagrange multiplier"
-    )
-    expected = choose_qsrt_lagrangian(
-        damage,
-        x4t_index.expert_storage_bytes,
-        lagrange_lambda=lagrange_lambda,
-        target_container_bytes=meta.get("target_container_bytes"),
-    )
-    if not np.array_equal(mask, expected.x4t_mask):
-        raise ValueError("QSRT X4T set is not optimal for its reported multiplier")
+    strategy = meta.get("allocation_strategy", ALLOCATION_STRATEGY_LAGRANGIAN)
+    if strategy == ALLOCATION_STRATEGY_LAGRANGIAN:
+        if meta.get("allocation_optimality") != (
+            "exact-for-reported-lagrange-multiplier"
+        ):
+            raise ValueError("QSRT Lagrangian allocation optimality claim drifted")
+        lagrange_lambda = _finite(
+            meta.get("lagrange_lambda_damage_per_byte"),
+            "QSRT Lagrange multiplier",
+        )
+        expected = choose_qsrt_lagrangian(
+            damage,
+            x4t_index.expert_storage_bytes,
+            lagrange_lambda=lagrange_lambda,
+            target_container_bytes=meta.get("target_container_bytes"),
+        )
+        if not np.array_equal(mask, expected.x4t_mask):
+            raise ValueError(
+                "QSRT X4T set is not optimal for its reported multiplier"
+            )
+    elif strategy == ALLOCATION_STRATEGY_FIXED:
+        if meta.get("allocation_optimality") != (
+            "controlled-fixed-set; not damage-optimal"
+        ):
+            raise ValueError("QSRT fixed-set allocation claim drifted")
+        provenance = meta.get("fixed_x4t_selection_provenance")
+        if not isinstance(provenance, dict):
+            raise ValueError("QSRT fixed-set allocation lacks selection provenance")
+        requested = provenance.get("requested_x4t_experts")
+        if _plain_int(requested, "fixed-set requested X4T experts") != int(
+            mask.sum()
+        ):
+            raise ValueError("QSRT fixed-set requested count does not close")
+        if meta.get("fixed_x4t_mask_sha256") != qsrt_x4t_mask_sha256(mask):
+            raise ValueError("QSRT fixed-set X4T mask digest drifted")
+        if meta.get("target_container_bytes") is not None:
+            raise ValueError("QSRT fixed-set experiment must not claim a byte target")
+        if meta.get("budget_slack_bytes") is not None:
+            raise ValueError("QSRT fixed-set experiment must not claim budget slack")
+    else:
+        raise ValueError(f"unsupported QSRT allocation strategy {strategy!r}")
     total_bytes = qsrt_total_container_bytes(mask, x4t_index.expert_storage_bytes)
     if total_bytes != total_atoms + total_x4t:
         raise AssertionError("QSRT materialization byte accounting drifted")
@@ -515,22 +547,46 @@ def validate_qsrt_layer_payloads(
     }
 
 
-def _validate_full_qsrt_closure(
+def qsrt_structural_layer_closure(
+    structural: dict[str, int | str],
+) -> dict[str, int | str]:
+    """Describe an atom/X4T pair whose payloads were not reread.
+
+    This is intentionally distinct from bit-exact source closure.  It is useful
+    for experimental artifacts where materialization already consumed sealed
+    candidates and the immutable official source, but paying for a second full
+    read is not warranted.
+    """
+
+    return {
+        **structural,
+        "payload_closure": "structural_only",
+        "compressed_experts_verified": 0,
+        "x4t_experts_verified": 0,
+    }
+
+
+def _validate_qsrt_closure(
     metadata: object,
     spec: QSRTAtomLayerSpec,
     structural: dict[str, int | str],
 ) -> dict[str, int | str]:
-    expected = {
+    bit_exact = {
         **structural,
         "payload_closure": "bit_exact",
         "compressed_experts_verified": len(spec.compressed),
         "x4t_experts_verified": len(spec.x4t),
     }
-    if metadata != expected:
+    structural_only = qsrt_structural_layer_closure(structural)
+    if metadata == bit_exact:
+        return bit_exact
+    if metadata == structural_only:
+        return structural_only
+    if metadata not in (bit_exact, structural_only):
         raise ValueError(
-            f"layer {spec.layer} closure does not describe complete source coverage"
+            f"layer {spec.layer} closure is neither bit-exact nor structural-only"
         )
-    return expected
+    raise AssertionError("unreachable QSRT closure validation state")
 
 
 def write_qsrt_layer_closure_receipt(
@@ -547,7 +603,7 @@ def write_qsrt_layer_closure_receipt(
     structural = validate_qsrt_layer_pair(
         atom_path, x4t_path, spec, expected_x4t_bytes=expected_x4t_bytes
     )
-    closure = _validate_full_qsrt_closure(metadata, spec, structural)
+    closure = _validate_qsrt_closure(metadata, spec, structural)
     receipt = {
         "kind": QSRT_CLOSURE_KIND,
         "schema_version": QSRT_CLOSURE_SCHEMA_VERSION,
@@ -587,7 +643,7 @@ def load_qsrt_layer_closure_receipt(
     structural = validate_qsrt_layer_pair(
         atom_path, x4t_path, spec, expected_x4t_bytes=expected_x4t_bytes
     )
-    return _validate_full_qsrt_closure(receipt.get("closure"), spec, structural)
+    return _validate_qsrt_closure(receipt.get("closure"), spec, structural)
 
 
 def qsrt_materialization_build_document(
@@ -722,6 +778,7 @@ def qsrt_artifact_manifest(
     if len(layers) != len(plan.layers):
         raise ValueError("a final QSRT manifest requires every MoE layer")
     by_layer: dict[str, dict] = {}
+    payload_validation = {"bit_exact": 0, "structural_only": 0}
     atom_bytes = 0
     x4t_bytes = 0
     for spec, expected_x4t, metadata in zip(
@@ -733,6 +790,12 @@ def qsrt_artifact_manifest(
             raise ValueError(f"layer {spec.layer} X4T byte ledger drifted")
         atom_bytes += spec.layout.disk_bytes
         x4t_bytes += expected_x4t
+        validation = metadata.get("payload_closure")
+        if validation not in payload_validation:
+            raise ValueError(
+                f"layer {spec.layer} has an unknown payload closure level"
+            )
+        payload_validation[validation] += 1
         by_layer[str(spec.layer)] = {
             **metadata,
             "qsrt_atoms": layer_filename(spec.layer),
@@ -770,6 +833,10 @@ def qsrt_artifact_manifest(
         "x4t_experts": plan.x4t_experts,
         "compressed_experts": plan.compressed_experts,
         "layer_count": len(plan.layers),
+        "payload_validation": {
+            "bit_exact_layers": payload_validation["bit_exact"],
+            "structural_only_layers": payload_validation["structural_only"],
+        },
         "layers": by_layer,
     }
 
@@ -801,6 +868,7 @@ __all__ = [
     "prepare_qsrt_destination",
     "qsrt_artifact_manifest",
     "qsrt_layer_closure_filename",
+    "qsrt_structural_layer_closure",
     "qsrt_materialization_build_document",
     "validate_qsrt_layer_pair",
     "validate_qsrt_layer_payloads",

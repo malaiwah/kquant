@@ -12,6 +12,7 @@
 // Viterbi lanes normally request different states, which would serialize a
 // 64-KiB constant-memory table despite its attractive nominal footprint.
 __device__ __constant__ const uint8_t* sqg_e4m3_lut;
+__device__ __constant__ const half* sqg_fp16_lut;
 
 template <>
 __device__ inline half decode_3inst<4>(uint32_t state)
@@ -31,6 +32,18 @@ __device__ inline half2 decode_3inst_2<4>(uint32_t state0, uint32_t state1)
         reinterpret_cast<const __nv_fp8x2_storage_t*>(sqg_e4m3_lut)[state0 >> 1];
     const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(fp8x2, __NV_E4M3);
     return __halves2half2(__ushort_as_half(raw.x), __ushort_as_half(raw.y));
+}
+
+template <>
+__device__ inline half decode_3inst<5>(uint32_t state)
+{
+    return sqg_fp16_lut[state & 0xffffu];
+}
+
+template <>
+__device__ inline half2 decode_3inst_2<5>(uint32_t state0, uint32_t state1)
+{
+    return reinterpret_cast<const half2*>(sqg_fp16_lut)[state0 >> 1];
 }
 
 __device__ inline half2 decode_sqg_fp8x2(__nv_fp8x2_storage_t fp8x2)
@@ -137,7 +150,8 @@ void launch_trellis(
     int tailbite_context,
     cudaStream_t stream)
 {
-    const int threads = K == 2 ? 1024 : (K == 3 ? 640 : 704);
+    const int threads =
+        K == 2 ? 1024 : (K == 3 ? 640 : (K == 4 ? 704 : 512));
     cudaFuncSetAttribute(
         quantize_tiles_kernel<K, codebook>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -187,7 +201,7 @@ void quantize_tiles_sqg_cuda(
                 "output_indices shape mismatch");
     TORCH_CHECK(output_indices.scalar_type() == at::kShort,
                 "output_indices must be int16");
-    TORCH_CHECK(K >= 2 && K <= 4, "SQG validation kernel supports K2--K4");
+    TORCH_CHECK(K >= 2 && K <= 6, "SQG validation kernel supports K2--K6");
     TORCH_CHECK(tailbite_context >= 1 && tailbite_context <= 128,
                 "tailbite_context must be in 1..128");
     TORCH_CHECK(codebook.is_cuda() && codebook.device() == input_tiles.device(),
@@ -255,6 +269,22 @@ void quantize_tiles_sqg_cuda(
                 temp_edges.data_ptr<uint8_t>(), tiles, max_batch, shared_memory,
                 static_cast<int>(tailbite_context), stream);
             break;
+        case 5:
+            launch_trellis<5, 4>(
+                input_tiles.data_ptr<float>(), output_tiles.data_ptr<float>(),
+                reinterpret_cast<uint16_t*>(output_indices.data_ptr<int16_t>()),
+                reinterpret_cast<half*>(temp_costs.data_ptr<at::Half>()),
+                temp_edges.data_ptr<uint8_t>(), tiles, max_batch, shared_memory,
+                static_cast<int>(tailbite_context), stream);
+            break;
+        case 6:
+            launch_trellis<6, 4>(
+                input_tiles.data_ptr<float>(), output_tiles.data_ptr<float>(),
+                reinterpret_cast<uint16_t*>(output_indices.data_ptr<int16_t>()),
+                reinterpret_cast<half*>(temp_costs.data_ptr<at::Half>()),
+                temp_edges.data_ptr<uint8_t>(), tiles, max_batch, shared_memory,
+                static_cast<int>(tailbite_context), stream);
+            break;
     }
 }
 
@@ -283,14 +313,16 @@ void quantize_tiles_procedural_cuda(
                 "output_indices shape mismatch");
     TORCH_CHECK(output_indices.scalar_type() == at::kShort,
                 "output_indices must be int16");
-    TORCH_CHECK(K >= 2 && K <= 4, "procedural control supports K2--K4");
+    TORCH_CHECK(K >= 2 && K <= 6, "procedural control supports K2--K6");
     TORCH_CHECK(codebook == 1 || codebook == 2,
                 "procedural codebook must be 1 (MCG) or 2 (MUL1)");
     TORCH_CHECK(tailbite_context >= 1 && tailbite_context <= 128,
                 "tailbite_context must be in 1..128");
 
     const int edges_per_state = 65536 >> K;
-    const int decision_entries = K == 2 ? edges_per_state / 4 : edges_per_state / 2;
+    const int decision_entries =
+        K == 2 ? edges_per_state / 4 :
+            (K <= 4 ? edges_per_state / 2 : edges_per_state);
     TORCH_CHECK(temp_costs.scalar_type() == at::kHalf && temp_costs.dim() == 3,
                 "temp_costs must be rank-3 FP16");
     TORCH_CHECK(temp_costs.size(1) == 2 && temp_costs.size(2) == edges_per_state,
@@ -327,6 +359,8 @@ void quantize_tiles_procedural_cuda(
             case 2: LAUNCH_PROCEDURAL(2, 1); break;
             case 3: LAUNCH_PROCEDURAL(3, 1); break;
             case 4: LAUNCH_PROCEDURAL(4, 1); break;
+            case 5: LAUNCH_PROCEDURAL(5, 1); break;
+            case 6: LAUNCH_PROCEDURAL(6, 1); break;
         }
     }
     else
@@ -336,7 +370,126 @@ void quantize_tiles_procedural_cuda(
             case 2: LAUNCH_PROCEDURAL(2, 2); break;
             case 3: LAUNCH_PROCEDURAL(3, 2); break;
             case 4: LAUNCH_PROCEDURAL(4, 2); break;
+            case 5: LAUNCH_PROCEDURAL(5, 2); break;
+            case 6: LAUNCH_PROCEDURAL(6, 2); break;
         }
     }
 #undef LAUNCH_PROCEDURAL
+}
+
+void quantize_tiles_fp16_cuda(
+    at::Tensor input_tiles,
+    at::Tensor output_tiles,
+    at::Tensor output_indices,
+    at::Tensor temp_costs,
+    at::Tensor temp_edges,
+    at::Tensor codebook,
+    int64_t K,
+    int64_t tailbite_context)
+{
+    const at::cuda::OptionalCUDAGuard guard(input_tiles.device());
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(input_tiles.is_cuda(), "input_tiles must be CUDA");
+    TORCH_CHECK(input_tiles.scalar_type() == at::kFloat, "input_tiles must be FP32");
+    TORCH_CHECK(input_tiles.dim() == 2 && input_tiles.size(1) == 256,
+                "input_tiles must have shape [tiles, 256]");
+    TORCH_CHECK(output_tiles.sizes() == input_tiles.sizes(),
+                "output_tiles shape mismatch");
+    TORCH_CHECK(output_tiles.scalar_type() == at::kFloat,
+                "output_tiles must be FP32");
+    TORCH_CHECK(output_indices.sizes() == input_tiles.sizes(),
+                "output_indices shape mismatch");
+    TORCH_CHECK(output_indices.scalar_type() == at::kShort,
+                "output_indices must be int16");
+    TORCH_CHECK(K >= 2 && K <= 6,
+                "experimental FP16 SQG kernel supports only K2--K6");
+    TORCH_CHECK(tailbite_context >= 1 && tailbite_context <= 128,
+                "tailbite_context must be in 1..128");
+    TORCH_CHECK(codebook.is_cuda() && codebook.device() == input_tiles.device(),
+                "codebook must be on the input CUDA device");
+    TORCH_CHECK(codebook.scalar_type() == at::kHalf && codebook.numel() == 65536,
+                "codebook must contain 65,536 FP16 values");
+    TORCH_CHECK(codebook.is_contiguous(), "codebook must be contiguous");
+
+    const int edges_per_state = 65536 >> K;
+    const int decision_entries =
+        K == 2 ? edges_per_state / 4 :
+        (K <= 4 ? edges_per_state / 2 : edges_per_state);
+    TORCH_CHECK(temp_costs.scalar_type() == at::kHalf && temp_costs.dim() == 3,
+                "temp_costs must be rank-3 FP16");
+    TORCH_CHECK(temp_costs.size(1) == 2 && temp_costs.size(2) == edges_per_state,
+                "temp_costs shape mismatch");
+    TORCH_CHECK(temp_edges.scalar_type() == at::kByte && temp_edges.dim() == 3,
+                "temp_edges must be rank-3 uint8");
+    TORCH_CHECK(temp_edges.size(1) == 256 && temp_edges.size(2) == decision_entries,
+                "temp_edges shape mismatch");
+
+    const half* codebook_pointer =
+        reinterpret_cast<const half*>(codebook.data_ptr<at::Half>());
+    C10_CUDA_CHECK(cudaMemcpyToSymbolAsync(
+        sqg_fp16_lut,
+        &codebook_pointer,
+        sizeof(codebook_pointer),
+        0,
+        cudaMemcpyHostToDevice,
+        stream));
+
+    int device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    int multiprocessors = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &multiprocessors, cudaDevAttrMultiProcessorCount, device));
+    const int max_batch = min(
+        static_cast<int>(temp_costs.size(0)), 3 * multiprocessors);
+    const int shared_memory =
+        2 * edges_per_state * static_cast<int>(sizeof(half)) + 512 + 64 + 128;
+    const int tiles = static_cast<int>(input_tiles.size(0));
+    if (!tiles) return;
+
+    if (K == 2)
+    {
+        launch_trellis<2, 5>(
+            input_tiles.data_ptr<float>(), output_tiles.data_ptr<float>(),
+            reinterpret_cast<uint16_t*>(output_indices.data_ptr<int16_t>()),
+            reinterpret_cast<half*>(temp_costs.data_ptr<at::Half>()),
+            temp_edges.data_ptr<uint8_t>(), tiles, max_batch, shared_memory,
+            static_cast<int>(tailbite_context), stream);
+    }
+    else if (K == 3)
+    {
+        launch_trellis<3, 5>(
+            input_tiles.data_ptr<float>(), output_tiles.data_ptr<float>(),
+            reinterpret_cast<uint16_t*>(output_indices.data_ptr<int16_t>()),
+            reinterpret_cast<half*>(temp_costs.data_ptr<at::Half>()),
+            temp_edges.data_ptr<uint8_t>(), tiles, max_batch, shared_memory,
+            static_cast<int>(tailbite_context), stream);
+    }
+    else if (K == 4)
+    {
+        launch_trellis<4, 5>(
+            input_tiles.data_ptr<float>(), output_tiles.data_ptr<float>(),
+            reinterpret_cast<uint16_t*>(output_indices.data_ptr<int16_t>()),
+            reinterpret_cast<half*>(temp_costs.data_ptr<at::Half>()),
+            temp_edges.data_ptr<uint8_t>(), tiles, max_batch, shared_memory,
+            static_cast<int>(tailbite_context), stream);
+    }
+    else if (K == 5)
+    {
+        launch_trellis<5, 5>(
+            input_tiles.data_ptr<float>(), output_tiles.data_ptr<float>(),
+            reinterpret_cast<uint16_t*>(output_indices.data_ptr<int16_t>()),
+            reinterpret_cast<half*>(temp_costs.data_ptr<at::Half>()),
+            temp_edges.data_ptr<uint8_t>(), tiles, max_batch, shared_memory,
+            static_cast<int>(tailbite_context), stream);
+    }
+    else
+    {
+        launch_trellis<6, 5>(
+            input_tiles.data_ptr<float>(), output_tiles.data_ptr<float>(),
+            reinterpret_cast<uint16_t*>(output_indices.data_ptr<int16_t>()),
+            reinterpret_cast<half*>(temp_costs.data_ptr<at::Half>()),
+            temp_edges.data_ptr<uint8_t>(), tiles, max_batch, shared_memory,
+            static_cast<int>(tailbite_context), stream);
+    }
 }

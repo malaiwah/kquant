@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import asdict, dataclass
 from collections.abc import Mapping
 from typing import Literal, Protocol, Sequence
@@ -11,7 +12,10 @@ import torch
 import torch.nn.functional as F
 
 from kquant.capture import LayerSamples
-from kquant.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
+from kquant.exl3_reference import (
+    CODEBOOK_SQG_XOR_CHEB_T12,
+    reconstruct_trellis_states,
+)
 from kquant.qsrt_candidates import (
     PERMUTATION_POLICIES,
     PermutationPolicy,
@@ -26,11 +30,13 @@ from kquant.qsrt_candidates import (
     select_phase1_rate_pair,
 )
 from kquant.qsrt import (
+    H308,
     SCHEMA,
     ExpertFormatSpec,
     PHASE1_MODE_IDS,
     RATE_TRANSFER_MODES,
     RECORDS_PER_EXPERT,
+    resolve_mode,
 )
 from kquant.pack.qsrt_encoder import (
     Layout,
@@ -53,6 +59,62 @@ OFFICIAL_SOURCE_DAMAGE_METRIC = "official_source_excess_sse"
 HessianPolicy = Literal["captured_blend", "identity"]
 HESSIAN_POLICIES: tuple[HessianPolicy, ...] = ("captured_blend", "identity")
 FOLDED_SCALE_GRID: tuple[float, ...] = (0.85, 0.925, 1.0, 1.075, 1.15)
+
+
+def _debug_assert_candidate_state_closure(
+    candidate: QSRTMatrixCandidate,
+    *,
+    layer: int,
+    expert: int,
+    stage: str,
+) -> None:
+    encoded = candidate.encoded
+    plan = candidate.plan
+    tile_bits = tuple(int(value) for value in plan.encoder_tile_bits)
+    rate_dim = 0 if plan.rate_axis == "k" else 1
+    for bits in sorted(set(tile_bits)):
+        positions = torch.tensor(
+            [index for index, value in enumerate(tile_bits) if value == bits],
+            dtype=torch.long,
+            device=encoded.device,
+        )
+        selected = encoded.index_select(rate_dim, positions)
+        expected = reconstruct_trellis_states(selected, bits)
+        mismatch = selected != expected
+        if bool(torch.any(mismatch)):
+            count = int(torch.count_nonzero(mismatch))
+            first = tuple(
+                int(value)
+                for value in torch.nonzero(mismatch, as_tuple=False)[0]
+                .cpu()
+                .tolist()
+            )
+            raise RuntimeError(
+                f"layer {layer} expert {expert} {plan.matrix} R{plan.mode.mode_id} "
+                f"failed {stage} state closure at K{bits}: {count} states "
+                f"differ; first grouped coordinate {first}"
+            )
+
+
+def _debug_assert_candidate_tree_closure(
+    candidates,
+    experts: Sequence[int],
+    *,
+    layer: int,
+    stage: str,
+) -> None:
+    if os.environ.get("KQUANT_QSRT_DEBUG_CANDIDATE_CLOSURE") != "1":
+        return
+    for expert, tree in zip(experts, candidates):
+        stack = [tree]
+        while stack:
+            value = stack.pop()
+            if isinstance(value, QSRTMatrixCandidate):
+                _debug_assert_candidate_state_closure(
+                    value, layer=layer, expert=expert, stage=stage
+                )
+            elif isinstance(value, Mapping):
+                stack.extend(value.values())
 
 
 class MatrixStore(Protocol):
@@ -95,7 +157,7 @@ class QSRTCandidateEncoding:
             "covariance": self.covariance,
             "evaluated_modes": list(self.evaluated_modes),
             "mode_coding": {
-                f"R{r13}/R{r2}": value
+                (H308.name if r13 == r2 == H308.mode_id else f"R{r13}/R{r2}"): value
                 for (r13, r2), value in self.mode_coding.items()
             },
         }
@@ -307,7 +369,10 @@ def _mode_evidence(encodings: dict[str, QSRTMatrixEncoding]) -> dict[str, object
 
 def _candidate_mode_evidence(encodings: dict[str, object]) -> dict[str, object]:
     trellis_bytes = sum(
-        value.reconstruction.numel() * 3 // 8 for value in encodings.values()
+        value.reconstruction.numel()
+        * sum(value.plan.mode.context_bits)
+        // (len(value.plan.mode.context_bits) * 8)
+        for value in encodings.values()
     )
     scale_bytes = sum(
         value.tensors[name].numel() * value.tensors[name].element_size()
@@ -553,10 +618,15 @@ def encode_phase1_expert(
     if not 1 <= layer <= 92 or not 0 <= expert < 896:
         raise ValueError("invalid K3 layer/expert assignment")
     modes = tuple(int(mode) for mode in mode_ids)
-    if not modes or modes[0] != 0 or len(set(modes)) != len(modes):
-        raise ValueError("mode_ids must be unique and begin with R0")
-    if any(not 0 <= mode < len(RATE_TRANSFER_MODES) for mode in modes):
-        raise ValueError("mode_ids contain an unsupported transfer count")
+    fixed_high_rate = modes == (H308.mode_id,)
+    if (
+        not modes
+        or len(set(modes)) != len(modes)
+        or (not fixed_high_rate and modes[0] != 0)
+    ):
+        raise ValueError("mode_ids must be H308 alone or unique and begin with R0")
+    if any(mode not in (0, 1, 2, H308.mode_id) for mode in modes):
+        raise ValueError("mode_ids contain an unsupported schedule")
     if hessian_policy not in HESSIAN_POLICIES:
         raise ValueError(f"unsupported Hessian policy: {hessian_policy}")
     if permutation_policy not in PERMUTATION_POLICIES:
@@ -620,7 +690,9 @@ def encode_phase1_expert(
         }
 
     can_confirm = confirmation_documents >= min_confirmation_documents
-    evaluated_modes = modes if have_local_support and can_confirm else (0,)
+    evaluated_modes = (
+        modes if fixed_high_rate or (have_local_support and can_confirm) else (0,)
+    )
     evaluated_formats = tuple(
         (r13, r2) for r13 in evaluated_modes for r2 in evaluated_modes
     )
@@ -636,7 +708,7 @@ def encode_phase1_expert(
         covariance["folded_scale_max"] = float(intermediate_conditioning.max())
         context_basis += "+folded_128_channel_conditioning"
 
-    mode_specs = tuple(RATE_TRANSFER_MODES[mode] for mode in evaluated_modes)
+    mode_specs = tuple(resolve_mode(mode) for mode in evaluated_modes)
     guarded_reuse = layout == "qsrt_guarded_reuse"
     if guarded_reuse and any(mode > 2 for mode in evaluated_modes):
         raise ValueError("qsrt_guarded_reuse supports only R0 through R2")
@@ -770,18 +842,33 @@ def encode_phase1_expert(
 
     assert fit_reference is not None and fit_counts is not None
     assert confirmation_reference is not None and confirmation_counts is not None
-    selection = select_phase1_rate_pair(
-        fit_sse,
-        confirmation_sse,
-        fit_counts=fit_counts,
-        confirmation_counts=confirmation_counts,
-        modes=evaluated_formats,
-        min_fit_documents=min_fit_documents,
-        min_confirmation_documents=min_confirmation_documents,
-        minimum_improvement=minimum_improvement,
-        bootstrap_replicates=bootstrap_replicates,
-        seed=deterministic_expert_seed(layer, expert),
-    )
+    if fixed_high_rate:
+        selection = RatePairSelection(
+            proposed_r13=H308.mode_id,
+            proposed_r2=H308.mode_id,
+            selected_r13=H308.mode_id,
+            selected_r2=H308.mode_id,
+            accepted=True,
+            reason="fixed_22k3_2k4_high_rate_profile",
+            fit_documents=int(torch.count_nonzero(fit_counts)),
+            confirmation_documents=int(torch.count_nonzero(confirmation_counts)),
+            confirmation_relative_improvement=None,
+            confirmation_ci95=(None, None),
+            bootstrap_replicates_valid=0,
+        )
+    else:
+        selection = select_phase1_rate_pair(
+            fit_sse,
+            confirmation_sse,
+            fit_counts=fit_counts,
+            confirmation_counts=confirmation_counts,
+            modes=evaluated_formats,
+            min_fit_documents=min_fit_documents,
+            min_confirmation_documents=min_confirmation_documents,
+            minimum_improvement=minimum_improvement,
+            bootstrap_replicates=bootstrap_replicates,
+            seed=deterministic_expert_seed(layer, expert),
+        )
     selected_r13, selected_r2 = selection.selected
     selected_candidates = {
         "w1": upstream_candidates["w1"][selected_r13],
@@ -887,10 +974,15 @@ def encode_phase1_expert_batch(
     if not 1 <= layer <= 92 or any(not 0 <= expert < 896 for expert in expert_ids):
         raise ValueError("invalid K3 layer/expert assignment")
     modes = tuple(int(mode) for mode in mode_ids)
-    if not modes or modes[0] != 0 or len(set(modes)) != len(modes):
-        raise ValueError("mode_ids must be unique and begin with R0")
-    if any(not 0 <= mode < len(RATE_TRANSFER_MODES) for mode in modes):
-        raise ValueError("mode_ids contain an unsupported transfer count")
+    fixed_high_rate = modes == (H308.mode_id,)
+    if (
+        not modes
+        or len(set(modes)) != len(modes)
+        or (not fixed_high_rate and modes[0] != 0)
+    ):
+        raise ValueError("mode_ids must be H308 alone or unique and begin with R0")
+    if any(mode not in (0, 1, 2, H308.mode_id) for mode in modes):
+        raise ValueError("mode_ids contain an unsupported schedule")
     if hessian_policy not in HESSIAN_POLICIES:
         raise ValueError(f"unsupported Hessian policy: {hessian_policy}")
     if permutation_policy not in PERMUTATION_POLICIES:
@@ -970,8 +1062,10 @@ def encode_phase1_expert_batch(
             }
 
         can_confirm = confirmation_documents >= min_confirmation_documents
-        evaluated_modes = modes if have_local_support and can_confirm else (0,)
-        mode_specs = tuple(RATE_TRANSFER_MODES[mode] for mode in evaluated_modes)
+        evaluated_modes = (
+            modes if fixed_high_rate or (have_local_support and can_confirm) else (0,)
+        )
+        mode_specs = tuple(resolve_mode(mode) for mode in evaluated_modes)
         contexts_device = block_contexts.to(device=device, dtype=torch.long)
         intermediate_conditioning = _folded_intermediate_conditioning(
             block_scores.to(device=device),
@@ -1033,6 +1127,12 @@ def encode_phase1_expert_batch(
         tailbite_context=tailbite_context,
         transform_seeds_by_expert=seed_maps,
         intermediate_conditioning_by_expert=upstream_conditioning,
+    )
+    _debug_assert_candidate_tree_closure(
+        upstream_candidates,
+        expert_ids,
+        layer=layer,
+        stage="post-upstream-encode",
     )
     del upstream_sources, upstream_hessians
 
@@ -1111,6 +1211,18 @@ def encode_phase1_expert_batch(
         tailbite_context=tailbite_context,
         transform_seeds_by_expert=seed_maps,
     )
+    _debug_assert_candidate_tree_closure(
+        upstream_candidates,
+        expert_ids,
+        layer=layer,
+        stage="post-down-encode upstream recheck",
+    )
+    _debug_assert_candidate_tree_closure(
+        down_candidates,
+        expert_ids,
+        layer=layer,
+        stage="post-down-encode",
+    )
     del down_sources, conditional_h2s
 
     results: list[QSRTCandidateEncoding] = []
@@ -1184,34 +1296,61 @@ def encode_phase1_expert_batch(
         fit_counts = fit_plan.counts
         confirmation_reference = confirmation_plan.reference_energy
         confirmation_counts = confirmation_plan.counts
-        selection = select_phase1_rate_pair(
-            fit_sse,
-            confirmation_sse,
-            fit_counts=fit_counts,
-            confirmation_counts=confirmation_counts,
-            modes=evaluated_formats,
-            min_fit_documents=min_fit_documents,
-            min_confirmation_documents=min_confirmation_documents,
-            minimum_improvement=minimum_improvement,
-            bootstrap_replicates=bootstrap_replicates,
-            seed=deterministic_expert_seed(layer, expert),
-        )
+        if fixed_high_rate:
+            selection = RatePairSelection(
+                proposed_r13=H308.mode_id,
+                proposed_r2=H308.mode_id,
+                selected_r13=H308.mode_id,
+                selected_r2=H308.mode_id,
+                accepted=True,
+                reason="fixed_22k3_2k4_high_rate_profile",
+                fit_documents=int(torch.count_nonzero(fit_counts)),
+                confirmation_documents=int(torch.count_nonzero(confirmation_counts)),
+                confirmation_relative_improvement=None,
+                confirmation_ci95=(None, None),
+                bootstrap_replicates_valid=0,
+            )
+        else:
+            selection = select_phase1_rate_pair(
+                fit_sse,
+                confirmation_sse,
+                fit_counts=fit_counts,
+                confirmation_counts=confirmation_counts,
+                modes=evaluated_formats,
+                min_fit_documents=min_fit_documents,
+                min_confirmation_documents=min_confirmation_documents,
+                minimum_improvement=minimum_improvement,
+                bootstrap_replicates=bootstrap_replicates,
+                seed=deterministic_expert_seed(layer, expert),
+            )
         selected_r13, selected_r2 = selection.selected
         selected_candidates = {
             "w1": upstream["w1"][selected_r13],
             "w3": upstream["w3"][selected_r13],
             "w2": down[selected_r13][selected_r2],
         }
-        selected_encodings = {
-            matrix: finalize_qsrt_matrix_candidate(
-                value,
-                layer=layer,
-                logical_trellis_schema=logical_trellis_schema,
-                codebook=codebook,
-                tailbite_context=tailbite_context,
-            )
-            for matrix, value in selected_candidates.items()
-        }
+        if os.environ.get("KQUANT_QSRT_DEBUG_CANDIDATE_CLOSURE") == "1":
+            for value in selected_candidates.values():
+                _debug_assert_candidate_state_closure(
+                    value,
+                    layer=layer,
+                    expert=expert,
+                    stage="post-scoring selected-candidate",
+                )
+        selected_encodings = {}
+        for matrix, value in selected_candidates.items():
+            try:
+                selected_encodings[matrix] = finalize_qsrt_matrix_candidate(
+                    value,
+                    layer=layer,
+                    logical_trellis_schema=logical_trellis_schema,
+                    codebook=codebook,
+                    tailbite_context=tailbite_context,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"layer {layer} expert {expert} {matrix} finalization failed"
+                ) from exc
         physical_permutation = selected_encodings["w1"].plan.physical_permutation
         for matrix in ("w3", "w2"):
             if not torch.equal(

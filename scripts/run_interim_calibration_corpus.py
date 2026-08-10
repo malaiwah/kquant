@@ -1,10 +1,10 @@
-"""Drive a deterministic calibration corpus through the interim EXL3 server.
+"""Drive a deterministic calibration corpus through a resident Kimi server.
 
 The script does not load model weights. It loads only the tokenizer from the
-local interim serve directory, verifies that the live capture manifest names
-the interim EXL3 hybrid as its teacher, and then sends pretokenized completion
-requests. A content hash assigns whole JSONL records to disjoint folds, so a
-separate training and validation capture cannot share a source document.
+local serve directory, verifies that the live capture manifest names the exact
+expected resident checkpoint, and then sends pretokenized completion requests.
+A content hash assigns whole JSONL records to disjoint folds, so a separate
+training and validation capture cannot share a source document.
 """
 
 from __future__ import annotations
@@ -20,8 +20,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
 
-INTERIM_SOURCE = "interim_exl3_3p09_hybrid"
-DEFAULT_MODEL_DIR = Path("/models/Kimi-K3-EXL3-3p09-serve")
+DEFAULT_CAPTURE_SOURCE = "pure_qsrt_sqg_xor_cheb_t12"
+DEFAULT_MODEL_DIR = Path(
+    "/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-PURE-v1-model"
+)
 
 
 class TokenizerLike(Protocol):
@@ -177,6 +179,17 @@ def _record_tokens(row: dict, tokenizer: TokenizerLike) -> list[int]:
     if isinstance(row.get("prompt"), str):
         return list(tokenizer.encode(row["prompt"], add_special_tokens=False))
     messages = row.get("messages")
+    if not isinstance(messages, list) and isinstance(row.get("text"), str):
+        # The pinned REAP recall corpus preserves each original chat record as
+        # JSON inside ``text`` while adding its own source/axis metadata.  Parse
+        # that envelope in place so the raw outer line remains the authenticated
+        # document identity used for splitting and provenance.
+        try:
+            nested = json.loads(row["text"])
+        except json.JSONDecodeError as exc:
+            raise ValueError("record text is not a valid serialized chat") from exc
+        if isinstance(nested, dict):
+            messages = nested.get("messages")
     if not isinstance(messages, list):
         # The locally prepared GLMFlash corpora use ``conversations`` for the
         # same OpenAI-style role/content sequence.  Accept it directly so the
@@ -328,7 +341,11 @@ def build_plan(
     return plan
 
 
-def _validate_interim_directory(model_dir: Path) -> Path:
+def _validate_resident_directory(
+    model_dir: Path,
+    *,
+    allow_other_layout: bool = False,
+) -> Path:
     root = model_dir.resolve()
     required = (
         "config.json",
@@ -337,7 +354,10 @@ def _validate_interim_directory(model_dir: Path) -> Path:
     )
     missing = [name for name in required if not (root / name).is_file()]
     if missing:
-        raise ValueError(f"{root} is not an interim EXL3 serve tree; missing {missing}")
+        raise ValueError(f"{root} is not a resident Kimi checkpoint; missing {missing}")
+
+    if allow_other_layout:
+        return root
 
     exl3_shards = [
         root / f"exl3-layer-{layer:05d}.safetensors" for layer in range(1, 93)
@@ -399,19 +419,21 @@ def _validate_live_capture(
     capture_dir: Path,
     model_dir: Path,
     *,
+    expected_source: str,
     timeout: float,
     allow_complete: bool = False,
 ) -> dict:
     manifest = _wait_for_capture_manifest(capture_dir, timeout)
     if manifest.get("kind") != "kquant_vllm_b12x_capture":
         raise ValueError("live server does not expose a KQuant capture manifest")
-    if manifest.get("source") != INTERIM_SOURCE:
+    if manifest.get("source") != expected_source:
         raise ValueError(
-            f"capture source is {manifest.get('source')!r}, expected {INTERIM_SOURCE!r}"
+            f"capture source is {manifest.get('source')!r}, "
+            f"expected {expected_source!r}"
         )
     teacher = Path(str(manifest.get("teacher_checkpoint", ""))).resolve()
     if teacher != model_dir:
-        raise ValueError(f"capture teacher is {teacher}, expected interim {model_dir}")
+        raise ValueError(f"capture teacher is {teacher}, expected {model_dir}")
     if manifest.get("complete") and not allow_complete:
         raise ValueError("capture is already finalized")
     return manifest
@@ -465,7 +487,8 @@ def _plan_report(
     return {
         "kind": "kquant_interim_calibration_corpus_run",
         "schema_version": 1,
-        "constraint": "interim EXL3 hybrid only; official model not loaded",
+        "constraint": "resident teacher only; official MXFP4 source not loaded",
+        "expected_capture_source": args.expected_capture_source,
         "model_dir": str(args.model_dir.resolve()),
         "capture_dir": str(args.capture_dir.resolve()),
         "sources": [
@@ -514,6 +537,7 @@ def _resume_report(path: Path, planned: dict) -> dict:
         "kind",
         "schema_version",
         "constraint",
+        "expected_capture_source",
         "model_dir",
         "capture_dir",
         "sources",
@@ -540,7 +564,13 @@ def _resume_report(path: Path, planned: dict) -> dict:
 
 
 def run(args: argparse.Namespace) -> dict:
-    model_dir = _validate_interim_directory(args.model_dir)
+    model_dir = _validate_resident_directory(
+        args.model_dir,
+        allow_other_layout=(
+            args.allow_other_teacher_layout
+            or args.expected_capture_source != "interim_exl3_3p09_hybrid"
+        ),
+    )
     for source in args.source:
         if not source.path.is_file():
             raise FileNotFoundError(source.path)
@@ -596,6 +626,7 @@ def run(args: argparse.Namespace) -> dict:
     live_manifest = _validate_live_capture(
         args.capture_dir,
         model_dir,
+        expected_source=args.expected_capture_source,
         timeout=args.health_timeout,
         allow_complete=completed_before_connect and sentinel_recorded,
     )
@@ -696,6 +727,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=20260801)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    parser.add_argument(
+        "--expected-capture-source",
+        default=DEFAULT_CAPTURE_SOURCE,
+        help="exact source identity required in the live capture manifest",
+    )
+    parser.add_argument(
+        "--allow-other-teacher-layout",
+        action="store_true",
+        help=(
+            "accept a resident checkpoint with the common model/tokenizer index "
+            "files but without the interim EXL3 shard layout; the live capture "
+            "manifest must still bind to this exact checkpoint"
+        ),
+    )
     parser.add_argument("--capture-dir", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")

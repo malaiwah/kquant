@@ -26,6 +26,12 @@ from kquant.io.stats_bundle import save_stats_bundle
 CAPTURE_SCHEMA_VERSION = 2
 HESSIAN_SCHEMA_VERSION = 2
 SAMPLE_CACHE_SCHEMA_VERSION = 1
+RESIDENT_CAPTURE_SOURCES = frozenset(
+    {
+        "interim_exl3_3p09_hybrid",
+        "pure_qsrt_sqg_xor_cheb_t12",
+    }
+)
 _RANK_RE = re.compile(r"rank-(\d+)$")
 
 
@@ -102,18 +108,13 @@ def load_capture(
                 "production K3 capture model/revision does not match kquant constants"
             )
         source = root.get("source")
-        if source not in {
-            "official_mxfp4_normal_w4a16",
-            "interim_exl3_3p09_hybrid",
-        }:
+        if source not in {"official_mxfp4_normal_w4a16", *RESIDENT_CAPTURE_SOURCES}:
             raise ValueError(
                 "production K3 calibration has an unsupported teacher source: "
                 f"{source!r}"
             )
-        if source == "interim_exl3_3p09_hybrid" and not root.get(
-            "teacher_checkpoint"
-        ):
-            raise ValueError("interim EXL3 capture is missing teacher_checkpoint")
+        if source in RESIDENT_CAPTURE_SOURCES and not root.get("teacher_checkpoint"):
+            raise ValueError("resident-teacher capture is missing teacher_checkpoint")
     rank_dirs = sorted(
         p for p in path.iterdir() if p.is_dir() and _RANK_RE.match(p.name)
     )

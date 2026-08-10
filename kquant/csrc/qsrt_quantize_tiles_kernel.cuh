@@ -14,6 +14,8 @@
 #define QUANTIZE_TILES_K2_NUM_THREADS 1024
 #define QUANTIZE_TILES_K3_NUM_THREADS 640
 #define QUANTIZE_TILES_K4_NUM_THREADS 704
+#define QUANTIZE_TILES_K5_NUM_THREADS 512
+#define QUANTIZE_TILES_K6_NUM_THREADS 512
 #ifndef H_INF
 #define H_INF __ushort_as_half(0x7c00)
 #endif
@@ -21,7 +23,10 @@
 template <int K, int cb>
 __global__ __launch_bounds__(
     K == 2 ? QUANTIZE_TILES_K2_NUM_THREADS :
-        (K == 3 ? QUANTIZE_TILES_K3_NUM_THREADS : QUANTIZE_TILES_K4_NUM_THREADS),
+        (K == 3 ? QUANTIZE_TILES_K3_NUM_THREADS :
+            (K == 4 ? QUANTIZE_TILES_K4_NUM_THREADS :
+                (K == 5 ? QUANTIZE_TILES_K5_NUM_THREADS :
+                    QUANTIZE_TILES_K6_NUM_THREADS))),
     K == 2 ? 1 : 2)
 void quantize_tiles_kernel
 (
@@ -45,7 +50,10 @@ void quantize_tiles_kernel
     constexpr int predecessor_step = 1 << decision_shift;
     constexpr int num_threads =
         K == 2 ? QUANTIZE_TILES_K2_NUM_THREADS :
-            (K == 3 ? QUANTIZE_TILES_K3_NUM_THREADS : QUANTIZE_TILES_K4_NUM_THREADS);
+            (K == 3 ? QUANTIZE_TILES_K3_NUM_THREADS :
+                (K == 4 ? QUANTIZE_TILES_K4_NUM_THREADS :
+                    (K == 5 ? QUANTIZE_TILES_K5_NUM_THREADS :
+                        QUANTIZE_TILES_K6_NUM_THREADS)));
 
     const int tile_idx = blockIdx.x;
     const int thread = threadIdx.x;

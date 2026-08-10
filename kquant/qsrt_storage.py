@@ -500,7 +500,7 @@ class QSRTLayerLayout:
             padding_bytes=extent - payload,
         )
 
-    def to_manifest(self) -> dict[str, int | str | tuple[int, ...]]:
+    def to_manifest(self) -> dict[str, int | str | list[int]]:
         return {
             "schema": SCHEMA,
             "alignment_bytes": STORAGE_ALIGNMENT,
@@ -515,7 +515,7 @@ class QSRTLayerLayout:
             "compressed_payload_bytes": self.compressed_payload_bytes,
             "atom_slab_offset": ATOM_SLAB_OFFSET,
             "disk_bytes": self.disk_bytes,
-            "equal_shard_counts": EQUAL_SHARD_COUNTS,
+            "equal_shard_counts": list(EQUAL_SHARD_COUNTS),
         }
 
 

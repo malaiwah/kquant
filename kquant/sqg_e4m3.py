@@ -21,7 +21,6 @@ import torch
 
 SQG_NORMAL_E4M3 = "sqg-normal-e4m3"
 SQG_CHEB_NORMAL_E4M3 = "sqg-cheb-normal-e4m3"
-SQG_CHEB = "sqg_cheb"
 SQG_XOR_CHEB_T12 = "sqg_xor_cheb_t12"
 
 _TRANSITIONS = 1 << 16
@@ -31,8 +30,8 @@ _Q = (1.0, 2.07630930, -8.08332684, 6.32135736, -1.31208298)
 
 
 def _validate(bits: int, mode: str) -> None:
-    if isinstance(bits, bool) or not isinstance(bits, int) or bits not in (2, 3, 4):
-        raise ValueError("SQG supports integer K2, K3, or K4")
+    if isinstance(bits, bool) or not isinstance(bits, int) or bits not in range(2, 7):
+        raise ValueError("SQG supports integer K2 through K6")
     if mode != "normal":
         raise ValueError("the supported R44 mode is 'normal'")
 
@@ -317,19 +316,6 @@ def sqg_codebook_bytes(
         return sqg_e4m3_bytes(bits, "normal", device=device)
     if codebook == SQG_CHEB_NORMAL_E4M3:
         return sqg_cheb_normal_e4m3_bytes(bits).to(device=device).contiguous()
-    if codebook == SQG_CHEB:
-        if rate_axis not in ("k", "n"):
-            raise ValueError(
-                "the w2-only K2-Q8H4 profile requires rate_axis 'k' or 'n'"
-            )
-        rank_lut = sqg_cheb_normal_rank_e4m3_bytes()
-        if bits == 2 and rate_axis == "k":
-            return sqg_k2_eight_stratum_e4m3_bytes_from_rank_lut(
-                rank_lut, history_bit=4, device=device
-            )
-        return sqg_e4m3_bytes_from_rank_lut(
-            bits, rank_lut, device=device
-        ).contiguous()
     raise ValueError(f"unsupported SQG codebook: {codebook!r}")
 
 
@@ -351,60 +337,6 @@ def sqg_codebook(
         .to(dtype=dtype)
         .contiguous()
     )
-
-
-@lru_cache(maxsize=None)
-def sqg_k2_eight_stratum_rank_permutation(
-    history_bit: int = 2,
-) -> torch.Tensor:
-    """Return a state-conditioned eight-stratum labelling for a K2 trellis.
-
-    The physical graph still appends two branch bits and retains fourteen
-    state bits.  Numerical labelling reinterprets the newest retained history
-    bit plus the two new branch bits as a virtual three-bit stratum selector;
-    the remaining thirteen bits select phase.  A K2 state therefore exposes
-    four of eight strata, while its retained history chooses which four.
-    Globally this is the same bijective rank law used by K3.  ``history_bit``
-    selects which retained physical codeword bit becomes the most-significant
-    virtual stratum bit.  Bit 2 is the newest retained bit and reproduces the
-    exact K3 transition-label function over the unmodified codeword.
-    """
-
-    if isinstance(history_bit, bool) or not isinstance(history_bit, int):
-        raise TypeError("K2 eight-stratum history bit must be an integer")
-    if not 2 <= history_bit < 16:
-        raise ValueError("K2 eight-stratum history bit must be in [2, 15]")
-    k3_ranks = sqg_rank_permutation(3)
-    if history_bit == 2:
-        return k3_ranks
-
-    transitions = torch.arange(_TRANSITIONS, dtype=torch.int64)
-    bit_2 = (transitions >> 2) & 1
-    bit_h = (transitions >> history_bit) & 1
-    swap = bit_2 ^ bit_h
-    permuted = transitions ^ (swap << 2) ^ (swap << history_bit)
-    return k3_ranks.index_select(0, permuted).contiguous()
-
-
-def sqg_k2_eight_stratum_e4m3_bytes_from_rank_lut(
-    rank_lut: torch.Tensor,
-    *,
-    history_bit: int = 2,
-    device: torch.device | str = "cpu",
-) -> torch.Tensor:
-    """Map one shared rank staircase onto state-conditioned K2 octiles."""
-
-    if rank_lut.dtype != torch.uint8:
-        raise TypeError("SQG rank LUT must contain raw uint8 E4M3 labels")
-    if rank_lut.ndim != 1 or rank_lut.numel() != _TRANSITIONS:
-        raise ValueError("SQG rank LUT must contain exactly 65,536 labels")
-    rank_lut = rank_lut.detach().to(device="cpu").contiguous()
-    values = rank_lut.view(torch.float8_e4m3fn).float()
-    if not bool(torch.isfinite(values).all()):
-        raise ValueError("SQG rank LUT must contain only finite E4M3 labels")
-    return rank_lut.index_select(
-        0, sqg_k2_eight_stratum_rank_permutation(history_bit)
-    ).to(device=device).contiguous()
 
 
 def sqg_rank_permutation(bits: int) -> torch.Tensor:

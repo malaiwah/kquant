@@ -15,6 +15,7 @@ from kquant.capture import (
     index_layer_samples,
     load_layer_hessians,
     load_layer_samples,
+    load_capture,
 )
 
 
@@ -119,6 +120,59 @@ def _make_capture(
             )
         save_file(part, samples / "part-00000001.safetensors")
     return root
+
+
+def _make_production_manifest_only_capture(root: Path, source: str) -> Path:
+    root.mkdir()
+    _write_json(
+        root / "manifest.json",
+        {
+            "schema_version": 2,
+            "run_id": "source-contract",
+            "tp_world_size": 1,
+            "complete": True,
+            "model": capture_module.C.MODEL_ID,
+            "revision": capture_module.C.REVISION,
+            "source": source,
+            "teacher_checkpoint": "/models/pure-qsrt",
+        },
+    )
+    rank = root / "rank-00000"
+    rank.mkdir()
+    _write_json(
+        rank / "manifest.json",
+        {
+            "schema_version": 2,
+            "rank": 0,
+            "tp_world_size": 1,
+            "run_id": "source-contract",
+            "complete": True,
+            "registered_decoder_layers": list(capture_module.C.MOE_LAYERS),
+        },
+    )
+    save_file({"dummy": torch.tensor([0])}, rank / "stats.safetensors")
+    return root
+
+
+def test_production_capture_accepts_pure_qsrt_teacher_source(tmp_path: Path) -> None:
+    capture = _make_production_manifest_only_capture(
+        tmp_path / "pure.kqcapture", "pure_qsrt_sqg_xor_cheb_t12"
+    )
+
+    root, geometry, ranks = load_capture(capture, load_stats=False)
+
+    assert root["teacher_checkpoint"] == "/models/pure-qsrt"
+    assert geometry == capture_module.CaptureGeometry()
+    assert [rank.rank for rank in ranks] == [0]
+
+
+def test_production_capture_rejects_unknown_teacher_source(tmp_path: Path) -> None:
+    capture = _make_production_manifest_only_capture(
+        tmp_path / "unknown.kqcapture", "unqualified_teacher"
+    )
+
+    with pytest.raises(ValueError, match="unsupported teacher source"):
+        load_capture(capture, load_stats=False)
 
 
 def test_build_hessians_joins_tp_channel_shards(tmp_path: Path) -> None:

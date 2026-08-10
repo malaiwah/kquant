@@ -12,6 +12,7 @@ from scripts.run_interim_calibration_corpus import (
     _parse_source,
     _record_tokens,
     _resume_report,
+    _validate_live_capture,
     build_plan,
 )
 
@@ -100,6 +101,23 @@ def test_record_tokens_accepts_conversations_alias() -> None:
 
     assert _record_tokens(row, tokenizer) == tokenizer.apply_chat_template(
         row["conversations"], tokenize=True, add_generation_prompt=False
+    )
+
+
+def test_record_tokens_accepts_authenticated_serialized_chat_text() -> None:
+    tokenizer = _Tokenizer()
+    messages = [
+        {"role": "system", "content": "Be precise."},
+        {"role": "user", "content": "Explain the result."},
+    ]
+    row = {
+        "axis": "axis1_general",
+        "source": "pinned-reap-recall",
+        "text": json.dumps({"messages": messages}),
+    }
+
+    assert _record_tokens(row, tokenizer) == tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=False
     )
 
 
@@ -323,3 +341,38 @@ def test_resume_report_requires_identical_document_plan(tmp_path: Path) -> None:
         assert "documents" in str(error)
     else:
         raise AssertionError("changed plan should not be resumable")
+
+
+def test_live_capture_requires_explicit_source_and_exact_teacher(
+    tmp_path: Path,
+) -> None:
+    teacher = tmp_path / "pure-qsrt"
+    capture = tmp_path / "capture"
+    teacher.mkdir()
+    capture.mkdir()
+    manifest = {
+        "kind": "kquant_vllm_b12x_capture",
+        "source": "pure_qsrt_sqg_xor_cheb_t12",
+        "teacher_checkpoint": str(teacher.resolve()),
+        "complete": False,
+    }
+    (capture / "manifest.json").write_text(json.dumps(manifest))
+
+    assert _validate_live_capture(
+        capture,
+        teacher.resolve(),
+        expected_source="pure_qsrt_sqg_xor_cheb_t12",
+        timeout=0.1,
+    ) == manifest
+
+    try:
+        _validate_live_capture(
+            capture,
+            teacher.resolve(),
+            expected_source="interim_exl3_3p09_hybrid",
+            timeout=0.1,
+        )
+    except ValueError as error:
+        assert "capture source" in str(error)
+    else:
+        raise AssertionError("mismatched capture source should fail")

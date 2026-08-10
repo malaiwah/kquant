@@ -9,6 +9,8 @@ import torch
 import kquant.pack.qsrt_pool as raw_keep_allocation
 from kquant import constants as C
 from kquant.qsrt import (
+    FIXED_HIGH_RATE_TRELLIS_BYTES,
+    H308,
     INTERMEDIATE_CHANNELS,
     LATENT_CHANNELS,
     MATRIX_TRELLIS_BYTES,
@@ -181,6 +183,54 @@ def test_layer_metrics_rederive_confirmation_proposal_and_gate() -> None:
         )
 
 
+def test_fixed_high_rate_metrics_have_no_selection_oracle() -> None:
+    fit_sse = torch.tensor([[[[1.0, 2.0]]]], dtype=torch.float64)
+    confirmation_sse = torch.tensor([[[[3.0]]]], dtype=torch.float64)
+    metrics = {
+        "expert_ids": torch.tensor([7], dtype=torch.int16),
+        "mode_ids": torch.tensor([H308.mode_id], dtype=torch.uint8),
+        "selected_r13": torch.tensor([H308.mode_id], dtype=torch.uint8),
+        "selected_r2": torch.tensor([H308.mode_id], dtype=torch.uint8),
+        "proposed_r13": torch.tensor([H308.mode_id], dtype=torch.uint8),
+        "proposed_r2": torch.tensor([H308.mode_id], dtype=torch.uint8),
+        "format_evaluated": torch.ones((1, 1, 1), dtype=torch.bool),
+        "fit_sse": fit_sse,
+        "confirmation_sse": confirmation_sse,
+        "fit_reference_energy": torch.ones((1, 2), dtype=torch.float64),
+        "confirmation_reference_energy": torch.ones((1, 1), dtype=torch.float64),
+        "fit_counts": torch.ones((1, 2), dtype=torch.int32),
+        "confirmation_counts": torch.ones((1, 1), dtype=torch.int32),
+        "confirmation_improvement": torch.full((1,), float("nan"), dtype=torch.float64),
+        "confirmation_ci95": torch.full((1, 2), float("nan"), dtype=torch.float64),
+        OFFICIAL_SOURCE_DAMAGE_METRIC: torch.tensor([6.0], dtype=torch.float64),
+    }
+
+    validated = validate_layer_metrics(
+        metrics,
+        mode_ids=(H308.mode_id,),
+        fit_documents=2,
+        confirmation_documents=1,
+        expert_ids=(7,),
+        min_fit_documents=1,
+        min_confirmation_documents=1,
+        minimum_improvement=0.0,
+    )
+
+    assert validated["damage"].tolist() == [6.0]
+    metrics["selected_r2"][0] = 0
+    with pytest.raises(ValueError, match="absent from the mode table"):
+        validate_layer_metrics(
+            metrics,
+            mode_ids=(H308.mode_id,),
+            fit_documents=2,
+            confirmation_documents=1,
+            expert_ids=(7,),
+            min_fit_documents=1,
+            min_confirmation_documents=1,
+            minimum_improvement=0.0,
+        )
+
+
 def _format_coding(r13: int, r2: int) -> dict:
     rates = {"w1": ("n", r13), "w3": ("n", r13), "w2": ("k", r2)}
     trellis_bytes = 3 * MATRIX_TRELLIS_BYTES
@@ -325,6 +375,16 @@ def test_candidate_payload_component_geometry_is_exact() -> None:
         {"dtype": "I16", "shape": [2_064_384]},
         matrix="w1",
         part="trellis",
+    )
+    _validate_payload_component(
+        "w1.h308_trellis",
+        {
+            "dtype": "I16",
+            "shape": [FIXED_HIGH_RATE_TRELLIS_BYTES // torch.int16.itemsize],
+        },
+        matrix="w1",
+        part="trellis",
+        trellis_bytes=FIXED_HIGH_RATE_TRELLIS_BYTES,
     )
     _validate_payload_component(
         "w1.suh",

@@ -16,8 +16,6 @@ IGNORED_DENSE_LAYERS = (
     "f_a_proj",
     "f_b_proj",
     "b_proj",
-    "vision_tower",
-    "mm_projector",
 )
 
 

@@ -13,9 +13,11 @@ from kquant.qsrt import (
     FORMAT_SECTION_BYTES,
     FORMAT_TABLE_BYTES,
     HOT_METADATA_BYTES,
+    H308,
     INTERMEDIATE_CHANNELS,
     LAYER_HEADER_BYTES,
     MATRIX_TRELLIS_BYTES,
+    FIXED_HIGH_RATE_TRELLIS_BYTES,
     PAIRS_PER_EXPERT,
     PAIR_BYTES,
     PHASE1_H13_EXPERT_LOCAL_ALPHA,
@@ -78,6 +80,12 @@ def test_mode_schedules_are_fixed_rate_pairs() -> None:
     assert pair_kinds(R0) == ("P33",) * PAIRS_PER_EXPERT
     assert pair_kinds(R1) == ("P24",) + ("P33",) * 11
     assert pair_kinds(R2) == ("P24",) * 2 + ("P33",) * 10
+
+
+def test_h308_is_a_fixed_74_bit_record_strip() -> None:
+    assert record_bits(H308) == (3,) * 22 + (4,) * 2
+    assert sum(record_bits(H308)) == 74
+    assert ExpertFormatSpec.compressed(3).name == "H308"
 
 
 def test_pair_rotation_is_a_per_expert_bijection() -> None:
@@ -334,6 +342,22 @@ def test_pair_payload_closes_on_both_logical_axes(
     torch.testing.assert_close(
         unpacked, _expected_edge_symbols(encoded, record_bits(mode), rate_axis)
     )
+    torch.testing.assert_close(unpack_qsrt_trellis_states(packed), encoded)
+
+
+@pytest.mark.parametrize(
+    ("rate_axis", "shape"),
+    [("k", (192, 224, 256)), ("n", (224, 192, 256))],
+)
+def test_h308_payload_closes_with_exact_high_rate_bytes(
+    rate_axis: str, shape: tuple[int, int, int]
+) -> None:
+    encoded = _legal_qsrt_states(shape, record_bits(H308), rate_axis, 308)
+    packed = pack_qsrt_trellis(encoded, H308, rate_axis=rate_axis)
+
+    assert packed.descriptor.payload_bytes == FIXED_HIGH_RATE_TRELLIS_BYTES
+    assert packed.descriptor.to_manifest()["pair_kinds"] is None
+    assert packed.descriptor.to_manifest()["record_bits"] == [3] * 22 + [4] * 2
     torch.testing.assert_close(unpack_qsrt_trellis_states(packed), encoded)
 
 

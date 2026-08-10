@@ -27,6 +27,7 @@ from kquant.pack.qsrt_materialize import (
     prepare_qsrt_destination,
     qsrt_artifact_manifest,
     qsrt_layer_closure_filename,
+    qsrt_structural_layer_closure,
     qsrt_materialization_build_document,
     validate_qsrt_layer_pair,
     validate_qsrt_layer_payloads,
@@ -87,6 +88,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip the initial all-candidate safetensors header inventory",
     )
+    parser.add_argument(
+        "--skip-payload-validation",
+        action="store_true",
+        help=(
+            "for experimental artifacts, validate layer structure but skip the "
+            "second full candidate/source payload read"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -106,6 +115,7 @@ def _load_or_rebuild_closure(
     build: dict,
     pool,
     store: OfficialMXFP4Store,
+    verify_payloads: bool,
 ) -> dict[str, int | str]:
     try:
         return load_qsrt_layer_closure_receipt(
@@ -118,17 +128,26 @@ def _load_or_rebuild_closure(
     except (FileNotFoundError, ValueError) as exc:
         print(
             f"layer {spec.layer}: QSRT receipt unavailable ({exc}); "
-            "revalidating both source tiers",
+            "rebuilding layer closure",
             flush=True,
         )
-    closure = validate_qsrt_layer_payloads(
-        atom_file,
-        x4t_file,
-        spec,
-        pool.root,
-        store,
-        expected_x4t_bytes=expected_x4t_bytes,
-    )
+    if verify_payloads:
+        closure = validate_qsrt_layer_payloads(
+            atom_file,
+            x4t_file,
+            spec,
+            pool.root,
+            store,
+            expected_x4t_bytes=expected_x4t_bytes,
+        )
+    else:
+        structural = validate_qsrt_layer_pair(
+            atom_file,
+            x4t_file,
+            spec,
+            expected_x4t_bytes=expected_x4t_bytes,
+        )
+        closure = qsrt_structural_layer_closure(structural)
     write_qsrt_layer_closure_receipt(
         atom_file,
         x4t_file,
@@ -250,6 +269,12 @@ def main() -> None:
         zip(plan.layers, plan.x4t_layer_bytes, strict=True),
         start=1,
     ):
+        # A layer subset is also the ownership boundary for concurrent
+        # materializers.  Do not inspect or repair a layer owned by another
+        # process: its atom file may have been published while its X4T partner
+        # is still being written atomically.
+        if spec.layer not in selected:
+            continue
         atom_file = destination / layer_filename(spec.layer)
         x4t_file = x4t_layer_path(destination, spec.layer)
         _repair_orphan_pair(
@@ -279,10 +304,13 @@ def main() -> None:
                 build=build,
                 pool=pool,
                 store=store,
+                verify_payloads=not args.skip_payload_validation,
             )
-            print(f"layer {spec.layer}: bit-exact pair complete, skip", flush=True)
-            continue
-        if spec.layer not in selected:
+            validation = verified[spec.layer]["payload_closure"]
+            print(
+                f"layer {spec.layer}: {validation} pair complete, skip",
+                flush=True,
+            )
             continue
         materialize_atom_layer(
             pool.root,
@@ -301,14 +329,17 @@ def main() -> None:
             spec,
             expected_x4t_bytes=expected_x4t_bytes,
         )
-        closure = validate_qsrt_layer_payloads(
-            atom_file,
-            x4t_file,
-            spec,
-            pool.root,
-            store,
-            expected_x4t_bytes=expected_x4t_bytes,
-        )
+        if args.skip_payload_validation:
+            closure = qsrt_structural_layer_closure(structural)
+        else:
+            closure = validate_qsrt_layer_payloads(
+                atom_file,
+                x4t_file,
+                spec,
+                pool.root,
+                store,
+                expected_x4t_bytes=expected_x4t_bytes,
+            )
         write_qsrt_layer_closure_receipt(
             atom_file,
             x4t_file,
@@ -351,6 +382,7 @@ def main() -> None:
                 build=build,
                 pool=pool,
                 store=store,
+                verify_payloads=not args.skip_payload_validation,
             )
         metadata.append(closure)
     manifest = qsrt_artifact_manifest(

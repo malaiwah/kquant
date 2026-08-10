@@ -23,7 +23,6 @@ import torch
 from kquant.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    CODEBOOK_SQG_CHEB,
     CODEBOOK_SQG_NORMAL_E4M3,
     QSRT_CODEBOOKS,
     decode_qsrt_weight,
@@ -76,6 +75,16 @@ SHARED_SCALE_SECTION_BYTES = 6 * STORAGE_ALIGNMENT
 # P24 and P33 both carry a six-bit sum over 256 intermediate channels.
 PAIR_BYTES = PAIR_CHANNELS * LATENT_CHANNELS * 3 // 8
 MATRIX_TRELLIS_BYTES = PAIRS_PER_EXPERT * PAIR_BYTES
+# Fixed all-QSRT high-rate profile: twenty-two K3 records and two K4 records.
+# This logical 74-bit schedule is 3.08333 trellis bpw.  Its canonical
+# atom-major serialization is defined by qsrt_atoms_v2.
+FIXED_HIGH_RATE_RECORD_BITS = (3,) * 22 + (4,) * 2
+FIXED_HIGH_RATE_TRELLIS_BYTES = (
+    INTERMEDIATE_CHANNELS
+    * LATENT_CHANNELS
+    * sum(FIXED_HIGH_RATE_RECORD_BITS)
+    // (RECORDS_PER_EXPERT * 8)
+)
 EXPERT_TRELLIS_BYTES = 3 * MATRIX_TRELLIS_BYTES
 RateAxis = Literal["k", "n"]
 PairKind = Literal["P24", "P33"]
@@ -134,7 +143,8 @@ class ModeSpec:
     """One rate-transfer schedule, ordered from low to high importance.
 
     ``context_bits`` contains one entry per final 128-channel record.
-    ``mode_id`` is the number of K2/K4 record exchanges.
+    IDs zero through two are equal-rate K2/K4 transfer modes.  ID three is
+    the fixed 22xK3 + 2xK4 all-QSRT high-rate profile.
     """
 
     mode_id: int
@@ -143,16 +153,20 @@ class ModeSpec:
     def __post_init__(self) -> None:
         if isinstance(self.mode_id, bool) or not isinstance(self.mode_id, int):
             raise TypeError("mode_id must be an integer")
-        if not 0 <= self.mode_id <= 2:
-            raise ValueError("QSRT mode_id must be R0, R1, or R2")
+        if not 0 <= self.mode_id <= 3:
+            raise ValueError("QSRT mode_id must identify R0, R1, R2, or H308")
         if not self.name:
             raise ValueError("mode name must not be empty")
         if not self.context_bits or len(self.context_bits) % 2:
             raise ValueError("a mode must contain an even, nonzero context count")
         if any(bits not in (2, 3, 4) for bits in self.context_bits):
             raise ValueError("Kimi-K3 QSRT supports only K2, K3, and K4")
-        if sum(self.context_bits) != 3 * len(self.context_bits):
-            raise ValueError("a mode must average exactly three trellis bits")
+        high_rate = self.mode_id == 3
+        if high_rate:
+            if self.name != "H308" or self.context_bits != FIXED_HIGH_RATE_RECORD_BITS:
+                raise ValueError("H308 must contain exactly 22 K3 and 2 K4 records")
+        elif sum(self.context_bits) != 3 * len(self.context_bits):
+            raise ValueError("a rate-transfer mode must average exactly three bits")
         if INTERMEDIATE_CHANNELS % len(self.context_bits):
             raise ValueError("contexts must divide the 3072-channel axis")
         context_channels = INTERMEDIATE_CHANNELS // len(self.context_bits)
@@ -160,6 +174,8 @@ class ModeSpec:
             raise ValueError("each context must contain whole 128-channel records")
         if tuple(sorted(self.context_bits)) != self.context_bits:
             raise ValueError("context rates must be monotone from K2 through K4")
+        if high_rate:
+            return
         records_per_context = RECORDS_PER_EXPERT // len(self.context_bits)
         k2_records = self.context_bits.count(2) * records_per_context
         k4_records = self.context_bits.count(4) * records_per_context
@@ -191,6 +207,7 @@ RATE_TRANSFER_MODES = tuple(_rate_transfer_mode(r) for r in range(3))
 R0 = RATE_TRANSFER_MODES[0]
 R1 = RATE_TRANSFER_MODES[1]
 R2 = RATE_TRANSFER_MODES[2]
+H308 = ModeSpec(3, "H308", FIXED_HIGH_RATE_RECORD_BITS)
 REPRESENTATIVE_MODE_CANDIDATES = RATE_TRANSFER_MODES
 EXPERIMENTAL_MODE_CANDIDATES = RATE_TRANSFER_MODES
 
@@ -207,14 +224,17 @@ PHASE1_H13_EXPERT_LOCAL_ALPHA = 0.0
 PHASE1_H2_EXPERT_LOCAL_ALPHA = 0.75
 PHASE1_H2_LOCAL_BASIS = "decoded_candidate_post_situ"
 PHASE1_H2_SHRINKAGE_POLICY = "weighted_oas_scaled_identity"
-_MODES_BY_NAME = {mode.name: mode for mode in RATE_TRANSFER_MODES}
-_MODES_BY_ID = {mode.mode_id: mode for mode in RATE_TRANSFER_MODES}
+_ALL_MODES = (*RATE_TRANSFER_MODES, H308)
+_MODES_BY_NAME = {mode.name: mode for mode in _ALL_MODES}
+_MODES_BY_ID = {mode.mode_id: mode for mode in _ALL_MODES}
 
 
 def mode_from_context_bits(context_bits: Sequence[int]) -> ModeSpec:
-    """Resolve any legal equal-context ladder allocation to canonical ``R_r``."""
+    """Resolve a supported record-rate allocation to its canonical mode."""
 
     bits = tuple(context_bits)
+    if bits == FIXED_HIGH_RATE_RECORD_BITS:
+        return H308
     if not bits or RECORDS_PER_EXPERT % len(bits):
         raise ValueError("allocation contexts must divide the 24 records")
     records_per_context = RECORDS_PER_EXPERT // len(bits)
@@ -239,8 +259,10 @@ class ExpertFormatSpec:
                 continue
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be an integer")
-            if not 0 <= value <= 2:
-                raise ValueError(f"{name} must be R0, R1, or R2")
+            if not 0 <= value <= 3:
+                raise ValueError(f"{name} must identify R0, R1, R2, or H308")
+        if self.r13 is not None and (self.r13 == 3) != (self.r2 == 3):
+            raise ValueError("H308 must be selected for both matrix rate axes")
 
     @classmethod
     def x4t(cls) -> "ExpertFormatSpec":
@@ -259,6 +281,8 @@ class ExpertFormatSpec:
         if self.is_x4t:
             return "X4T"
         assert self.r13 is not None and self.r2 is not None
+        if self.r13 == self.r2 == H308.mode_id:
+            return H308.name
         return f"R{self.r13}" if self.r13 == self.r2 else f"R{self.r13}/R{self.r2}"
 
     @property
@@ -274,7 +298,7 @@ class ExpertFormatSpec:
             return cls.x4t()
         r13 = code >> 4
         r2 = code & FORMAT_NIBBLE_MASK
-        if r13 > 2 or r2 > 2:
+        if r13 > 3 or r2 > 3:
             raise ValueError(f"format table contains invalid rate code 0x{code:02x}")
         return cls.compressed(r13, r2)
 
@@ -475,9 +499,11 @@ def matrix_rate_axis(matrix: str) -> RateAxis:
 
 
 def record_contexts(mode: ModeSpec | str | int) -> tuple[int, ...]:
-    """Return physical record contexts, paired low/high then moving inward."""
+    """Return physical record contexts in their serialized rate order."""
 
     spec = resolve_mode(mode)
+    if spec.mode_id == H308.mode_id:
+        return tuple(range(RECORDS_PER_EXPERT))
     contexts: list[int] = []
     for low_context in range(spec.context_count // 2):
         high_context = spec.context_count - 1 - low_context
@@ -552,6 +578,8 @@ def storage_group_order(
 
     spec = resolve_mode(mode)
     _validate_block_contexts(block_contexts, spec)
+    if spec.mode_id == H308.mode_id:
+        return torch.argsort(block_contexts, stable=True)
     groups_per_record = RECORD_CHANNELS // CONTEXT_GROUP_CHANNELS
     by_context = []
     for context in range(spec.context_count):
@@ -910,11 +938,18 @@ class QSRTTrellisDescriptor:
 
     @property
     def words_per_pair(self) -> int:
+        if self.mode.mode_id == H308.mode_id:
+            raise ValueError("H308 has no fixed six-bit record-pair contract")
         return self.tiles_per_record * TILE_CHANNELS * 6
 
     @property
+    def words_per_record(self) -> tuple[int, ...]:
+        unit = self.tiles_per_record * TILE_CHANNELS
+        return tuple(unit * bits for bits in record_bits(self.mode))
+
+    @property
     def payload_words(self) -> int:
-        return PAIRS_PER_EXPERT * self.words_per_pair
+        return sum(self.words_per_record)
 
     @property
     def payload_bytes(self) -> int:
@@ -936,8 +971,17 @@ class QSRTTrellisDescriptor:
             "record_channels": self.record_channels,
             "pair_channels": PAIR_CHANNELS,
             "record_bits": list(record_bits(self.mode)),
-            "pair_kinds": list(pair_kinds(self.mode)),
-            "words_per_pair": self.words_per_pair,
+            "pair_kinds": (
+                list(pair_kinds(self.mode))
+                if self.mode.mode_id != H308.mode_id
+                else None
+            ),
+            "words_per_pair": (
+                self.words_per_pair
+                if self.mode.mode_id != H308.mode_id
+                else None
+            ),
+            "words_per_record": list(self.words_per_record),
             "payload_words": self.payload_words,
             "payload_bytes": self.payload_bytes,
         }

@@ -6,11 +6,11 @@ import torch
 from kquant.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    CODEBOOK_SQG_CHEB,
     CODEBOOK_SQG_NORMAL_E4M3,
 )
 from kquant.qsrt import (
     CONTEXT_GROUP_CHANNELS,
+    H308,
     INTERMEDIATE_CHANNELS,
     RATE_TRANSFER_MODES,
     RECORDS_PER_EXPERT,
@@ -63,6 +63,22 @@ def test_common_physical_permutation_is_matrix_independent() -> None:
         for matrix in ("w1", "w3", "w2")
     ]
 
+    assert torch.equal(plans[0].physical_permutation, plans[1].physical_permutation)
+    assert torch.equal(plans[0].physical_permutation, plans[2].physical_permutation)
+
+
+def test_h308_plan_applies_permutation_before_fixed_record_funding() -> None:
+    contexts = _scrambled_record_contexts()
+    plans = [
+        plan_qsrt_matrix(contexts, H308, matrix=matrix)
+        for matrix in ("w1", "w3", "w2")
+    ]
+
+    expected = tuple(bits for bits in ((3,) * 22 + (4,) * 2) for _ in range(8))
+    for plan in plans:
+        assert plan.encoder_tile_bits == expected
+        assert plan.physical_tile_bits == expected
+        assert sum(plan.physical_tile_bits) == 8 * 74
     assert torch.equal(plans[0].physical_permutation, plans[1].physical_permutation)
     assert torch.equal(plans[0].physical_permutation, plans[2].physical_permutation)
 
@@ -136,40 +152,6 @@ def test_qsrt_quant_args_selects_sqg() -> None:
     )
     assert "sqg_e4m3_mode" not in cheb_args
     assert set(cheb_args["sqg_e4m3_luts_by_bits"]) == {2, 3, 4}
-
-    q8_down_args = _qsrt_quant_args(
-        plan,
-        matrix="w2",
-        layer=1,
-        device=torch.device("cuda", 0),
-        shared_scale_scope=None,
-        codebook=CODEBOOK_SQG_CHEB,
-    )
-    assert not torch.equal(
-        q8_down_args["sqg_e4m3_luts_by_bits"][2],
-        cheb_args["sqg_e4m3_luts_by_bits"][2],
-    )
-    assert torch.equal(
-        q8_down_args["sqg_e4m3_luts_by_bits"][3],
-        cheb_args["sqg_e4m3_luts_by_bits"][3],
-    )
-
-    upstream_plan = plan_qsrt_matrix(
-        _scrambled_record_contexts(), RATE_TRANSFER_MODES[1], matrix="w1"
-    )
-    q8_upstream_args = _qsrt_quant_args(
-        upstream_plan,
-        matrix="w1",
-        layer=1,
-        device=torch.device("cuda", 0),
-        shared_scale_scope=None,
-        codebook=CODEBOOK_SQG_CHEB,
-    )
-    for bits in (2, 3, 4):
-        assert torch.equal(
-            q8_upstream_args["sqg_e4m3_luts_by_bits"][bits],
-            cheb_args["sqg_e4m3_luts_by_bits"][bits],
-        )
 
     rate_luts = {
         bits: torch.zeros(1 << 16, dtype=torch.uint8) for bits in (2, 3, 4)

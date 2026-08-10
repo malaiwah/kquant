@@ -29,6 +29,8 @@ from kquant.io.hf_cache import read_safetensors_header
 from kquant.qsrt import (
     EXPERTS_PER_LAYER,
     EXPERT_TRELLIS_BYTES,
+    FIXED_HIGH_RATE_TRELLIS_BYTES,
+    H308,
     INTERMEDIATE_CHANNELS,
     LATENT_CHANNELS,
     LOGICAL_CANDIDATE_SCHEMAS,
@@ -56,6 +58,46 @@ UNCERTIFIED_ALLOCATION_OPTIMALITY = "uncertified_greedy_alignment_repair"
 CANDIDATE_POOL_COMPLETION_KIND = "kquant_kimi_k3_qsrt_candidate_completion"
 CANDIDATE_POOL_COMPLETION_SCHEMA_VERSION = 2
 CANDIDATE_POOL_COMPLETION_FILENAME = "qsrt-candidate-completion.json"
+
+
+def _is_fixed_high_rate(mode_ids: tuple[int, ...]) -> bool:
+    return mode_ids == (H308.mode_id,)
+
+
+def _format_label(r13: int, r2: int) -> str:
+    if r13 == r2 == H308.mode_id:
+        return H308.name
+    return f"R{r13}/R{r2}"
+
+
+def _matrix_trellis_bytes(mode_ids: tuple[int, ...]) -> int:
+    return (
+        FIXED_HIGH_RATE_TRELLIS_BYTES
+        if _is_fixed_high_rate(mode_ids)
+        else MATRIX_TRELLIS_BYTES
+    )
+
+
+def _selection_contract(mode_ids: tuple[int, ...]) -> dict[str, object]:
+    if _is_fixed_high_rate(mode_ids):
+        return {
+            "format_grid": "fixed_h308",
+            "shared_r": True,
+            "candidate_construction_fold": "fit",
+            "mode_selection_fold": "none",
+            "mode_proposal_metric": "none",
+            "mode_acceptance": "fixed_22k3_2k4_high_rate_profile",
+            "external_validation_used": False,
+        }
+    return {
+        "format_grid": "cartesian_r13_r2",
+        "shared_r": False,
+        "candidate_construction_fold": "fit",
+        "mode_selection_fold": "confirmation",
+        "mode_proposal_metric": "confirmation_routed_functional_sse",
+        "mode_acceptance": "paired_document_bootstrap_lower_bound_vs_r0",
+        "external_validation_used": False,
+    }
 
 
 @dataclass(frozen=True)
@@ -509,22 +551,50 @@ def validate_layer_metrics(
             raise ValueError(
                 "selection validation parameters must be provided together"
             )
-        _validate_selection_semantics(
-            metrics,
-            mode_ids=mode_ids,
-            evaluated=evaluated,
-            fit_sse=fit_sse,
-            confirmation_sse=confirmation_sse,
-            fit_counts=fit_counts,
-            confirmation_counts=confirmation_counts,
-            proposed_r13=proposed_r13,
-            proposed_r2=proposed_r2,
-            selected_r13=selected_r13,
-            selected_r2=selected_r2,
-            min_fit_documents=int(min_fit_documents),
-            min_confirmation_documents=int(min_confirmation_documents),
-            minimum_improvement=float(minimum_improvement),
-        )
+        if _is_fixed_high_rate(mode_ids):
+            if not bool(torch.all(evaluated)):
+                raise ValueError("fixed H308 profile must be evaluated for every expert")
+            expected = torch.full((experts,), H308.mode_id, dtype=torch.uint8)
+            if not (
+                torch.equal(proposed_r13, expected)
+                and torch.equal(proposed_r2, expected)
+                and torch.equal(selected_r13, expected)
+                and torch.equal(selected_r2, expected)
+            ):
+                raise ValueError("fixed H308 profile was not selected exactly")
+            improvement = _require_tensor(
+                metrics,
+                "confirmation_improvement",
+                shape=(experts,),
+                dtype=torch.float64,
+            )
+            ci95 = _require_tensor(
+                metrics,
+                "confirmation_ci95",
+                shape=(experts, 2),
+                dtype=torch.float64,
+            )
+            if not bool(torch.all(torch.isnan(improvement))) or not bool(
+                torch.all(torch.isnan(ci95))
+            ):
+                raise ValueError("fixed H308 profile must not carry selection evidence")
+        else:
+            _validate_selection_semantics(
+                metrics,
+                mode_ids=mode_ids,
+                evaluated=evaluated,
+                fit_sse=fit_sse,
+                confirmation_sse=confirmation_sse,
+                fit_counts=fit_counts,
+                confirmation_counts=confirmation_counts,
+                proposed_r13=proposed_r13,
+                proposed_r2=proposed_r2,
+                selected_r13=selected_r13,
+                selected_r2=selected_r2,
+                min_fit_documents=int(min_fit_documents),
+                min_confirmation_documents=int(min_confirmation_documents),
+                minimum_improvement=float(minimum_improvement),
+            )
 
     recomputed = (
         fit_sse[rows, selected_r13_columns, selected_r2_columns].sum(dim=1)
@@ -708,6 +778,7 @@ def _validate_payload_header(
     *,
     codebook: str,
     tailbite_context: int,
+    trellis_bytes: int,
 ) -> None:
     header = read_safetensors_header(path)
     metadata = header.pop("__metadata__", None)
@@ -751,7 +822,13 @@ def _validate_payload_header(
                 "svh",
             ):
                 raise ValueError(f"layer {layer} payload has invalid component {name}")
-            _validate_payload_component(name, header[name], matrix=matrix, part=part)
+            _validate_payload_component(
+                name,
+                header[name],
+                matrix=matrix,
+                part=part,
+                trellis_bytes=trellis_bytes,
+            )
             seen.add(key)
     expected = {
         (expert, matrix, part)
@@ -942,19 +1019,19 @@ def validate_selection_ledger_evidence(
         ]
         mode_coding = evidence.get("mode_coding")
         if not isinstance(mode_coding, dict) or set(mode_coding) != {
-            f"R{r13}/R{r2}" for r13, r2 in expected_formats
+            _format_label(r13, r2) for r13, r2 in expected_formats
         }:
             raise ValueError(
                 f"selection evidence expert {expert} mode coding drifted"
             )
         for rate_pair in expected_formats:
-            format_name = f"R{rate_pair[0]}/R{rate_pair[1]}"
+            format_name = _format_label(*rate_pair)
             coding = mode_coding[format_name]
             if not isinstance(coding, dict):
                 raise ValueError(
                     f"selection evidence expert {expert} {format_name} coding is malformed"
                 )
-            expected_trellis_bytes = 3 * MATRIX_TRELLIS_BYTES
+            expected_trellis_bytes = 3 * _matrix_trellis_bytes(mode_ids)
             expected_scale_bytes = 6 * (INTERMEDIATE_CHANNELS + LATENT_CHANNELS)
             expected_coding_scalars = {
                 "trellis_bytes": expected_trellis_bytes,
@@ -985,7 +1062,9 @@ def validate_selection_ledger_evidence(
                     )
                 expected_mode = rate_pair[pair_index]
                 expected_matrix = {
-                    "mode": f"R{expected_mode}",
+                    "mode": (
+                        H308.name if expected_mode == H308.mode_id else f"R{expected_mode}"
+                    ),
                     "mode_id": expected_mode,
                     "rate_axis": rate_axis,
                 }
@@ -1015,12 +1094,13 @@ def _validate_payload_component(
     *,
     matrix: str,
     part: str,
+    trellis_bytes: int = MATRIX_TRELLIS_BYTES,
 ) -> None:
     if not isinstance(entry, dict):
         raise ValueError(f"candidate payload component {name} has no tensor header")
     if part == "trellis":
         expected_dtype = "I16"
-        expected_shape = [MATRIX_TRELLIS_BYTES // torch.int16.itemsize]
+        expected_shape = [trellis_bytes // torch.int16.itemsize]
     else:
         expected_dtype = "F16"
         if part == "suh":
@@ -1063,15 +1143,19 @@ def load_qsrt_candidate_pool(
                 f"{manifest.get(name)!r} != {expected!r}"
             )
     mode_ids = tuple(int(mode) for mode in manifest.get("mode_ids", ()))
-    if (
-        not mode_ids
-        or mode_ids[0] != 0
-        or mode_ids != tuple(sorted(set(mode_ids)))
-        or any(mode not in (0, 1, 2) for mode in mode_ids)
-        or manifest.get("format_grid") != "cartesian_r13_r2"
-        or manifest.get("shared_r") is not False
-    ):
+    fixed_high_rate = _is_fixed_high_rate(mode_ids)
+    conventional_grid = (
+        bool(mode_ids)
+        and mode_ids[0] == 0
+        and mode_ids == tuple(sorted(set(mode_ids)))
+        and all(mode in (0, 1, 2) for mode in mode_ids)
+    )
+    if not (fixed_high_rate or conventional_grid):
         raise ValueError("candidate pool has an invalid rate-transfer mode policy")
+    expected_contract = _selection_contract(mode_ids)
+    for name in ("format_grid", "shared_r"):
+        if manifest.get(name) != expected_contract[name]:
+            raise ValueError(f"candidate manifest {name} drifted")
     codebook = manifest.get("codebook")
     if codebook not in QSRT_CODEBOOKS:
         raise ValueError("candidate manifest codebook is unsupported")
@@ -1101,7 +1185,7 @@ def load_qsrt_candidate_pool(
     proposed_r2 = np.empty_like(damage, dtype=np.uint8)
     evaluated_counts = np.empty_like(damage, dtype=np.uint8)
     histogram = {
-        f"R{r13}/R{r2}": 0 for r13 in mode_ids for r2 in mode_ids
+        _format_label(r13, r2): 0 for r13 in mode_ids for r2 in mode_ids
     }
     trellis_schema: str | None = None
     for layer in C.MOE_LAYERS:
@@ -1135,17 +1219,7 @@ def load_qsrt_candidate_pool(
         contract = ledger.get("selection_contract", {})
         if tuple(contract.get("mode_ids", ())) != mode_ids:
             raise ValueError(f"layer {layer} selection mode table drifted")
-        expected_selection_contract = {
-            "format_grid": "cartesian_r13_r2",
-            "shared_r": False,
-            "candidate_construction_fold": "fit",
-            "mode_selection_fold": "confirmation",
-            "mode_proposal_metric": "confirmation_routed_functional_sse",
-            "mode_acceptance": (
-                "paired_document_bootstrap_lower_bound_vs_r0"
-            ),
-            "external_validation_used": False,
-        }
+        expected_selection_contract = _selection_contract(mode_ids)
         for name, expected in expected_selection_contract.items():
             if contract.get(name) != expected:
                 raise ValueError(
@@ -1194,7 +1268,7 @@ def load_qsrt_candidate_pool(
         proposed_r2[row] = validated["proposed_r2"].numpy()
         evaluated_counts[row] = validated["evaluated_format_count"].numpy()
         actual_histogram = {
-            f"R{r13}/R{r2}": int(
+            _format_label(r13, r2): int(
                 (
                     (validated["selected_r13"] == r13)
                     & (validated["selected_r2"] == r2)
@@ -1213,6 +1287,7 @@ def load_qsrt_candidate_pool(
                 layer,
                 codebook=codebook,
                 tailbite_context=tailbite_context,
+                trellis_bytes=_matrix_trellis_bytes(mode_ids),
             )
 
     if completion is not None and completion.get(
