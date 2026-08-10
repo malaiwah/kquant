@@ -53,11 +53,6 @@ from kquant.fruit_calibration import (
     FruitCalibrationStore,
     fruit_calibration_authority,
 )
-from kquant.fruit_rate_evidence import (
-    FRUIT_RATE_SWEEP_SAMPLE_ASSIGNMENTS,
-    FRUIT_UNIFORM_RATE_SWEEP_RATES,
-    run_fruit_uniform_rate_sweep,
-)
 from kquant.fruit_qsrt import (
     FRUIT_QSRT_ARTIFACT_TENSORS,
     FRUIT_QSRT_ATOM_BUNDLE_BYTES,
@@ -79,6 +74,11 @@ from kquant.fruit_qsrt import (
     FruitMatrixStore,
     encode_fruit_expert,
     pack_fruit_atom_layer,
+)
+from kquant.fruit_rate_evidence import (
+    FRUIT_RATE_SWEEP_SAMPLE_ASSIGNMENTS,
+    FRUIT_UNIFORM_RATE_SWEEP_RATES,
+    run_fruit_uniform_rate_sweep,
 )
 from kquant.fruit_source import (
     FRUIT_INSTRUCT_SPEC,
@@ -376,7 +376,7 @@ _RATE_SWEEP_NAME = "evaluation/fruit-uniform-rate-sweep.json"
 _RUNTIME_QUALIFICATION_SCHEMA = "kquant_fruit_runtime_qualification_v1"
 _RUNTIME_QUALIFICATION_NAME = "evaluation/fruit-runtime-qualification.json"
 _RUNTIME_ARMS = ("bf16", "siq", "qsrt")
-_RUNTIME_PATHS_SCHEMA = "kquant_fruit_runtime_paths_v1"
+_RUNTIME_PATHS_SCHEMA = "kquant_fruit_runtime_paths_v2"
 _INSTRUCT_COMPARATOR_MODELS = {
     "bf16": {
         "repository": "malaiwah/GLM-5.2-SIQ-Fruit-Instruct-bf16",
@@ -1227,7 +1227,7 @@ def _validate_runtime_paths(value: object) -> None:
     if (
         runtime_paths["schema"] != _RUNTIME_PATHS_SCHEMA
         or type(runtime_paths["version"]) is not int
-        or runtime_paths["version"] != 1
+        or runtime_paths["version"] != 2
     ):
         raise ValueError("Fruit runtime path evidence has the wrong schema")
 
@@ -1277,8 +1277,20 @@ def _validate_runtime_paths(value: object) -> None:
     mtp_layer = _qualification_object(
         layers["13"],
         name="runtime_paths.layers.13",
-        keys={"mtp_decode"},
+        keys={"mtp_prefill", "mtp_decode"},
     )
+    mtp_prefill = _qualification_object(
+        mtp_layer["mtp_prefill"],
+        name="runtime_paths.layers.13.mtp_prefill",
+        keys={"mode", "calls", "capture_calls", "replay_calls"},
+    )
+    if mtp_prefill["mode"] != "w4a16":
+        raise ValueError("Fruit runtime path MTP prefill did not use W4A16")
+    for key in ("calls", "capture_calls", "replay_calls"):
+        _positive_runtime_count(
+            mtp_prefill[key],
+            name=f"layers.13.mtp_prefill.{key}",
+        )
     mtp_decode = _qualification_object(
         mtp_layer["mtp_decode"],
         name="runtime_paths.layers.13.mtp_decode",
@@ -2047,8 +2059,10 @@ hardware, prompt tokens, generation settings, recorded launch order, TP1, and
 All three arms use the same immutable image, software stack, non-eager
 compilation backend, CUDA-graph mode, and fixed launcher contract; only the
 model identity, served name, port, and model-specific quantization/load options
-differ. The rates include request and serving overhead, so they are not
-decode-only kernel rates or a general throughput benchmark.
+differ. The QSRT runtime-path record separately proves W4A16 prompt/prefill and
+W4A8 decode graph capture and replay for the MTP layer. The rates include
+request and serving overhead, so they are not decode-only kernel rates or a
+general throughput benchmark.
 
 | Candidate relative to BF16 | Mean forward KL | Max forward KL | Top-1 agreement | Top-10 agreement |
 |---|---:|---:|---:|---:|

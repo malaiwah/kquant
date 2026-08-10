@@ -664,13 +664,19 @@ def _runtime_qualification_fixture(
         for layer in range(3, 13)
     }
     runtime_layers["13"] = {
+        "mtp_prefill": {
+            "mode": "w4a16",
+            "calls": 1,
+            "capture_calls": 1,
+            "replay_calls": 1,
+        },
         "mtp_decode": {
             "mode": "w4a8",
             "calls": 2,
             "part_count": 2,
             "capture_calls": 1,
             "replay_calls": 1,
-        }
+        },
     }
 
     payload: dict[str, object] = {
@@ -708,7 +714,7 @@ def _runtime_qualification_fixture(
         "loaders": {arm: loader(arm) for arm in ("bf16", "siq", "qsrt")},
         "runtime_paths": {
             "schema": builder._RUNTIME_PATHS_SCHEMA,
-            "version": 1,
+            "version": 2,
             "layers": runtime_layers,
             "cudagraph": {
                 "mode": "FULL_AND_PIECEWISE",
@@ -1277,6 +1283,9 @@ def test_runtime_qualification_rejects_incomplete_runtime_paths(
     no_mtp_capture = json.loads(builder._canonical_json(payload))
     no_mtp_capture["runtime_paths"]["layers"]["13"]["mtp_decode"]["capture_calls"] = 0
     malformed_values.append(no_mtp_capture)
+    no_mtp_prefill = json.loads(builder._canonical_json(payload))
+    no_mtp_prefill["runtime_paths"]["layers"]["13"].pop("mtp_prefill")
+    malformed_values.append(no_mtp_prefill)
 
     no_graph = json.loads(builder._canonical_json(payload))
     no_graph["runtime_paths"]["cudagraph"]["capture_count"] = 0
