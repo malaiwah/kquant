@@ -1,46 +1,52 @@
 # Kimi-K3-QSRT technical brief
 
-Status: TP-independent canonical storage and TP12 runtime qualification,
-2026-08-07.
+Status: TP-independent mixed-rate and uniform-K2 artifacts; TP8 A16 numerical
+gate complete and TP12 multimodal runtime qualification in progress,
+2026-08-10.
 
 `QSRT` means **Quantile-Stratified Rate-shifted Trellis codec**. QSRT is an
-expert-static, fixed-payload mixed-rate trellis codec for gated
-mixture-of-experts weights. The Kimi-K3 construction combines three
-independently useful ideas:
+expert-static, fixed-payload trellis codec for gated mixture-of-experts
+weights. The Kimi-K3 construction combines four independently useful ideas:
 
 1. an L16 stratified-quantile graph whose transitions reconstruct finite E4M3
    values (`SQG-E4M3`);
 2. equal-byte K2/K4 exchanges around K3 (`R0`, `R1`, and `R2`), selected
-   separately for fused `w1`/`w3` and for `w2`; and
-3. `X4T`, an exact high-quality endpoint that preserves the official MXFP4
+   separately for fused `w1`/`w3` and for `w2`;
+3. an exact coupled activation-boundary coordinate transform that makes a
+   uniform-K2 expert profile materially more accurate; and
+4. `X4T`, an exact high-quality endpoint that preserves the official MXFP4
    nibble plane and losslessly compresses its UE8M0 scale plane.
 
-The intended artifact name is `Kimi-K3-QSRT`. The first usable checkpoint will
-contain QSRT experts selected from a fresh all-expert candidate pool and X4T
-experts chosen by an exact-byte global allocator. There is no raw-MXFP4 keep
-tier in the storage contract.
+The intended artifact name is `Kimi-K3-QSRT`. Mixed-rate artifacts may combine
+QSRT experts with X4T experts chosen by an exact-byte global allocator. The
+uniform-K2 profile instead stores every routed expert as QSRT and contains no
+X4T tier. There is no raw-MXFP4 keep tier in either storage contract.
 
 ## Frozen scope
 
-The initial production experiment is intentionally narrow:
+The supported experiments are intentionally narrow:
 
 ```text
 canonical storage              TP-independent 32-channel balanced atoms
 qualified runtime              TP12 first; TP is not serialized in the codec
 trellis window                 L16
-reconstruction family         SQG normal -> finite E4M3, RNE
+reconstruction family         sqg_xor_cheb_t12 -> finite E4M3, RNE
 lossy rate candidates          R0, R1, R2
 gate/up decision               one shared r13
 down-projection decision       independent r2
+uniform low-rate profile       K2 on all 24 records, all routed experts
+uniform-K2 conditioning        coupled H512/H128 activation-boundary transform
 high-quality endpoint          exact X4T
 source weights                 official Kimi-K3 MXFP4 checkpoint
 calibration teacher            resident interim EXL3 checkpoint
 encoder objective              expert-stratified dense-H BlockLDLQ + routed replay
 ```
 
-The current performance gate is TP12 because that is the available Kimi-K3
-deployment. TP4, TP8, TP16, TP24, and TP32 are storage-valid direct-load views
-of the same artifact and require kernel qualification, not re-encoding.
+The current performance gate is TP12 because that is the primary Kimi-K3
+deployment. The uniform-K2 artifact has also completed its first end-to-end
+numerical gate at TP8. TP4, TP8, TP16, TP24, and TP32 are storage-valid
+direct-load views of the same artifact and require kernel qualification, not
+re-encoding.
 Alternate companders, wider rate ladders, learned per-layer tables, and
 entropy-coded hot streams remain outside the supported surface.
 
@@ -560,6 +566,85 @@ padding. Load preparation removes the group layout into a disposable compact
 P33/P43 operand pool. The canonical layout and exact accounting are in
 `kquant/qsrt_atoms_v2.py`.
 
+### Uniform-K2 coupled `atoms_v2` profile
+
+The uniform-K2 profile assigns K2 to all 24 intermediate records of every
+routed expert. It uses the same `qsrt_sqg_e4m3` encoding and
+`sqg_xor_cheb_t12` codebook as the mixed-rate profile; it changes the exact
+coordinate system presented to the quantizer and removes rate allocation:
+
+```text
+record bits                    24 x K2
+routed experts                 82,432 QSRT; zero X4T
+trellis rate                   2.0 bpw
+per-expert atom payload        8,275,968 bytes
+payload rate including scales  2.004464 bpw
+```
+
+The coupled transform is an exact reparameterization of the full-precision
+expert. Let
+
+$$
+Q=\operatorname{interleave}(W_1,W_3)
+$$
+
+contain alternating gate and up rows. Let $U_R$ be the layer-shared normalized
+block-H512 residual transform, and let $U_{A,e}$ and $U_{B,e}$ be the
+expert-static normalized signed block-H128 transforms on the interleaved
+preactivation and post-SiTU axes. With row vectors, the stored source matrices
+before lossy encoding are
+
+$$
+Q'_e=U_{A,e}^{\mathsf T}Q_eU_R,
+\qquad
+W'_{2,e}=U_R^{\mathsf T}W_{2,e}U_{B,e}.
+$$
+
+Execution applies
+
+$$
+z'=zU_R,
+\qquad
+q'=z'Q_e'^{\mathsf T}=(zQ_e^{\mathsf T})U_{A,e},
+$$
+
+undoes $U_{A,e}$ before splitting the alternating coordinates and evaluating
+SiTU, applies $U_{B,e}$ to the resulting hidden vector, and finally undoes
+$U_R$ after the down projection. Orthogonality gives exact unquantized
+closure:
+
+$$
+y'_e=(hU_{B,e})W_{2,e}'^{\mathsf T}=(hW_{2,e}^{\mathsf T})U_R,
+\qquad
+y_e=y'_eU_R^{\mathsf T}=hW_{2,e}^{\mathsf T}.
+$$
+
+The residual transform uses draw zero and is shared by every expert in a
+layer. The intermediate draw is expert-static and selects deterministic sign
+vectors for both $U_{A,e}$ and $U_{B,e}$; the two axes use different vectors
+derived from the same draw ID. The frozen family contains eight draws, so the
+artifact stores one three-bit ID per expert rather than sign tensors. The
+all-expert build evaluated the qualified production portfolio `{0,6}` with a
+fit-propose/confirmation-accept rule. Its sealed plan contains 60,277 draw-zero
+experts and 22,155 draw-six experts.
+
+Pure K2 uses the compact P22 atom bundle. Each 32-channel atom stores all three
+matrix fragments and their FP16 intermediate-side scale fragments in 86,208
+bytes. The 96 atom rows retain the same TP-independent ownership as the
+mixed-rate layout. The sealed 92-layer expert container is 682,207,608,832
+bytes including safetensors headers and aligned row padding. Every supported
+TP view reads complete contiguous atom rows; only the disposable prepared
+cache is rank-local.
+
+The runtime fuses the activation-boundary transforms with the routed expert
+path. It does not materialize dense transformed weights or intermediate
+activation tensors, and it does not branch on a rate mode or tile-local
+codebook. Load preparation expands the deterministic intermediate signs for
+the local experts and converts the atom rows into the W4A16 operand layout.
+The canonical implementation and byte accounting are in
+`kquant/qsrt_coupled.py`, `kquant/qsrt_coupled_plan.py`, and
+`kquant/qsrt_atoms_v2.py`.
+
 ## Dense-H encoding and statistical selection
 
 Cheap importance scores only propose the permutation and donor/recipient
@@ -568,13 +653,32 @@ evaluated through complete dense-$H$ BlockLDLQ re-encodes so cross-record
 covariance feedback is retained. For `w1`/`w3`, the common input covariance is
 retained while the selected output-row records receive their assigned rates.
 
+`H13` may be layer-global because all routed experts consume the same residual
+coordinate system. `H2` may not be pooled: every expert owns a distinct
+post-SiTU coordinate system, and the coupled draw changes that system again.
+For each decoded upstream candidate, the encoder replays that expert's routed
+rows, constructs $H_{2,e}$ from the reconstructed middle activations, and
+shrinks it only toward its own trace-scaled identity:
+
+$$
+\widehat H_{2,e}
+=\alpha_e H^{\mathrm{sample}}_{2,e}
++(1-\alpha_e)
+\frac{\operatorname{tr}(H^{\mathrm{sample}}_{2,e})}{3072}I.
+$$
+
+Unsupported experts use identity. A layer-global post-SiTU covariance is
+neither a prior nor a fallback. In the uniform-K2 build, each candidate draw
+therefore receives its own complete upstream reconstruction, conditional
+`H2`, down-projection BlockLDLQ encode, and full-expert routed score.
+
 The encoder then reconstructs the full expert and scores applied-gate-square
 weighted routed output error on document-disjoint samples.  A nonzero mode is
 accepted only when its paired document-bootstrap lower confidence bound clears
 the frozen improvement margin over matched SQG `R0`; uncertain experts fall
 back to `(R0,R0)`.
 
-The initial search evaluates only the 3x3 Cartesian grid
+The mixed-rate search evaluates only the 3x3 Cartesian grid
 
 ```text
 (r13, r2) in {0,1,2} x {0,1,2}.
@@ -693,7 +797,7 @@ charged by the same optimizer. Since X4T sizes vary by expert, candidate
 generation and X4T cost indexing remain reusable when the target budget
 changes.
 
-## Evidence and current quality blocker
+## Evidence and qualification state
 
 The initial production-path SQG study used 24 official-source experts across
 layers 1, 24, and 40. At fixed K2/K3/K4 endpoints, SQG normal beat both
@@ -722,13 +826,13 @@ can remain active. It did not establish that the captured Hessian geometry was
 representative enough for a checkpoint. The resulting R44/X4T artifact failed
 the expected quality trajectory, and its generation path has been stopped.
 
-The replacement gate begins with a source-controlled one-million-token
+The current selection path uses the source-controlled four-million-token
 training capture. `H13` remains layer-global because its latent input basis is
 shared. `H2` is rebuilt from expert-stratified routed post-SiTU rows, shrunk
 toward identity according to support, and falls back to identity for
-unsupported experts. Mode-selection and final-validation corpora remain
-document-disjoint. No old R44 candidate pool is eligible for the next
-checkpoint merely because it is complete.
+unsupported experts. Draw selection was checked on a separate 128K capture;
+final-validation corpora remain document-disjoint. No old R44 candidate pool
+is eligible for a current checkpoint merely because it is complete.
 
 The mature B12X W4A16 kernel now has one QSRT serving reconstruction:
 QSRT-E4M3. The slow exact profile-5 graph, R44, MUL1, and MCG codebook branches
@@ -741,9 +845,28 @@ P33 and 65.09 us for P24 on the production-shaped benchmark and reproduces the
 CPU decoder for P33, P24, and dynamic pair layouts. P24 remains above the
 current latency target.
 
+The coupled-Hadamard uniform-K2 profile was selected independently of the
+mixed-rate pool. On fresh uniform-K2 SQG re-encodes, the fixed coupled boundary
+transform reduced pooled routed SSE by 3.052% and improved 22/24 experts. The
+expert-private draw rule was then fit on the 4M capture and evaluated on a
+separate 128K corpus: pooled routed SSE fell 1.308%, the expert median fell
+0.447%, and 17/28 experts improved. A single global intermediate draw lost;
+layer-shared draw selection recovered only 0.030%, establishing that the
+useful degree of freedom is expert-static rather than global.
+
+The first complete artifact materializes all 82,432 routed experts under the
+uniform-K2 profile, with exact payload closure for all 92 MoE layers and no
+X4T experts. Its first full-model A16 gate ran at TP8 over 32 windows and
+65,504 scored positions. Mean reference-to-candidate KLD was
+0.0851995464. The run's fail-closed audit observed the QSRT atom reader,
+hybrid quantization loader, W4A16 implementation, and post-start repeat check
+on every rank. This is a successful codec and runtime integration result at an
+extreme expert rate; task quality, multimodal execution, and production
+latency remain separate gates.
+
 ## Supported reconstruction path
 
-QSRT exposes one serving profile:
+QSRT exposes one serving reconstruction profile:
 
 | Profile | Role | Contract |
 | --- | --- | --- |
@@ -753,6 +876,13 @@ There is no runtime R44, MUL1, MCG, exact profile-5 graph, alternate K2
 staircase, or per-expert codebook selector. Those names may appear in archived
 measurements and offline research controls, but they are not valid payload or
 kernel profile identities.
+
+Two TP-independent `atoms_v2` storage profiles use that reconstruction:
+
+| Storage profile | Record law | Expert tiering |
+| --- | --- | --- |
+| `k3x22_k4x2` | 22 K3 records and 2 K4 records | all-QSRT high-rate profile |
+| `k2_coupled_h512_h128` | 24 K2 records plus the exact coupled boundary transform | all 82,432 routed experts are QSRT; no X4T |
 
 Rate shifting was checked on 384 unseen, support-stratified experts from layers
 1, 24, and 40 using production Hadamard ordering, TF32 dense-H BlockLDLQ,
@@ -857,7 +987,7 @@ on the separate corpus. Residual draw zero therefore remains fixed.
 
 | Mechanism | Mathematical role | Current evidence | Qualification |
 | --- | --- | --- | --- |
-| Coupled gate/up/down boundary Hadamard | Exact change of basis before the coordinatewise activation boundary | Fresh uniform-K2 SQG re-encodes improved routed error on 22/24 experts; pooled routed SSE fell 3.052%. Eight-draw expert-private selection on the 4M capture transferred to a separate 128K corpus: 1.308% pooled and 0.447% median routed improvement, with 17/28 wins. A single global draw lost and layer-shared selection recovered only 0.030% pooled | Qualified for the pure-K2 profile with residual draw zero and one expert-static three-bit intermediate draw. The runtime must fuse the two unavoidable activation-boundary transforms and prove TP8 closure and latency |
+| Coupled gate/up/down boundary Hadamard | Exact change of basis before the coordinatewise activation boundary | Fresh uniform-K2 SQG re-encodes improved routed error on 22/24 experts; pooled routed SSE fell 3.052%. Eight-draw expert-private selection on the 4M capture transferred to a separate 128K corpus: 1.308% pooled and 0.447% median routed improvement, with 17/28 wins. A single global draw lost and layer-shared selection recovered only 0.030% pooled | Materialized in the pure-K2 profile with residual draw zero and one expert-static three-bit intermediate draw. TP8 A16 model execution and KLD have closed; TP12 multimodal and latency qualification remain |
 | Activation-metric W1/W3 pair code | Uses the local 2-by-2 SiTU metric so gate/up errors can cancel | 24/28 isolated pair-codebook wins; median functional metric improvement 4.90% | Codebook oracle; needs a joint vector trellis, decoded-payload scoring, and full-expert validation |
 | W3/W2 sign gauge | Exact symmetry from the odd up activation | Eight deterministic sign representatives were searched with real K2 SQG. The fit/confirmation-selected gauge transferred by 0.393% pooled and 0.302% median on 7,168 untouched routed rows, with 14/28 wins. Combining it mechanically with the selected Hadamard draw reduced the Hadamard gain from 1.308% to 0.448% | Retain as an expert-static alternative to the selected intermediate rotation, not an automatically stacked transform. Baking matched signs into W3 rows and W2 columns costs no payload or runtime work |
 | Positive W3/W2 scale gauge | Approximate symmetry while the up branch is linear | The scalar proxy selected a nonidentity gauge for 18/28 experts, but those frozen proposals worsened real SQG K2 by 2.250% pooled and 0.840% median on the 4M corpus. Full-precision drift was not the cause: median relative SSE was $8.22\times10^{-9}$ and the worst was $3.59\times10^{-5}$ | Reject the tested RMS/absmax policies. A future gauge requires path-aware SQG selection and must beat identity before external validation |
@@ -895,6 +1025,16 @@ a fresh research encode rather than inferred from aggregate SSE.
 
 ## Execution checklist
 
+- [x] Implement the exact coupled H512/H128 activation-boundary transform and
+      prove unquantized full-expert closure.
+- [x] Freeze expert-static K2 draw selection and validate it on a separate
+      128K routed corpus after fitting on the 4M capture.
+- [x] Encode, seal, and structurally validate all 82,432 routed experts in the
+      TP-independent pure-K2 `atoms_v2` profile.
+- [x] Complete the TP8 W4A16 text KLD gate with a fail-closed QSRT runtime
+      audit.
+- [ ] Complete TP12 multimodal loading, image-input smoke tests, and the
+      production latency gate for the coupled pure-K2 profile.
 - [x] Implement and unit-test L16 SQG-normal E4M3 labels for K2/K3/K4.
 - [x] Integrate SQG into dense-H rate-shifted encoding and stored-state decode.
 - [x] Validate SQG endpoints and the separate `(r13,r2)` R0/R1/R2 gate.
@@ -931,7 +1071,8 @@ a fresh research encode rather than inferred from aggregate SSE.
 - [ ] Run streamed official-vs-packaged traces, live TP12 routing/logit checks,
       and the expanded end-to-end quality suite.
 
-The later evaluation suite should incorporate the 32x2048 KLD reference
-dataset and the Kimi-K3 evaluation tools identified for final end-to-end
-testing.  The current calibration/confirmation corpus must also be expanded
-substantially before production quality claims are made.
+The remaining evaluation suite must include text and multimodal task quality,
+long-context behavior, live routing drift, TP12 latency, and at least one
+document-disjoint KLD confirmation. The successful 32-window KLD gate proves
+that the artifact and A16 serving path are coherent; it is not by itself a
+production-quality claim.

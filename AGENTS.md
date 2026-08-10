@@ -100,10 +100,10 @@ or external EXL encoder APIs.
   profile-ID-5 or R44 candidate shards into the new artifact; changing the
   graph changes the Viterbi paths and requires full re-encoding.
 
-The active design is documented in [docs/qsrt-technical-brief.md](docs/qsrt-technical-brief.md).
-Capture and covariance requirements are in
-[docs/qsrt-calibration.md](docs/qsrt-calibration.md) and
-[docs/dense-h-corpus-plan.md](docs/dense-h-corpus-plan.md).
+The complete design is documented in
+[docs/qsrt-technical-brief.md](docs/qsrt-technical-brief.md). The uniform
+two-bit representation is defined independently in
+[docs/qsrt-2bpw-codec.md](docs/qsrt-2bpw-codec.md).
 
 ## Porting QSRT to another gated MoE model
 
