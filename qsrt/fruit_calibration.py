@@ -292,9 +292,9 @@ FRUIT_INSTRUCT_CALIBRATION_AUTHORITY = FruitCalibrationAuthority(
         "e838645989a37e651e59f2388bb55d16f9b33b9a76b0352628abf2d4e667f414"
     ),
     capture_id="ddf1b740a6b0a12f0bc447a22467e64b19213ba793d2d4651e0bcb6c27e56d7b",
-    fingerprint="4feb5b05c4e078f4eaaa02635b0e62daca4e260dfb3213877d495b670f0624dc",
+    fingerprint="3ccb2d9204f4cb4189fb4ba768f9a0c530eda4853dc1ee0630d7ca6025e791ba",
     manifest_sha256=(
-        "b9d38a5a373f79b87e0a79cfba9057283f6ce92ffa4a8f7372e135124609685b"
+        "19448bc37e46cbd4a545b8f9e7b77713180f7854fc096ec663409d364a07e1ce"
     ),
     max_abs_logprob=1.0,
     rms_logprob=0.2,
