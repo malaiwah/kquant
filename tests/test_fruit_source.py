@@ -81,15 +81,15 @@ def test_instruct_source_and_calibration_authority_are_publicly_pinned() -> None
     )
     assert (
         authority.capture_id
-        == "c25fcecb63d1874018bc7fd2a2b7b20ce4c7783d98e66f24fb779614f0ba67b6"
+        == "ddf1b740a6b0a12f0bc447a22467e64b19213ba793d2d4651e0bcb6c27e56d7b"
     )
     assert (
         authority.fingerprint
-        == "56d472c2c1d8856271d534a23a4bee77995cd84fbff968a390cc2a8110f0c749"
+        == "4feb5b05c4e078f4eaaa02635b0e62daca4e260dfb3213877d495b670f0624dc"
     )
     assert (
         authority.manifest_sha256
-        == "f11efd9876fc5f787f1cfb5df9cd606659109ae3cbc3d582ac492da4811c1f3f"
+        == "b9d38a5a373f79b87e0a79cfba9057283f6ce92ffa4a8f7372e135124609685b"
     )
 
 
