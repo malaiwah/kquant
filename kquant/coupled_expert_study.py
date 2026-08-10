@@ -771,6 +771,23 @@ def _rotation_signs(
     return signs.mul_(2).sub_(1).float().to(device=device)
 
 
+def hadamard_rotation_signs(
+    length: int,
+    *,
+    draw: int,
+    axis: int,
+    device: torch.device,
+) -> Tensor:
+    """Return the deterministic signs that identify one boundary rotation."""
+
+    return _rotation_signs(
+        length,
+        draw=draw,
+        axis=axis,
+        device=device,
+    )
+
+
 def apply_w3_w2_sign_draw(
     triplet: CoupledTriplet,
     *,
@@ -1657,6 +1674,7 @@ __all__ = [
     "fit_low_rank_basis",
     "fit_metric_codebook",
     "fixed_tile_entropy_bound",
+    "hadamard_rotation_signs",
     "local_triplet_metrics",
     "micro_neuron_energy_saliency",
     "micro_neuron_fingerprints",

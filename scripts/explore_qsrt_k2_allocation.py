@@ -20,13 +20,15 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
-from kquant.capture import index_cached_layer_samples, load_layer_hessians
+from kquant.capture import LayerSamples, index_cached_layer_samples, load_layer_hessians
 from kquant.coupled_expert_study import (
     CoupledTriplet,
     apply_permutation_sign_gauge,
     block_hadamard,
     encode_coupled_block_hadamard,
     execute_coupled_block_hadamard,
+    hadamard_rotation_signs,
+    signed_block_hadamard,
 )
 from kquant.exl3_loader import load_qsrt_encoder
 from kquant.exl3_reference import (
@@ -108,6 +110,7 @@ TripletExecutor = Callable[
     ],
     torch.Tensor,
 ]
+InputTransform = Callable[[torch.Tensor], torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,7 @@ class CoupledSearchBasis:
     inputs: torch.Tensor
     permutation: torch.Tensor
     reference_output: torch.Tensor
+    transform_inputs: InputTransform
     decode_middle: MiddleDecoder
     execute_triplet: TripletExecutor
     evidence: dict[str, object]
@@ -162,6 +166,23 @@ def _parse_ints(value: str, *, minimum: int, maximum: int) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError(
             f"values must lie in {minimum}..{maximum}"
         )
+    return result
+
+
+def _parse_expert_draws(value: str) -> dict[int, int]:
+    result: dict[int, int] = {}
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        fields = item.split(":")
+        if len(fields) != 2 or not all(field.isdecimal() for field in fields):
+            raise argparse.ArgumentTypeError(
+                "expected comma-separated expert:draw pairs"
+            )
+        expert, draw = map(int, fields)
+        if expert in result:
+            raise argparse.ArgumentTypeError("expert draw keys must be unique")
+        result[expert] = draw
     return result
 
 
@@ -2389,6 +2410,8 @@ def _coupled_hadamard_k2(
     preactivation_block_size: int,
     postactivation_block_size: int,
     pre_permutation: str,
+    residual_rotation_draw: int,
+    intermediate_rotation_draw: int,
 ) -> dict[str, object]:
     """Compare production-basis and coupled-boundary uniform K2 encodes."""
 
@@ -2413,79 +2436,41 @@ def _coupled_hadamard_k2(
         ),
     )
 
-    source_triplet = CoupledTriplet(*source)
-    if pre_permutation == "identity":
-        coupled_source_triplet = source_triplet
-        pre_permutation_tensor = torch.arange(
-            source_triplet.intermediate, dtype=torch.long, device=device
-        )
-    elif pre_permutation == "selected":
-        pre_permutation_tensor = baseline_permutation.to(
-            device=device, dtype=torch.long
-        )
-        coupled_source_triplet = apply_permutation_sign_gauge(
-            source_triplet,
-            pre_permutation_tensor,
-            torch.ones(
-                source_triplet.intermediate,
-                dtype=source_triplet.up.dtype,
-                device=device,
-            ),
-        )
-    else:
-        raise ValueError(f"unsupported coupled pre-permutation: {pre_permutation}")
-    transformed_triplet = encode_coupled_block_hadamard(
-        coupled_source_triplet,
+    basis = _prepare_coupled_search_basis(
+        source,
+        h13=h13,
+        h2=source_h2,
+        inputs=inputs,
+        selected_permutation=baseline_permutation,
         block_size=block_size,
         preactivation_block_size=preactivation_block_size,
         postactivation_block_size=postactivation_block_size,
+        pre_permutation=pre_permutation,
+        residual_rotation_draw=residual_rotation_draw,
+        intermediate_rotation_draw=intermediate_rotation_draw,
     )
-    transformed_source = transformed_triplet.tensors()
-    transformed_fit_inputs = block_hadamard(
-        fit_inputs, block_size=block_size, dim=1
-    )
-    transformed_h13 = block_hadamard(
-        block_hadamard(h13, block_size=block_size, dim=0),
-        block_size=block_size,
-        dim=1,
-    )
-    identity = torch.arange(3072, dtype=torch.long, device=device)
-
-    def transformed_middle(w1: torch.Tensor, w3: torch.Tensor) -> torch.Tensor:
-        transformed_pre = torch.cat(
-            (
-                F.linear(transformed_fit_inputs, w1),
-                F.linear(transformed_fit_inputs, w3),
-            ),
-            dim=1,
-        )
-        recovered = block_hadamard(
-            transformed_pre, block_size=preactivation_block_size, dim=1
-        )
-        middle = situ(recovered[:, 0::2], recovered[:, 1::2])
-        return block_hadamard(
-            middle, block_size=postactivation_block_size, dim=1
-        )
 
     coupled, coupled_evidence = _encode_uniform_k2_triplet(
-        transformed_source,
-        h13=transformed_h13,
-        source_h2=source_h2,
+        basis.source,
+        h13=basis.h13,
+        source_h2=basis.h2,
         contexts=contexts,
         layer=layer,
         expert=expert,
         device=device,
         quantizer_module=quantizer_module,
         ldlq_tf32=ldlq_tf32,
-        fit_inputs=transformed_fit_inputs,
+        fit_inputs=basis.inputs[fit_mask],
         fit_gates=fit_gates,
-        permutation_override=identity,
+        permutation_override=basis.permutation,
         shared_scale_scope=(
             f"k2-coupled-hadamard-b{block_size}-"
             f"pre{preactivation_block_size}-post{postactivation_block_size}-"
             f"{pre_permutation}"
         ),
-        middle_from_upstream=transformed_middle,
+        middle_from_upstream=lambda w1, w3: basis.decode_middle(
+            basis.inputs[fit_mask], w1, w3
+        ),
     )
 
     reference_middle = situ(
@@ -2496,20 +2481,8 @@ def _coupled_hadamard_k2(
         F.linear(inputs, baseline[0]), F.linear(inputs, baseline[1])
     )
     baseline_output = F.linear(baseline_middle, baseline[2])
-    coupled_output = execute_coupled_block_hadamard(
-        inputs,
-        CoupledTriplet(*coupled),
-        block_size=block_size,
-        preactivation_block_size=preactivation_block_size,
-        postactivation_block_size=postactivation_block_size,
-    )
-    closure_output = execute_coupled_block_hadamard(
-        inputs,
-        transformed_triplet,
-        block_size=block_size,
-        preactivation_block_size=preactivation_block_size,
-        postactivation_block_size=postactivation_block_size,
-    )
+    coupled_output = basis.execute_triplet(basis.inputs, coupled)
+    closure_output = basis.execute_triplet(basis.inputs, basis.source)
 
     def score(output: torch.Tensor) -> dict[str, dict[str, float | int]]:
         return {
@@ -2542,9 +2515,11 @@ def _coupled_hadamard_k2(
         "postactivation_block_size": postactivation_block_size,
         "baseline_basis": "production_h2_reverse_neuron_permutation",
         "pre_hadamard_neuron_permutation": pre_permutation,
-        "pre_hadamard_permutation_sha256": _permutation_sha256(
-            pre_permutation_tensor
-        ),
+        "pre_hadamard_permutation_sha256": basis.evidence[
+            "pre_hadamard_permutation_sha256"
+        ],
+        "residual_rotation_draw": residual_rotation_draw,
+        "intermediate_rotation_draw": intermediate_rotation_draw,
         "coupled_basis": (
             "interleaved_gate_up_two_sided_block_hadamard_with_identity_"
             "transformed_coordinate_order"
@@ -2588,6 +2563,8 @@ def _prepare_coupled_search_basis(
     preactivation_block_size: int,
     postactivation_block_size: int,
     pre_permutation: str,
+    residual_rotation_draw: int = 0,
+    intermediate_rotation_draw: int = 0,
 ) -> CoupledSearchBasis:
     """Build exact coupled-Hadamard coordinates for mixed-rate research.
 
@@ -2625,26 +2602,66 @@ def _prepare_coupled_search_basis(
         block_size=block_size,
         preactivation_block_size=preactivation_block_size,
         postactivation_block_size=postactivation_block_size,
+        residual_rotation_draw=residual_rotation_draw,
+        intermediate_rotation_draw=intermediate_rotation_draw,
     )
-    transformed_inputs = block_hadamard(
-        inputs, block_size=block_size, dim=1
+    input_signs = hadamard_rotation_signs(
+        source_triplet.hidden,
+        draw=residual_rotation_draw,
+        axis=0,
+        device=inputs.device,
     )
-    transformed_h13 = block_hadamard(
-        block_hadamard(h13, block_size=block_size, dim=0),
+    preactivation_signs = hadamard_rotation_signs(
+        2 * source_triplet.intermediate,
+        draw=intermediate_rotation_draw,
+        axis=1,
+        device=inputs.device,
+    )
+    postactivation_signs = hadamard_rotation_signs(
+        source_triplet.intermediate,
+        draw=intermediate_rotation_draw,
+        axis=2,
+        device=inputs.device,
+    )
+    output_signs = hadamard_rotation_signs(
+        source_triplet.hidden,
+        draw=residual_rotation_draw,
+        axis=3,
+        device=inputs.device,
+    )
+    def transform_inputs(rows: torch.Tensor) -> torch.Tensor:
+        return signed_block_hadamard(
+            rows,
+            block_size=block_size,
+            signs=input_signs,
+            dim=1,
+        )
+
+    transformed_inputs = transform_inputs(inputs)
+    transformed_h13 = signed_block_hadamard(
+        signed_block_hadamard(
+            h13,
+            block_size=block_size,
+            signs=input_signs,
+            dim=0,
+        ),
         block_size=block_size,
+        signs=input_signs,
         dim=1,
     )
     h2_permutation = permutation.to(device=h2.device)
     permuted_h2 = h2.index_select(0, h2_permutation).index_select(
         1, h2_permutation
     )
-    transformed_h2 = block_hadamard(
-        block_hadamard(
+    transformed_h2 = signed_block_hadamard(
+        signed_block_hadamard(
             permuted_h2,
             block_size=postactivation_block_size,
+            signs=postactivation_signs,
             dim=0,
         ),
         block_size=postactivation_block_size,
+        signs=postactivation_signs,
         dim=1,
     )
     transformed_identity = torch.arange(
@@ -2665,15 +2682,18 @@ def _prepare_coupled_search_basis(
             ),
             dim=1,
         )
-        recovered = block_hadamard(
+        recovered = signed_block_hadamard(
             transformed_pre,
             block_size=preactivation_block_size,
+            signs=preactivation_signs,
             dim=1,
+            inverse=True,
         )
         middle = situ(recovered[:, 0::2], recovered[:, 1::2])
-        return block_hadamard(
+        return signed_block_hadamard(
             middle,
             block_size=postactivation_block_size,
+            signs=postactivation_signs,
             dim=1,
         )
 
@@ -2689,8 +2709,12 @@ def _prepare_coupled_search_basis(
         transformed_output = F.linear(
             transformed_middle, reconstruction[2]
         )
-        return block_hadamard(
-            transformed_output, block_size=block_size, dim=1
+        return signed_block_hadamard(
+            transformed_output,
+            block_size=block_size,
+            signs=output_signs,
+            dim=1,
+            inverse=True,
         )
 
     reference_output = _execute_standard_triplet(inputs, source)
@@ -2706,6 +2730,7 @@ def _prepare_coupled_search_basis(
         inputs=transformed_inputs,
         permutation=transformed_identity,
         reference_output=reference_output,
+        transform_inputs=transform_inputs,
         decode_middle=decode_middle,
         execute_triplet=execute_triplet,
         evidence={
@@ -2713,6 +2738,8 @@ def _prepare_coupled_search_basis(
             "block_size": block_size,
             "preactivation_block_size": preactivation_block_size,
             "postactivation_block_size": postactivation_block_size,
+            "residual_rotation_draw": residual_rotation_draw,
+            "intermediate_rotation_draw": intermediate_rotation_draw,
             "pre_hadamard_neuron_permutation": pre_permutation,
             "pre_hadamard_permutation_sha256": _permutation_sha256(
                 permutation
@@ -2796,6 +2823,15 @@ def _k2_codebook_menu(
     fit_requests: Mapping[int, str],
     confirmation_requests: Mapping[int, str],
     permutation_override: torch.Tensor,
+    decode_middle: MiddleDecoder | None = None,
+    execute_triplet: TripletExecutor | None = None,
+    reference_output: torch.Tensor | None = None,
+    representation: Mapping[str, object] | None = None,
+    external_inputs: torch.Tensor | None = None,
+    external_gates: torch.Tensor | None = None,
+    external_request_steps: torch.Tensor | None = None,
+    external_requests: Mapping[int, str] | None = None,
+    external_reference_output: torch.Tensor | None = None,
 ) -> dict[str, object]:
     """Measure a two-bit K2 staircase menu with an exact selector-aware encode.
 
@@ -2808,6 +2844,70 @@ def _k2_codebook_menu(
     missing = set(K2_MENU_LAWS) - set(switched_luts)
     if missing:
         raise ValueError(f"missing K2 menu laws: {sorted(missing)}")
+    middle_decoder = (
+        _decode_standard_middle if decode_middle is None else decode_middle
+    )
+    triplet_executor = (
+        _execute_standard_triplet if execute_triplet is None else execute_triplet
+    )
+    if reference_output is None:
+        reference_output = triplet_executor(inputs, source)
+    if reference_output.shape != (inputs.shape[0], source[2].shape[0]):
+        raise ValueError("K2 menu reference output does not align with routed rows")
+    external_values = (
+        external_inputs,
+        external_gates,
+        external_request_steps,
+        external_requests,
+        external_reference_output,
+    )
+    if any(value is not None for value in external_values) and not all(
+        value is not None for value in external_values
+    ):
+        raise ValueError("external K2 menu scoring requires complete row metadata")
+    if (
+        external_inputs is not None
+        and external_reference_output is not None
+        and external_reference_output.shape
+        != (external_inputs.shape[0], source[2].shape[0])
+    ):
+        raise ValueError("external K2 menu reference output does not align")
+
+    def score_candidate(
+        reconstruction: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> dict[str, dict[str, float | int]]:
+        output = triplet_executor(inputs, reconstruction)
+        result = {
+            "fit": _functional_output_totals(
+                reference_output[fit_mask],
+                output[fit_mask],
+                gates=gates[fit_mask],
+                request_steps=request_steps[fit_mask],
+                requests=fit_requests,
+            ),
+            "confirmation": _functional_output_totals(
+                reference_output[confirmation_mask],
+                output[confirmation_mask],
+                gates=gates[confirmation_mask],
+                request_steps=request_steps[confirmation_mask],
+                requests=confirmation_requests,
+            ),
+        }
+        if external_inputs is not None:
+            assert external_gates is not None
+            assert external_request_steps is not None
+            assert external_requests is not None
+            assert external_reference_output is not None
+            external_output = triplet_executor(external_inputs, reconstruction)
+            result["external"] = _functional_output_totals(
+                external_reference_output,
+                external_output,
+                gates=external_gates,
+                request_steps=external_request_steps,
+                requests=external_requests,
+            )
+        return result
+
     fit_inputs = inputs[fit_mask]
     fit_gates = gates[fit_mask]
     uniform_maps = {
@@ -2888,9 +2988,7 @@ def _k2_codebook_menu(
         normal_w3, torch.Tensor
     ):
         raise TypeError("normal K2 upstream reconstruction is missing")
-    normal_middle = situ(
-        F.linear(fit_inputs, normal_w1), F.linear(fit_inputs, normal_w3)
-    )
+    normal_middle = middle_decoder(fit_inputs, normal_w1, normal_w3)
     _, normal_h2, normal_h2_evidence = build_expert_hessians(
         fit_inputs,
         fit_gates,
@@ -2973,17 +3071,7 @@ def _k2_codebook_menu(
     if not isinstance(normal_w2, torch.Tensor):
         raise TypeError("normal K2 down reconstruction is missing")
     scores = {
-        "normal": _score_candidate(
-            source,
-            (normal_w1, normal_w3, normal_w2),
-            inputs=inputs,
-            gates=gates,
-            request_steps=request_steps,
-            fit_mask=fit_mask,
-            confirmation_mask=confirmation_mask,
-            fit_requests=fit_requests,
-            confirmation_requests=confirmation_requests,
-        )
+        "normal": score_candidate((normal_w1, normal_w3, normal_w2))
     }
     h2_evidence: dict[str, object] = {"normal": normal_h2_evidence}
     for name, (laws, ids, _) in menu_specs.items():
@@ -3011,9 +3099,10 @@ def _k2_codebook_menu(
             if not isinstance(reconstruction, torch.Tensor):
                 raise TypeError("mixed K2 upstream reconstruction is missing")
             mixed_upstream.append(reconstruction)
-        mixed_middle = situ(
-            F.linear(fit_inputs, mixed_upstream[0]),
-            F.linear(fit_inputs, mixed_upstream[1]),
+        mixed_middle = middle_decoder(
+            fit_inputs,
+            mixed_upstream[0],
+            mixed_upstream[1],
         )
         _, mixed_h2, evidence = build_expert_hessians(
             fit_inputs,
@@ -3041,21 +3130,35 @@ def _k2_codebook_menu(
         mixed_w2 = mixed_down[name]["reconstruction"]
         if not isinstance(mixed_w2, torch.Tensor):
             raise TypeError("mixed K2 down reconstruction is missing")
-        scores[name] = _score_candidate(
-            source,
-            (mixed_upstream[0], mixed_upstream[1], mixed_w2),
-            inputs=inputs,
-            gates=gates,
-            request_steps=request_steps,
-            fit_mask=fit_mask,
-            confirmation_mask=confirmation_mask,
-            fit_requests=fit_requests,
-            confirmation_requests=confirmation_requests,
+        scores[name] = score_candidate(
+            (mixed_upstream[0], mixed_upstream[1], mixed_w2)
         )
         h2_evidence[name] = evidence
 
     selected = min(scores, key=lambda name: float(scores[name]["fit"]["sse"]))
     baseline_confirmation = float(scores["normal"]["confirmation"]["sse"])
+    baseline_fit = float(scores["normal"]["fit"]["sse"])
+    eligible = [
+        name
+        for name in menu_specs
+        if float(scores[name]["fit"]["sse"]) < baseline_fit
+        and float(scores[name]["confirmation"]["sse"]) < baseline_confirmation
+    ]
+    confirmation_selected = (
+        min(
+            eligible,
+            key=lambda name: float(scores[name]["confirmation"]["sse"]),
+        )
+        if eligible
+        else "normal"
+    )
+    external_relative: dict[str, float] | None = None
+    if "external" in scores["normal"]:
+        baseline_external = float(scores["normal"]["external"]["sse"])
+        external_relative = {
+            name: _relative(float(score["external"]["sse"]), baseline_external)
+            for name, score in scores.items()
+        }
     return {
         "selection_granularity": (
             "one_shared_two_bit_codebook_id_per_corresponding_"
@@ -3064,6 +3167,11 @@ def _k2_codebook_menu(
         "proposal_scale": "independently_fitted_normal_k2_then_held_fixed",
         "exact_encode_scale": "independently_refit_per_matrix_and_menu",
         "w2_hessian": "expert_local_conditioned_on_decoded_upstream_candidate",
+        "representation": (
+            {"basis": "production"}
+            if representation is None
+            else dict(representation)
+        ),
         "metadata": {
             "tile_triplets": 224 * 192,
             "bits_per_tile_triplet": 2,
@@ -3077,9 +3185,20 @@ def _k2_codebook_menu(
         "conditional_h2": h2_evidence,
         "scores": scores,
         "selected_on_fit": selected,
+        "selected_after_confirmation_gate": confirmation_selected,
+        "confirmation_gate": {
+            "rule": "strictly_lower_fit_and_confirmation_sse_than_normal",
+            "eligible": eligible,
+        },
         "confirmation_relative_to_normal": _relative(
             float(scores[selected]["confirmation"]["sse"]),
             baseline_confirmation,
+        ),
+        "external_relative_to_normal": external_relative,
+        "confirmation_gated_external_relative_to_normal": (
+            None
+            if external_relative is None
+            else external_relative[confirmation_selected]
         ),
         "best_of_four_confirmation_relative_to_normal": _relative(
             float(scores["best_of_four"]["confirmation"]["sse"]),
@@ -4531,8 +4650,10 @@ def _run_expert(
     *,
     layer: int,
     expert: int,
-    samples,
+    samples: LayerSamples,
     partition,
+    external_samples: LayerSamples | None,
+    external_requests: Mapping[int, str] | None,
     global_h13: torch.Tensor,
     global_h2: torch.Tensor,
     store: OfficialMXFP4Store,
@@ -4547,6 +4668,8 @@ def _run_expert(
     coupled_hadamard_preactivation_block_size: int,
     coupled_hadamard_postactivation_block_size: int,
     coupled_hadamard_pre_permutation: str,
+    coupled_residual_draw: int,
+    coupled_intermediate_draws: Mapping[int, int],
     functional_tile_search: bool,
     qsrt_308_search: bool,
     qsrt_308_tile_fractions: bool,
@@ -4583,6 +4706,24 @@ def _run_expert(
         store.load_matrix(layer, expert, matrix, device=device).float().contiguous()
         for matrix in MATRICES
     )
+    external_inputs: torch.Tensor | None = None
+    external_gates: torch.Tensor | None = None
+    external_request_steps: torch.Tensor | None = None
+    external_support: dict[str, int] | None = None
+    if external_samples is not None:
+        if external_requests is None:
+            raise ValueError("external samples require external request metadata")
+        external_rows = select_expert_rows(
+            external_samples, expert, external_requests
+        )
+        if external_rows.rows:
+            external_inputs = external_rows.inputs.float().to(device)
+            external_gates = external_rows.gates.float().to(device)
+            external_request_steps = external_rows.request_steps.to(device)
+            external_support = {
+                "rows": external_rows.rows,
+                "documents": external_rows.documents,
+            }
     with torch.inference_mode():
         source_middle = situ(F.linear(inputs, source[0]), F.linear(inputs, source[1]))
         context_policy: PermutationPolicy = (
@@ -4792,7 +4933,7 @@ def _run_expert(
         codec_features=codec_features.to(device=geometry_scores.device),
     )
 
-    if coupled_hadamard_k2 and not qsrt_308_search:
+    if coupled_hadamard_k2 and not qsrt_308_search and not k2_codebook_menu:
         return {
             "skipped": False,
             "support": {
@@ -4831,10 +4972,62 @@ def _run_expert(
                     coupled_hadamard_postactivation_block_size
                 ),
                 pre_permutation=coupled_hadamard_pre_permutation,
+                residual_rotation_draw=coupled_residual_draw,
+                intermediate_rotation_draw=coupled_intermediate_draws.get(
+                    expert, 0
+                ),
             ),
         }
 
     if k2_codebook_menu:
+        menu_source = source
+        menu_h13 = h13
+        menu_h2 = h2
+        menu_inputs = inputs
+        menu_permutation = selected_permutation
+        menu_reference_output = None
+        menu_decode_middle = None
+        menu_execute_triplet = None
+        menu_representation = None
+        menu_external_inputs = external_inputs
+        external_reference_output = (
+            None
+            if external_inputs is None
+            else _execute_standard_triplet(external_inputs, source)
+        )
+        if coupled_hadamard_k2:
+            menu_basis = _prepare_coupled_search_basis(
+                source,
+                h13=h13,
+                h2=h2,
+                inputs=inputs,
+                selected_permutation=selected_permutation,
+                block_size=coupled_hadamard_block_size,
+                preactivation_block_size=(
+                    coupled_hadamard_preactivation_block_size
+                ),
+                postactivation_block_size=(
+                    coupled_hadamard_postactivation_block_size
+                ),
+                pre_permutation=coupled_hadamard_pre_permutation,
+                residual_rotation_draw=coupled_residual_draw,
+                intermediate_rotation_draw=(
+                    coupled_intermediate_draws.get(expert, 0)
+                ),
+            )
+            menu_source = menu_basis.source
+            menu_h13 = menu_basis.h13
+            menu_h2 = menu_basis.h2
+            menu_inputs = menu_basis.inputs
+            menu_permutation = menu_basis.permutation
+            menu_reference_output = menu_basis.reference_output
+            menu_decode_middle = menu_basis.decode_middle
+            menu_execute_triplet = menu_basis.execute_triplet
+            menu_representation = menu_basis.evidence
+            if external_inputs is not None:
+                menu_external_inputs = menu_basis.transform_inputs(
+                    external_inputs
+                )
         return {
             "skipped": False,
             "support": {
@@ -4842,30 +5035,40 @@ def _run_expert(
                 "fit_documents": fit_documents,
                 "confirmation_rows": int(confirmation_mask.sum()),
                 "confirmation_documents": confirmation_documents,
+                "external": external_support,
             },
             "covariance": covariance,
             "permutation_policy": permutation_policy,
             "permutation_sha256": permutation_sha256,
             "permutation_tile_geometry": permutation_geometry,
             "k2_codebook_menu": _k2_codebook_menu(
-                source,
+                menu_source,
                 switched_luts,
-                h13=h13,
-                source_h2=h2,
+                h13=menu_h13,
+                source_h2=menu_h2,
                 contexts=contexts,
                 layer=layer,
                 expert=expert,
                 device=device,
                 quantizer_module=quantizer_module,
                 ldlq_tf32=ldlq_tf32,
-                inputs=inputs,
+                inputs=menu_inputs,
                 gates=gates,
                 request_steps=request_steps,
                 fit_mask=fit_mask,
                 confirmation_mask=confirmation_mask,
                 fit_requests=partition.fit,
                 confirmation_requests=partition.confirmation,
-                permutation_override=selected_permutation,
+                permutation_override=menu_permutation,
+                decode_middle=menu_decode_middle,
+                execute_triplet=menu_execute_triplet,
+                reference_output=menu_reference_output,
+                representation=menu_representation,
+                external_inputs=menu_external_inputs,
+                external_gates=external_gates,
+                external_request_steps=external_request_steps,
+                external_requests=external_requests,
+                external_reference_output=external_reference_output,
             ),
         }
 
@@ -4893,6 +5096,10 @@ def _run_expert(
                 coupled_hadamard_postactivation_block_size
             ),
             pre_permutation=coupled_hadamard_pre_permutation,
+            residual_rotation_draw=coupled_residual_draw,
+            intermediate_rotation_draw=(
+                coupled_intermediate_draws.get(expert, 0)
+            ),
         )
         research_source = coupled_search_basis.source
         research_h13 = coupled_search_basis.h13
@@ -5381,6 +5588,47 @@ def run(args: argparse.Namespace) -> dict:
     samples = index_cached_layer_samples(args.sample_cache, [args.layer - 1]).pop(
         args.layer - 1
     )
+    external_samples: LayerSamples | None = None
+    external_requests: dict[int, str] | None = None
+    external_contract: dict[str, object] | None = None
+    if args.external_sample_cache is not None:
+        assert args.external_report is not None
+        external_report = _read_json(args.external_report)
+        external_requests = request_documents(
+            external_report, deduplicate=True
+        )
+        overlap = set(requests.values()) & set(external_requests.values())
+        if overlap:
+            raise ValueError(
+                f"external corpus overlaps training by {len(overlap)} documents"
+            )
+        external_manifest_path = args.external_sample_cache / "manifest.json"
+        external_manifest = _read_json(external_manifest_path)
+        external_capture = Path(
+            str(external_report.get("capture_dir", ""))
+        ).resolve()
+        if (
+            Path(str(external_manifest.get("source_capture", ""))).resolve()
+            != external_capture
+        ):
+            raise ValueError(
+                "external sample cache does not describe the external report"
+            )
+        external_samples = index_cached_layer_samples(
+            args.external_sample_cache, [args.layer - 1]
+        ).pop(args.layer - 1)
+        external_contract = {
+            "sample_cache": str(args.external_sample_cache.resolve()),
+            "report": str(args.external_report.resolve()),
+            "capture": str(external_capture),
+            "documents": len(external_requests),
+            "duplicate_document_epochs": int(
+                external_report.get("completed_requests", len(external_requests))
+            )
+            - len(external_requests),
+            "document_overlap_with_training": 0,
+            "selection_role": "untouched_frozen_candidate_evaluation_only",
+        }
     global_h13, global_h2 = load_layer_hessians(args.hessians, args.layer)
     store_kwargs: dict[str, object] = {"repo_dir": args.official_repo_dir}
     if args.official_revision is not None:
@@ -5402,7 +5650,7 @@ def run(args: argparse.Namespace) -> dict:
     }
     payload: dict[str, object] = {
         "kind": "kquant_qsrt_k2_tile_allocation_experiment",
-        "schema_version": 1,
+        "schema_version": 2,
         "complete": False,
         "contract": {
             "experiment_implementation_sha256": hashlib.sha256(
@@ -5420,6 +5668,7 @@ def run(args: argparse.Namespace) -> dict:
             "ldlq_tf32": args.ldlq_tf32,
             "selection": "fit-document dense-H tile geometry",
             "evaluation": "document-disjoint confirmation partition",
+            "external_validation": external_contract,
             "w2_hessian": (
                 "3.08-bpw and boundary candidates rebuild expert-local H2 from "
                 "their decoded upstream reconstruction and shrink only toward "
@@ -5448,6 +5697,13 @@ def run(args: argparse.Namespace) -> dict:
                 "coupled_hadamard_pre_permutation": (
                     args.coupled_hadamard_pre_permutation
                 ),
+                "coupled_residual_draw": args.coupled_residual_draw,
+                "coupled_intermediate_draws": {
+                    str(expert): draw
+                    for expert, draw in sorted(
+                        args.coupled_intermediate_draws.items()
+                    )
+                },
                 "tile_search_limit": args.tile_search_limit,
             },
             "allocation_coordinates": {
@@ -5488,6 +5744,8 @@ def run(args: argparse.Namespace) -> dict:
             expert=expert,
             samples=samples,
             partition=partition,
+            external_samples=external_samples,
+            external_requests=external_requests,
             global_h13=global_h13,
             global_h2=global_h2,
             store=store,
@@ -5508,6 +5766,8 @@ def run(args: argparse.Namespace) -> dict:
             coupled_hadamard_pre_permutation=(
                 args.coupled_hadamard_pre_permutation
             ),
+            coupled_residual_draw=args.coupled_residual_draw,
+            coupled_intermediate_draws=args.coupled_intermediate_draws,
             functional_tile_search=args.functional_tile_search,
             qsrt_308_search=args.qsrt_308_search,
             qsrt_308_tile_fractions=args.qsrt_308_tile_fractions,
@@ -5523,7 +5783,11 @@ def run(args: argparse.Namespace) -> dict:
         payload["results"][str(expert)] = result
         _atomic_write(args.output, payload)
         if not result["skipped"]:
-            if args.coupled_hadamard_k2 and not args.qsrt_308_search:
+            if (
+                args.coupled_hadamard_k2
+                and not args.qsrt_308_search
+                and not args.k2_codebook_menu
+            ):
                 coupled = result["coupled_hadamard_k2"]
                 print(
                     f"layer {args.layer} expert {expert}: "
@@ -5538,12 +5802,22 @@ def run(args: argparse.Namespace) -> dict:
             if args.k2_codebook_menu:
                 menu = result["k2_codebook_menu"]
                 selected_stats = menu["selector_stats"]["best_of_four"]
+                external = menu[
+                    "confirmation_gated_external_relative_to_normal"
+                ]
+                external_text = (
+                    ""
+                    if external is None
+                    else f" external={100 * external:+.3f}%"
+                )
                 print(
                     f"layer {args.layer} expert {expert}: "
                     f"k2-menu={menu['selected_on_fit']} "
+                    f"gated={menu['selected_after_confirmation_gate']} "
                     f"non-normal={100 * selected_stats['non_normal_fraction']:.2f}% "
                     f"confirm="
-                    f"{100 * menu['confirmation_relative_to_normal']:+.3f}%",
+                    f"{100 * menu['confirmation_relative_to_normal']:+.3f}%"
+                    f"{external_text}",
                     flush=True,
                 )
                 torch.cuda.empty_cache()
@@ -5607,6 +5881,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--sample-cache", type=Path, required=True)
     parser.add_argument("--training-report", type=Path, required=True)
+    parser.add_argument(
+        "--external-sample-cache",
+        type=Path,
+        help=(
+            "optional document-disjoint cache used only to score frozen "
+            "K2 codebook-menu candidates"
+        ),
+    )
+    parser.add_argument(
+        "--external-report",
+        type=Path,
+        help="finalized corpus report for --external-sample-cache",
+    )
     parser.add_argument("--hessians", type=Path, required=True)
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument(
@@ -5671,6 +5958,18 @@ def parse_args() -> argparse.Namespace:
             "interleaving gate/up and applying the coupled Hadamard"
         ),
     )
+    parser.add_argument(
+        "--coupled-residual-draw",
+        type=int,
+        default=0,
+        help="layer-shared residual-boundary rotation draw",
+    )
+    parser.add_argument(
+        "--coupled-intermediate-draws",
+        type=_parse_expert_draws,
+        default={},
+        help="expert:draw overrides for expert-private intermediate rotations",
+    )
     parser.add_argument("--qsrt-308-search", action="store_true")
     parser.add_argument(
         "--qsrt-308-tile-fractions",
@@ -5722,12 +6021,25 @@ def parse_args() -> argparse.Namespace:
         parser.error("--layer must lie in 1..92")
     if args.output.exists():
         parser.error("--output already exists")
+    if (args.external_sample_cache is None) != (args.external_report is None):
+        parser.error(
+            "--external-sample-cache and --external-report must be supplied together"
+        )
+    if args.external_sample_cache is not None and not args.k2_codebook_menu:
+        parser.error("external frozen scoring currently requires --k2-codebook-menu")
     if args.tile_search_chunk <= 0:
         parser.error("--tile-search-chunk must be positive")
     if not 0 <= args.tile_search_limit <= 1792:
         parser.error("--tile-search-limit must lie in 0..1792")
     if not 0 <= args.qsrt_308_max_donors <= 11:
         parser.error("--qsrt-308-max-donors must lie in 0..11")
+    if args.coupled_residual_draw < 0:
+        parser.error("--coupled-residual-draw must be nonnegative")
+    if any(
+        expert not in args.experts or draw < 0
+        for expert, draw in args.coupled_intermediate_draws.items()
+    ):
+        parser.error("coupled intermediate draws must name selected experts")
     if args.qsrt_308_tile_fractions and not args.qsrt_308_search:
         parser.error("--qsrt-308-tile-fractions requires --qsrt-308-search")
     if args.qsrt_308_boundary_tile_search and not args.qsrt_308_search:
@@ -5751,7 +6063,8 @@ def parse_args() -> argparse.Namespace:
             args.functional_tile_search,
             args.qsrt_308_search,
             args.k2_codebook_menu,
-            args.coupled_hadamard_k2 and not args.qsrt_308_search,
+            args.coupled_hadamard_k2
+            and not (args.qsrt_308_search or args.k2_codebook_menu),
         )
     )
     if experiment_count > 1:

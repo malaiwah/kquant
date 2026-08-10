@@ -95,6 +95,7 @@ def test_coupled_search_basis_closes_and_scores_in_original_output_basis() -> No
 
     assert basis.evidence["full_precision_closure_relative_sse"] < 1e-11
     assert torch.equal(basis.permutation, torch.arange(intermediate))
+    assert torch.equal(basis.transform_inputs(inputs), basis.inputs)
     assert torch.allclose(basis.h13, basis.h13.T, rtol=1e-5, atol=1e-5)
     assert torch.allclose(basis.h2, basis.h2.T, rtol=1e-5, atol=1e-5)
     route_weights = torch.ones(rows, 1)
@@ -105,6 +106,26 @@ def test_coupled_search_basis_closes_and_scores_in_original_output_basis() -> No
         route_weights=route_weights,
         execute_triplet=basis.execute_triplet,
     ) == pytest.approx(0.0, abs=2e-8)
+
+    external_inputs = torch.randn(7, hidden, generator=generator)
+    external_gate = external_inputs @ source[0].T
+    external_up = external_inputs @ source[1].T
+    external_reference = (
+        4.0
+        * torch.tanh(external_gate / 4.0)
+        * torch.sigmoid(external_gate)
+        * 25.0
+        * torch.tanh(external_up / 25.0)
+    ) @ source[2].T
+    external_output = basis.execute_triplet(
+        basis.transform_inputs(external_inputs), basis.source
+    )
+    assert torch.allclose(
+        external_output,
+        external_reference,
+        rtol=2e-5,
+        atol=2e-5,
+    )
 
 
 def test_k2_menu_selector_counts_shared_triplet_winners() -> None:
