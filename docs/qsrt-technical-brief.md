@@ -840,6 +840,18 @@ degree of freedom.
 | Aligned per-neuron shared bases | Stores a small number of layer bases and quantizes only expert residuals | In 32-expert coordinate sketches, rank-four excess capture over an energy-matched isotropic null was 1.18, 1.74, 0.09, and 0.39 percentage points at layers 1, 24, 64, and 92. Global expert coefficients were weaker | Track as a low-rate oracle, but the signal is not stable through depth; require full-coordinate/all-expert factorization and residual K2 encoding before implementation work |
 | Reconstructed-activation W2 refit | Compensates upstream quantization before the final K2 encode | Dense refit won 20/28 experts with 1.55% median routed improvement | Upper bound only; the dense fitted matrix must be distilled into a cheap structured correction or used solely as the next W2 encoding target |
 
+The remaining low-rate design space is retained explicitly even where no
+production result exists yet:
+
+| Mechanism | Pure K2 | Required decisive experiment |
+| --- | --- | --- |
+| One- or two-bit tile-local K2 codebook menu | Yes | Retain byte-distinct complementary K2 staircases or graphs, fit the mode on training documents, and verify mode stability and full-expert SSE on confirmation documents. One selector bit per 16-by-16 tile costs 0.00390625 bpw; two cost 0.0078125 bpw. |
+| Joint gate/up vector trellis | Yes | Incorporate the measured 2-by-2 activation metric into full tail-biting assignment, preserve decoded scale closure, and score the complete reconstructed expert. |
+| Successively refinable K2 base | Yes, as the base layer | Jointly train a two-plane base and K3/K4 refinement planes with the production transform, refitted scales, and functional objective; do not infer viability from native MXFP4 bit truncation. |
+| Tile-local P33/P24 funding | No | Rerun the actual equal-byte pair allocator after every tile proposal. Keep its selector accounting and kernel grammar separate from pure-K2 quality claims. |
+| Gate/up/down rate triples such as 234 permutations | No | Select complete equal-byte projection triplets through decoded whole-expert error; isolated matrix SSE cannot choose which projection receives K2 or K4. |
+| Joint low/high K6 vector code | No | Treat as a six-bit pair-allocation oracle and require a real trellis realization plus P24/P33 allocator comparison before considering a runtime format. |
+
 The co-routing objective for retained candidate mode $m_e$ is
 
 $$
