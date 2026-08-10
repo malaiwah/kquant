@@ -116,7 +116,7 @@ history and physical branch:
 $$
 h=t\mathbin{\gg}K,
 \qquad
-b=t\mathbin{\&}(2^K-1).
+b=t\mathbin{\mathrm{AND}}(2^K-1).
 $$
 
 With $M_w=2^w-1$, define
@@ -124,12 +124,12 @@ With $M_w=2^w-1$, define
 $$
 \begin{aligned}
 x_0 &= h\oplus(h\gg11),\\
-x_1 &= x_0\oplus((x_0\ll11)\mathbin{\&}M_w),\\
+x_1 &= x_0\oplus((x_0\ll11)\mathbin{\mathrm{AND}}M_w),\\
 p &= (\mathtt{0x3FA7D929}\,x_1+\mathtt{0xC928FD8E})\bmod2^{32},\\
-\phi &= p\mathbin{\&}M_w,\\
+\phi &= p\mathbin{\mathrm{AND}}M_w,\\
 s_K &= p\gg(32-K),\\
 j &= \mathrm{rev}_K(b)\oplus s_K,\\
-G_K(h,b)=r &= (j\ll w)\mathbin{|}\phi.
+G_K(h,b)=r &= (j\ll w)\mathbin{\mathrm{OR}}\phi.
 \end{aligned}
 $$
 

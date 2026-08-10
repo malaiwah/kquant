@@ -118,7 +118,7 @@ For a sixteen-bit edge word $t$, split the retained history and new branch:
 $$
 h=t\gg2,
 \qquad
-b=t\mathbin{\&}3.
+b=t\mathbin{\mathrm{AND}}3.
 $$
 
 With $M=2^{14}-1$, compute
@@ -126,13 +126,13 @@ With $M=2^{14}-1$, compute
 $$
 \begin{aligned}
 x_0 &= h\oplus(h\gg11),\\
-x_1 &= x_0\oplus((x_0\ll11)\mathbin{\&}M),\\
+x_1 &= x_0\oplus((x_0\ll11)\mathbin{\mathrm{AND}}M),\\
 p &= (\mathtt{0x3FA7D929}\,x_1+
       \mathtt{0xC928FD8E})\bmod2^{32},\\
-\phi &= p\mathbin{\&}M,\\
+\phi &= p\mathbin{\mathrm{AND}}M,\\
 s &= p\gg30,\\
 j &= \mathrm{rev}_2(b)\oplus s,\\
-r &= (j\ll14)\mathbin{|}\phi.
+r &= (j\ll14)\mathbin{\mathrm{OR}}\phi.
 \end{aligned}
 $$
 
