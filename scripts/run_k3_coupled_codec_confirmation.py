@@ -25,6 +25,7 @@ from kquant.capture import index_cached_layer_samples
 from kquant.coupled_expert_study import (
     CoupledTriplet,
     RoutedOutputMetric,
+    apply_w3_w2_scale_gauge,
     apply_w3_w2_sign_draw,
     encode_coupled_block_hadamard,
     execute_coupled_block_hadamard,
@@ -75,6 +76,27 @@ def _parse_expert_draws(value: str) -> dict[int, int]:
         if expert in result:
             raise argparse.ArgumentTypeError("expert draw keys must be unique")
         result[expert] = draw
+    return result
+
+
+def _parse_expert_scale_gauges(value: str) -> dict[int, tuple[str, float]]:
+    result: dict[int, tuple[str, float]] = {}
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        fields = item.split(":")
+        if len(fields) != 3 or not fields[0].isdecimal():
+            raise argparse.ArgumentTypeError(
+                "expected comma-separated expert:policy:strength triples"
+            )
+        expert = int(fields[0])
+        try:
+            strength = float(fields[2])
+        except ValueError as error:
+            raise argparse.ArgumentTypeError("gauge strength must be numeric") from error
+        if expert in result:
+            raise argparse.ArgumentTypeError("expert gauge keys must be unique")
+        result[expert] = (fields[1], strength)
     return result
 
 
@@ -164,8 +186,13 @@ def _external_transform(
     residual_draw: int,
     intermediate_draw: int,
     sign_draw: int,
+    scale_gauge: tuple[str, float],
 ) -> CoupledTriplet:
-    gauged = apply_w3_w2_sign_draw(source, draw=sign_draw)
+    gauged = apply_w3_w2_scale_gauge(
+        apply_w3_w2_sign_draw(source, draw=sign_draw),
+        policy=scale_gauge[0],
+        strength=scale_gauge[1],
+    )
     return encode_coupled_block_hadamard(
         gauged,
         block_size=512,
@@ -242,6 +269,13 @@ def _score(
     intermediate_draw: int,
 ) -> dict[str, Any]:
     source_output = expert_hidden(rows["inputs"], source) @ source.down.T
+    encoded_source_output = _execute_arm(
+        rows["inputs"],
+        encoded_source,
+        arm,
+        residual_draw=residual_draw,
+        intermediate_draw=intermediate_draw,
+    )
     output = _execute_arm(
         rows["inputs"],
         reconstruction,
@@ -286,6 +320,10 @@ def _score(
     scale_bits = sum(int(item["scale_bytes"]) * 8 for item in evidence)
     return {
         "weight_nmse": weight_sse / weight_energy,
+        "encoded_source_relative_sse": float(
+            (encoded_source_output - source_output).double().square().sum()
+            / source_output.double().square().sum().clamp_min(1e-30)
+        ),
         **routed_scores,
         "fit": score_rows(fit_rows),
         "confirmation": score_rows(confirmation_rows),
@@ -329,6 +367,12 @@ def parse_args() -> argparse.Namespace:
         default={},
         help="expert:draw overrides for exact baked W3/W2 sign gauges",
     )
+    parser.add_argument(
+        "--w3-w2-scale-gauges",
+        type=_parse_expert_scale_gauges,
+        default={},
+        help="expert:policy:strength overrides for bounded positive W3/W2 gauges",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--exllamav3-root", type=Path, default=Path("/home/luke/projects/exllamav3"))
     parser.add_argument("--official-revision", default=C.REVISION)
@@ -362,6 +406,16 @@ def parse_args() -> argparse.Namespace:
         for expert, draw in args.w3_w2_sign_draws.items()
     ):
         parser.error("W3/W2 sign draws must be nonnegative and name selected experts")
+    allowed_scale_policies = {"identity", "up_down_rms", "down_rms", "down_absmax"}
+    if any(
+        expert not in args.experts
+        or policy not in allowed_scale_policies
+        or not math.isfinite(strength)
+        or (policy == "identity" and strength != 0.0)
+        or (policy != "identity" and not 0.0 < strength <= 1.0)
+        for expert, (policy, strength) in args.w3_w2_scale_gauges.items()
+    ):
+        parser.error("W3/W2 scale gauges contain an invalid expert, policy, or strength")
     return args
 
 
@@ -392,6 +446,10 @@ def main() -> None:
         "w3_w2_sign_gauge_by_expert": {
             str(expert): draw
             for expert, draw in sorted(args.w3_w2_sign_draws.items())
+        },
+        "w3_w2_scale_gauge_by_expert": {
+            str(expert): {"policy": policy, "strength": strength}
+            for expert, (policy, strength) in sorted(args.w3_w2_scale_gauges.items())
         },
         "ldlq_tf32": args.ldlq_tf32,
         "no_qat": True,
@@ -431,6 +489,7 @@ def main() -> None:
             )
         intermediate_draw = args.coupled_intermediate_draws.get(expert, 0)
         sign_draw = args.w3_w2_sign_draws.get(expert, 0)
+        scale_gauge = args.w3_w2_scale_gauges.get(expert, ("identity", 0.0))
         arm_sources = {
             "baseline": source,
             "coupled_hadamard": _external_transform(
@@ -438,6 +497,7 @@ def main() -> None:
                 residual_draw=args.coupled_residual_draw,
                 intermediate_draw=intermediate_draw,
                 sign_draw=sign_draw,
+                scale_gauge=scale_gauge,
             ),
         }
         results: dict[str, Any] = {}
@@ -497,6 +557,10 @@ def main() -> None:
                 "intermediate_draw": intermediate_draw,
             },
             "w3_w2_sign_gauge_draw": sign_draw,
+            "w3_w2_scale_gauge": {
+                "policy": scale_gauge[0],
+                "strength": scale_gauge[1],
+            },
             "candidates": results,
             "comparisons": comparisons,
             "seconds": time.time() - started,

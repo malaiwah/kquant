@@ -15,6 +15,7 @@ from kquant.coupled_expert_study import (
     apply_permutation_sign_gauge,
     apply_postactivation_scale,
     apply_w3_w2_sign_draw,
+    apply_w3_w2_scale_gauge,
     block_hadamard,
     blockwise_codebook_quantize,
     conditional_entropy_bits,
@@ -255,6 +256,27 @@ def test_w3_w2_sign_draw_is_exact_and_deterministic() -> None:
     identity = apply_w3_w2_sign_draw(triplet, draw=0)
     assert torch.equal(identity.up, triplet.up)
     assert torch.equal(identity.down, triplet.down)
+
+
+def test_w3_w2_scale_gauge_is_bounded_and_validated() -> None:
+    triplet = _triplet(seed=119, hidden=16, intermediate=8)
+    gauged = apply_w3_w2_scale_gauge(
+        triplet,
+        policy="down_rms",
+        strength=0.5,
+    )
+    scale = gauged.up / triplet.up
+    finite_scale = scale[torch.isfinite(scale)]
+    assert torch.all(finite_scale.abs() >= 0.5)
+    assert torch.all(finite_scale.abs() <= 2.0)
+    assert torch.allclose(gauged.up * gauged.down.T, triplet.up * triplet.down.T)
+    assert apply_w3_w2_scale_gauge(
+        triplet,
+        policy="identity",
+        strength=0.0,
+    ) is triplet
+    with pytest.raises(ValueError, match="unknown"):
+        apply_w3_w2_scale_gauge(triplet, policy="bad", strength=0.5)
 
 
 def test_pair_metric_and_residual_cross_term() -> None:

@@ -797,6 +797,44 @@ def apply_w3_w2_sign_draw(
     )
 
 
+def apply_w3_w2_scale_gauge(
+    triplet: CoupledTriplet,
+    *,
+    policy: str,
+    strength: float,
+) -> CoupledTriplet:
+    """Apply one bounded positive W3/W2 scale-gauge proposal.
+
+    This is only approximately function preserving because Kimi's saturated
+    up activation is odd but not homogeneous. The proposal is nevertheless
+    useful when routed up preactivations remain in its nearly linear region.
+    """
+
+    if policy == "identity":
+        if strength != 0.0:
+            raise ValueError("the identity scale gauge requires zero strength")
+        return triplet
+    if policy not in {"up_down_rms", "down_rms", "down_absmax"}:
+        raise ValueError(f"unknown W3/W2 scale-gauge policy {policy!r}")
+    if not math.isfinite(strength) or not 0.0 < strength <= 1.0:
+        raise ValueError("scale-gauge strength must be in (0, 1]")
+    up_rms = triplet.up.float().square().mean(dim=1).sqrt().clamp_min(1e-8)
+    down_rms = triplet.down.float().square().mean(dim=0).sqrt().clamp_min(1e-8)
+    if policy == "up_down_rms":
+        proposal = (down_rms / up_rms).sqrt()
+    elif policy == "down_rms":
+        proposal = down_rms
+    else:
+        proposal = triplet.down.float().abs().amax(dim=0).clamp_min(1e-8)
+    proposal = proposal / proposal.log().mean().exp()
+    scale = proposal.pow(strength).clamp(0.5, 2.0)
+    return CoupledTriplet(
+        triplet.gate,
+        (triplet.up * scale[:, None]).contiguous(),
+        (triplet.down / scale[None, :]).contiguous(),
+    )
+
+
 def signed_block_hadamard(
     values: Tensor,
     *,
@@ -1602,6 +1640,7 @@ __all__ = [
     "apply_permutation_sign_gauge",
     "apply_postactivation_scale",
     "apply_w3_w2_sign_draw",
+    "apply_w3_w2_scale_gauge",
     "allocate_rate_options",
     "block_hadamard",
     "blockwise_codebook_quantize",
