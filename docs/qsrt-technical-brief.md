@@ -823,6 +823,39 @@ pair selects R1+ in 7,141 (8.663%), and R2 appears on at least one axis in
 6,907 experts (8.379%). X4T endpoint allocation is a separate exact-byte
 optimization over these sealed candidates.
 
+### Extreme-rate K2 research register
+
+Pure or nearly pure K2 operation makes individually small gains relevant. The
+following mechanisms remain distinct research candidates; a negative result
+for one parameterization does not remove the underlying symmetry or coding
+degree of freedom.
+
+| Mechanism | Mathematical role | Current evidence | Qualification |
+| --- | --- | --- | --- |
+| Coupled gate/up/down boundary Hadamard | Exact change of basis before the coordinatewise activation boundary | Fresh uniform-K2 SQG re-encodes improved routed error on 22/24 experts; pooled routed SSE fell 3.052% | Numerically promising; requires fused-transform latency and broader layer confirmation |
+| Activation-metric W1/W3 pair code | Uses the local 2-by-2 SiTU metric so gate/up errors can cancel | 24/28 isolated pair-codebook wins; median functional metric improvement 4.90% | Codebook oracle; needs a joint vector trellis, decoded-payload scoring, and full-expert validation |
+| W3/W2 sign gauge | Exact symmetry from the odd up activation | Zero payload and runtime cost after baking signs into both matrices | Retain for real SQG path search; symmetric scalar proxies cannot measure its trellis-path value |
+| Positive W3/W2 scale gauge | Approximate symmetry while the up branch is linear | Across 28 routed experts, median route-weighted mass with $g'(u)\ge0.99$ is 99.9986%; the worst expert remains 97.7792%. A four-expert baked-gauge check changed full-precision expert SSE by only $1.39\times10^{-11}$, but naive RMS balancing worsened the 2-bit proxy by 0.283% median | Symmetry is valid; RMS balancing is a negative heuristic, not a rejection of activation-aware scale fitting |
+| Co-routing-aware candidate phase | Chooses among near-equal expert errors to reduce top-16 cross terms | A 32-row layer-24 audit measured a positive cross term equal to 0.929% of diagonal mapped SSE; the linear metric matched exact post-projection SSE within 0.458% | Plausible sub-percent headroom; requires two or more retained trellis candidates per expert and document-disjoint selection |
+| Aligned per-neuron shared bases | Stores a small number of layer bases and quantizes only expert residuals | A 32-expert coordinate sketch left 72.29% residual at rank four versus 74.05% for an energy-matched isotropic null, an excess captured fraction of 1.75%. Global expert coefficients were weaker | Track as a low-rate oracle; full-coordinate/all-expert factorization and residual K2 encoding are required |
+| Reconstructed-activation W2 refit | Compensates upstream quantization before the final K2 encode | Dense refit won 20/28 experts with 1.55% median routed improvement | Upper bound only; the dense fitted matrix must be distilled into a cheap structured correction or used solely as the next W2 encoding target |
+
+The co-routing objective for retained candidate mode $m_e$ is
+
+$$
+\min_{\{m_e\}}
+\sum_n\left\|
+\sum_{e\in\mathcal R_n}p_{n,e}J_n\epsilon_{n,e,m_e}
+\right\|_2^2,
+$$
+
+where $J_n$ is the post-aggregate RMSNorm/output-projection Jacobian. Candidate
+modes must first pass an expert-local unary-loss bound; otherwise cancellation
+can hide an unacceptable individual regression. The repository analysis
+solver implements this constrained objective, but the sealed candidate pool
+contains only one payload per expert, so alternate paths must be generated in
+a fresh research encode rather than inferred from aggregate SSE.
+
 ## Execution checklist
 
 - [x] Implement and unit-test L16 SQG-normal E4M3 labels for K2/K3/K4.

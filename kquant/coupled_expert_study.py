@@ -77,6 +77,18 @@ class ActivationLaw:
 
 
 @dataclass(frozen=True)
+class SiTUComponentGeometry:
+    """Dimensionless SiTU inputs, factors, and component derivatives."""
+
+    normalized_gate: Tensor
+    normalized_up: Tensor
+    gate_factor: Tensor
+    up_factor: Tensor
+    gate_derivative: Tensor
+    up_derivative: Tensor
+
+
+@dataclass(frozen=True)
 class RoutedOutputMetric:
     """RMS normalization followed by a gain and output projection."""
 
@@ -165,6 +177,52 @@ def situ_derivatives(
     f_prime = (1.0 - tanh_gate.square()) * sigmoid + beta * tanh_gate * sigmoid * (1.0 - sigmoid)
     g_prime = 1.0 - torch.tanh(b / linear_beta).square()
     return g * f_prime, f * g_prime
+
+
+def situ_component_geometry(
+    gate: Tensor,
+    up: Tensor,
+    *,
+    beta: float = 4.0,
+    linear_beta: float = 25.0,
+) -> SiTUComponentGeometry:
+    """Expose the two SiTU factors before their product.
+
+    ``situ_derivatives`` returns the derivatives of the complete product,
+    which intentionally fold the opposite factor into each result.  This
+    diagnostic instead returns ``f``, ``g``, ``f'``, and ``g'`` separately so
+    activation-regime studies can determine whether the nominally linear up
+    branch is actually operating near ``g'(u) = 1``.
+    """
+
+    if gate.shape != up.shape:
+        raise ValueError("gate and up projections must have identical shapes")
+    if not math.isfinite(beta) or beta <= 0:
+        raise ValueError("gate temperature must be finite and positive")
+    if not math.isfinite(linear_beta) or linear_beta <= 0:
+        raise ValueError("up temperature must be finite and positive")
+    gate_f = gate.float()
+    up_f = up.float()
+    normalized_gate = gate_f / beta
+    normalized_up = up_f / linear_beta
+    tanh_gate = torch.tanh(normalized_gate)
+    tanh_up = torch.tanh(normalized_up)
+    sigmoid_gate = torch.sigmoid(gate_f)
+    gate_factor = beta * tanh_gate * sigmoid_gate
+    up_factor = linear_beta * tanh_up
+    gate_derivative = (
+        (1.0 - tanh_gate.square()) * sigmoid_gate
+        + beta * tanh_gate * sigmoid_gate * (1.0 - sigmoid_gate)
+    )
+    up_derivative = 1.0 - tanh_up.square()
+    return SiTUComponentGeometry(
+        normalized_gate=normalized_gate,
+        normalized_up=normalized_up,
+        gate_factor=gate_factor,
+        up_factor=up_factor,
+        gate_derivative=gate_derivative,
+        up_derivative=up_derivative,
+    )
 
 
 SITU = ActivationLaw(value=situ_value, derivatives=situ_derivatives)
@@ -413,6 +471,144 @@ def route_error_covariance(
         "bias_sse": float(bias),
         "total_over_diagonal": float(total / diagonal) if diagonal > 0 else 0.0,
         "independent_averaging_factor": float(diagonal / total) if total > 0 else float("inf"),
+    }
+
+
+def select_corouted_candidate_modes(
+    expert_ids: Tensor,
+    candidate_errors: Tensor,
+    *,
+    valid_modes: Tensor | None = None,
+    unary_relative_slack: float | None = None,
+    maximum_sweeps: int = 20,
+) -> dict[str, Tensor | float | int]:
+    """Select one candidate per expert against the routed mixture error.
+
+    ``candidate_errors`` has shape ``[rows, slots, modes, features]`` and is
+    expected to contain route-gate weighting and any desired output-metric
+    projection already.  The optimized objective is therefore
+
+    ``sum_rows ||sum_slots error[row, slot, mode[expert]])||^2``.
+
+    This deterministic coordinate solver is an analysis tool.  It exposes the
+    headroom from choosing among several valid, nearly equal payloads without
+    prescribing how those payloads are generated or stored.
+    """
+
+    if expert_ids.ndim != 2 or candidate_errors.ndim != 4:
+        raise ValueError("co-routing inputs must have rank two and four")
+    if tuple(candidate_errors.shape[:2]) != tuple(expert_ids.shape):
+        raise ValueError("candidate errors do not align with routed expert slots")
+    if candidate_errors.shape[2] < 2 or candidate_errors.shape[3] == 0:
+        raise ValueError("co-routing selection requires multiple nonempty candidates")
+    if expert_ids.numel() == 0 or bool(torch.any(expert_ids < 0)):
+        raise ValueError("routed expert identifiers must be nonempty and non-negative")
+    if not torch.is_floating_point(candidate_errors) or not bool(
+        torch.all(torch.isfinite(candidate_errors))
+    ):
+        raise ValueError("candidate errors must be finite floating-point values")
+    if maximum_sweeps <= 0:
+        raise ValueError("maximum sweeps must be positive")
+    if unary_relative_slack is not None and (
+        not math.isfinite(unary_relative_slack) or unary_relative_slack < 0
+    ):
+        raise ValueError("unary relative slack must be finite and non-negative")
+
+    ids = expert_ids.detach().long().cpu()
+    errors = candidate_errors.detach().double().cpu()
+    modes = errors.shape[2]
+    routed_experts = int(ids.max()) + 1
+    experts = int(valid_modes.shape[0]) if valid_modes is not None else routed_experts
+    if experts < routed_experts:
+        raise ValueError("valid mode mask omits a routed expert")
+    present = torch.zeros(experts, dtype=torch.bool)
+    present[torch.unique(ids)] = True
+    if valid_modes is None:
+        allowed = torch.ones((experts, modes), dtype=torch.bool)
+    else:
+        if tuple(valid_modes.shape) != (experts, modes):
+            raise ValueError("valid mode mask does not match expert and mode counts")
+        allowed = valid_modes.detach().bool().cpu().clone()
+    if bool(torch.any(present & ~allowed.any(dim=1))):
+        raise ValueError("every routed expert must retain at least one valid candidate")
+
+    unary = torch.zeros((experts, modes), dtype=torch.float64)
+    contributions: dict[int, tuple[Tensor, Tensor]] = {}
+    for expert in torch.nonzero(present, as_tuple=False).flatten().tolist():
+        locations = torch.nonzero(ids == expert, as_tuple=False)
+        rows = torch.unique(locations[:, 0], sorted=True)
+        by_row = torch.zeros(
+            (rows.numel(), modes, errors.shape[3]), dtype=torch.float64
+        )
+        row_lookup = torch.searchsorted(rows, locations[:, 0])
+        for location, row_index in zip(locations, row_lookup):
+            by_row[row_index] += errors[location[0], location[1]]
+        unary[expert] = by_row.square().sum(dim=(0, 2))
+        contributions[expert] = rows, by_row
+
+    if unary_relative_slack is not None:
+        masked = unary.masked_fill(~allowed, float("inf"))
+        best = masked.min(dim=1).values
+        threshold = best * (1.0 + unary_relative_slack) + 1e-30
+        allowed &= unary <= threshold[:, None]
+        if bool(torch.any(present & ~allowed.any(dim=1))):
+            raise RuntimeError("unary filtering removed every candidate for an expert")
+
+    unary_selection = torch.full((experts,), -1, dtype=torch.long)
+    unary_selection[present] = unary.masked_fill(~allowed, float("inf")).argmin(
+        dim=1
+    )[present]
+
+    def optimize(initial: Tensor) -> tuple[Tensor, Tensor, int, int]:
+        selection = initial.clone()
+        aggregate = torch.zeros(
+            (ids.shape[0], errors.shape[3]), dtype=torch.float64
+        )
+        for expert, (rows, by_row) in contributions.items():
+            aggregate[rows] += by_row[:, selection[expert]]
+        changes = 0
+        completed_sweeps = 0
+        for completed_sweeps in range(1, maximum_sweeps + 1):
+            sweep_changes = 0
+            for expert, (rows, by_row) in contributions.items():
+                current = int(selection[expert])
+                base = aggregate[rows] - by_row[:, current]
+                costs = (base[:, None, :] + by_row).square().sum(dim=(0, 2))
+                costs.masked_fill_(~allowed[expert], float("inf"))
+                winner = int(costs.argmin())
+                if winner == current:
+                    continue
+                aggregate[rows] = base + by_row[:, winner]
+                selection[expert] = winner
+                sweep_changes += 1
+            changes += sweep_changes
+            if sweep_changes == 0:
+                break
+        return selection, aggregate, completed_sweeps, changes
+
+    starts = [unary_selection]
+    for mode in range(modes):
+        uniform = unary_selection.clone()
+        uniform[present & allowed[:, mode]] = mode
+        starts.append(uniform)
+    candidates = [optimize(start) for start in starts]
+    selection, aggregate, completed_sweeps, changes = min(
+        candidates, key=lambda item: float(item[1].square().sum())
+    )
+
+    selected_unary = float(
+        unary.gather(1, selection.clamp_min(0)[:, None]).squeeze(1)[present].sum()
+    )
+    objective = float(aggregate.square().sum())
+    return {
+        "selection": selection,
+        "objective": objective,
+        "selected_unary": selected_unary,
+        "cross_term": objective - selected_unary,
+        "sweeps": completed_sweeps,
+        "changes": changes,
+        "experts": int(present.sum()),
+        "modes": modes,
     }
 
 
@@ -1237,6 +1433,7 @@ __all__ = [
     "RateComponent",
     "RoutedOutputMetric",
     "SITU",
+    "SiTUComponentGeometry",
     "apply_common_input_gauge",
     "apply_output_rotation",
     "apply_permutation_sign_gauge",
@@ -1269,7 +1466,9 @@ __all__ = [
     "ridge_refit_down",
     "route_error_covariance",
     "search_expert_output_gain",
+    "select_corouted_candidate_modes",
     "situ_derivatives",
+    "situ_component_geometry",
     "situ_value",
     "sparse_fingerprint_alignment",
     "temperature_scaled_situ",

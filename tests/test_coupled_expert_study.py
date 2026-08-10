@@ -36,6 +36,8 @@ from kquant.coupled_expert_study import (
     ridge_refit_down,
     route_error_covariance,
     search_expert_output_gain,
+    select_corouted_candidate_modes,
+    situ_component_geometry,
     situ_derivatives,
     situ_value,
     sparse_fingerprint_alignment,
@@ -71,6 +73,27 @@ def test_situ_derivatives_match_finite_difference() -> None:
     )
     torch.testing.assert_close(d_gate, numeric_gate, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(d_up, numeric_up, rtol=2e-3, atol=2e-3)
+
+
+def test_situ_component_geometry_reconstructs_activation_and_derivatives() -> None:
+    generator = torch.Generator().manual_seed(10101)
+    gate = torch.randn(4, 6, generator=generator) * 3
+    up = torch.randn(4, 6, generator=generator) * 12
+    geometry = situ_component_geometry(gate, up)
+    torch.testing.assert_close(
+        geometry.gate_factor * geometry.up_factor,
+        situ_value(gate, up),
+    )
+    d_gate, d_up = situ_derivatives(gate, up)
+    torch.testing.assert_close(
+        geometry.up_factor * geometry.gate_derivative,
+        d_gate,
+    )
+    torch.testing.assert_close(
+        geometry.gate_factor * geometry.up_derivative,
+        d_up,
+    )
+    assert torch.all((geometry.up_derivative >= 0) & (geometry.up_derivative <= 1))
 
 
 def test_rms_output_jacobian_and_radial_suppression() -> None:
@@ -281,6 +304,42 @@ def test_routed_radial_and_cross_expert_decompositions() -> None:
     assert result["total_sse"] == pytest.approx(
         result["diagonal_sse"] + result["cross_term"], rel=1e-10, abs=1e-10
     )
+
+
+def test_corouted_candidate_selection_finds_cancelling_modes() -> None:
+    expert_ids = torch.tensor([[0, 1], [0, 1]])
+    errors = torch.tensor(
+        [
+            [[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, -1.0]]],
+            [[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [0.0, -1.0]]],
+        ]
+    )
+    selected = select_corouted_candidate_modes(expert_ids, errors)
+    torch.testing.assert_close(selected["selection"], torch.tensor([1, 1]))
+    assert selected["objective"] == pytest.approx(0.0)
+    assert selected["selected_unary"] == pytest.approx(4.0)
+    assert selected["cross_term"] == pytest.approx(-4.0)
+
+
+def test_corouted_candidate_selection_respects_unary_filter() -> None:
+    expert_ids = torch.tensor([[0, 1]])
+    errors = torch.tensor(
+        [[[[1.0], [10.0]], [[1.0], [-10.0]]]]
+    )
+    unrestricted = select_corouted_candidate_modes(expert_ids, errors)
+    assert unrestricted["objective"] == pytest.approx(0.0)
+    restricted = select_corouted_candidate_modes(
+        expert_ids,
+        errors,
+        valid_modes=torch.tensor(
+            [[True, True], [True, True], [True, False], [True, False]]
+        ),
+        unary_relative_slack=0.1,
+    )
+    torch.testing.assert_close(
+        restricted["selection"], torch.tensor([0, 0, -1, -1])
+    )
+    assert restricted["objective"] == pytest.approx(4.0)
 
 
 def test_alignment_metric_vq_and_predictors() -> None:

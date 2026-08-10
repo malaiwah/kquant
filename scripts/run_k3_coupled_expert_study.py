@@ -50,6 +50,7 @@ from kquant.coupled_expert_study import (
     ridge_refit_down,
     route_error_covariance,
     search_expert_output_gain,
+    situ_component_geometry,
     situ_value,
     sparse_fingerprint_alignment,
     temperature_scaled_situ,
@@ -232,6 +233,34 @@ def _quantiles(values: torch.Tensor) -> dict[str, float]:
         name: float(value)
         for name, value in zip(("min", "p10", "p25", "median", "p75", "p90", "max"), measured)
     }
+
+
+def _weighted_moments(values: torch.Tensor, row_weights: torch.Tensor) -> dict[str, float]:
+    if values.ndim != 2 or row_weights.ndim != 1 or values.shape[0] != row_weights.numel():
+        raise ValueError("weighted activation values and routed-row weights do not align")
+    weights = row_weights.detach().double().clamp_min(0)
+    denominator = weights.sum() * values.shape[1]
+    if denominator <= 0:
+        return {"mean": 0.0, "mean_absolute": 0.0, "rms": 0.0}
+    measured = values.detach().double()
+    return {
+        "mean": float((weights[:, None] * measured).sum() / denominator),
+        "mean_absolute": float((weights[:, None] * measured.abs()).sum() / denominator),
+        "rms": float(torch.sqrt((weights[:, None] * measured.square()).sum() / denominator)),
+    }
+
+
+def _weighted_fraction(
+    mask: torch.Tensor,
+    row_weights: torch.Tensor,
+) -> float:
+    if mask.ndim != 2 or row_weights.ndim != 1 or mask.shape[0] != row_weights.numel():
+        raise ValueError("weighted activation mask and routed-row weights do not align")
+    weights = row_weights.detach().double().clamp_min(0)
+    denominator = weights.sum() * mask.shape[1]
+    if denominator <= 0:
+        return 0.0
+    return float((weights[:, None] * mask.detach().double()).sum() / denominator)
 
 
 def _document_bootstrap(values: torch.Tensor, documents: torch.Tensor, *, seed: int) -> dict[str, float | int]:
@@ -469,6 +498,60 @@ def _two_bit_transform_proxy(
     )
     temperature["requires_activation_temperature"] = True
 
+    # q(u) = 25*tanh(u/25) is almost linear on the routed Kimi rows.  In that
+    # regime, scaling each W3 row by c and the matching W2 column by 1/c is an
+    # approximately function-preserving gauge that can be baked into stored
+    # weights.  Balance the two per-neuron RMS values, but retain a small
+    # strength grid so the full nonlinear expert remains the authority.
+    up_rms = source.up.float().square().mean(dim=1).sqrt().clamp_min(1e-8)
+    down_rms = source.down.float().square().mean(dim=0).sqrt().clamp_min(1e-8)
+    balance = (down_rms / up_rms).sqrt()
+    balance /= balance.log().mean().exp()
+    scale_gauge_arms: dict[str, dict[str, float]] = {}
+    for strength in (0.25, 0.5, 0.75, 1.0):
+        scale = balance.pow(strength).clamp(0.5, 2.0)
+        full_precision_hidden = situ_value(
+            inputs @ source.gate.T,
+            inputs @ (source.up * scale[:, None]).T,
+        )
+        full_precision_output = full_precision_hidden @ (
+            source.down / scale[None, :]
+        ).T
+        quantized_up = blockwise_codebook_quantize(source.up * scale[:, None])
+        quantized_down = blockwise_codebook_quantize(
+            source.down / scale[None, :]
+        )
+        quantized_hidden = situ_value(
+            inputs @ q_gate.T, inputs @ quantized_up.T
+        )
+        arm = score(quantized_hidden @ quantized_down.T)
+        full_precision_error = full_precision_output - source_output
+        arm.update(
+            {
+                "strength": strength,
+                "scale_minimum": float(scale.min()),
+                "scale_maximum": float(scale.max()),
+                "full_precision_expert_relative_sse": float(
+                    full_precision_error.double().square().sum()
+                    / source_output.double().square().sum().clamp_min(1e-30)
+                ),
+                "expert_sse_improvement_vs_baseline": float(
+                    1.0
+                    - arm["expert_sse"] / max(baseline["expert_sse"], 1e-30)
+                ),
+                "post_projection_sse_improvement_vs_baseline": float(
+                    1.0
+                    - arm["post_projection_sse"]
+                    / max(baseline["post_projection_sse"], 1e-30)
+                ),
+            }
+        )
+        scale_gauge_arms[f"{strength:.2f}"] = arm
+    scale_gauge_best = max(
+        scale_gauge_arms.values(),
+        key=lambda arm: arm["post_projection_sse_improvement_vs_baseline"],
+    )
+
     # Interleave the two branches before the left transform so each block can
     # exploit their coupled functional geometry, then invert before SiTU.
     transformed = encode_coupled_block_hadamard(source, block_size=512)
@@ -498,6 +581,14 @@ def _two_bit_transform_proxy(
         "common_input_diagonal_gauge": input_gauge,
         "exact_postactivation_equilibration": postactivation,
         "temperature_equilibration": temperature,
+        "approximate_w3_w2_scale_gauge": {
+            "selection_metric": "post_projection_sse_improvement_vs_baseline",
+            "best": scale_gauge_best,
+            "arms": scale_gauge_arms,
+            "metadata_bpw": 0.0,
+            "runtime": "none; transformed weights are baked into the checkpoint",
+            "warning": "approximately, not exactly, function preserving because tanh is not homogeneous",
+        },
         "expert_local_two_sided_block_hadamard": explicit,
         "warning": "proxy ranking only; this is not SQG, MCG, MXFP4, or a serving format",
     }
@@ -579,6 +670,8 @@ def functional_report(
         source_up,
         row_weights=gates.square(),
     )
+    activation = situ_component_geometry(source_gate, source_up)
+    activation_weights = gates.square()
     residual_decomposition = pair_residual_decomposition(
         inputs, source, candidate, route_gates=gates
     )
@@ -720,6 +813,43 @@ def functional_report(
         "rows": int(inputs.shape[0]),
         "documents": int(torch.unique(rows["documents"]).numel()),
         "weight_distortion": weight_metrics,
+        "section_5_0_activation_geometry": {
+            "normalized_gate": {
+                "quantiles": _quantiles(activation.normalized_gate),
+                "route_weighted_moments": _weighted_moments(
+                    activation.normalized_gate, activation_weights
+                ),
+            },
+            "normalized_up": {
+                "quantiles": _quantiles(activation.normalized_up),
+                "route_weighted_moments": _weighted_moments(
+                    activation.normalized_up, activation_weights
+                ),
+            },
+            "gate_factor_derivative": {
+                "quantiles": _quantiles(activation.gate_derivative),
+                "route_weighted_moments": _weighted_moments(
+                    activation.gate_derivative, activation_weights
+                ),
+            },
+            "up_factor_derivative": {
+                "quantiles": _quantiles(activation.up_derivative),
+                "route_weighted_moments": _weighted_moments(
+                    activation.up_derivative, activation_weights
+                ),
+                "route_weighted_fraction_at_least": {
+                    "0.90": _weighted_fraction(
+                        activation.up_derivative >= 0.90, activation_weights
+                    ),
+                    "0.95": _weighted_fraction(
+                        activation.up_derivative >= 0.95, activation_weights
+                    ),
+                    "0.99": _weighted_fraction(
+                        activation.up_derivative >= 0.99, activation_weights
+                    ),
+                },
+            },
+        },
         "section_5_1_pair_geometry": {
             "small_eigenvalue_fraction": _quantiles(pair_summary.small_eigenvalue_fraction),
             "condition_number": _quantiles(pair_summary.condition_number),
@@ -783,12 +913,30 @@ def functional_report(
 
 
 def _basis_curve(vectors: torch.Tensor, maximum_rank: int = 8) -> dict[str, float]:
-    singular = torch.linalg.svdvals(vectors.float())
-    energy = singular.double().square()
+    measured = vectors.float()
+    gram = measured @ measured.T
+    energy = torch.linalg.eigvalsh(gram).double().clamp_min_(0).flip(0)
     total = energy.sum().clamp_min(1e-30)
     return {
         str(rank): float(1.0 - energy[:rank].sum() / total)
         for rank in range(1, min(maximum_rank, vectors.shape[0]) + 1)
+    }
+
+
+def _batched_basis_curve(
+    vectors: torch.Tensor, maximum_rank: int = 8
+) -> dict[str, float]:
+    """Return aggregate residual energy for one basis fitted per first axis."""
+
+    if vectors.ndim != 3 or vectors.shape[1] < 2:
+        raise ValueError("batched basis vectors must be [groups, samples, features]")
+    measured = vectors.float()
+    gram = measured @ measured.transpose(1, 2)
+    energy = torch.linalg.eigvalsh(gram).double().clamp_min_(0).flip(1)
+    total = energy.sum().clamp_min(1e-30)
+    return {
+        str(rank): float(1.0 - energy[:, :rank].sum() / total)
+        for rank in range(1, min(maximum_rank, vectors.shape[1]) + 1)
     }
 
 
@@ -831,6 +979,8 @@ def cross_expert_report(
 
     raw_vectors = []
     aligned_vectors = []
+    raw_neuron_vectors = []
+    aligned_neuron_vectors = []
     for triplet, sign, alignment in zip(triplets, signs, alignments):
         raw = torch.cat(
             (
@@ -854,8 +1004,22 @@ def cross_expert_report(
         )
         raw_vectors.append(raw.reshape(-1))
         aligned_vectors.append(aligned.reshape(-1))
+        raw_neuron_vectors.append(raw)
+        aligned_neuron_vectors.append(aligned)
     raw_matrix = torch.stack(raw_vectors)
     aligned_matrix = torch.stack(aligned_vectors)
+    raw_by_neuron = torch.stack(raw_neuron_vectors, dim=1)
+    aligned_by_neuron = torch.stack(aligned_neuron_vectors, dim=1)
+    null_generator = torch.Generator().manual_seed(seed + 65537 * layer)
+    isotropic_null = torch.randn(
+        aligned_by_neuron.shape, generator=null_generator
+    )
+    null_energy = isotropic_null.square().sum(dim=(1, 2)).clamp_min_(1e-30)
+    real_energy = aligned_by_neuron.square().sum(dim=(1, 2))
+    isotropic_null *= (real_energy / null_energy).sqrt()[:, None, None]
+    null_curve = _batched_basis_curve(isotropic_null)
+    aligned_neuron_curve = _batched_basis_curve(aligned_by_neuron)
+    maximum_rank = min(8, len(experts))
     return {
         "kind": KIND,
         "stage": "cross",
@@ -873,9 +1037,27 @@ def cross_expert_report(
         "sampled_shared_basis": {
             "raw_residual_fraction_by_rank": _basis_curve(raw_matrix),
             "aligned_residual_fraction_by_rank": _basis_curve(aligned_matrix),
+            "raw_per_neuron_residual_fraction_by_rank": _batched_basis_curve(
+                raw_by_neuron
+            ),
+            "aligned_per_neuron_residual_fraction_by_rank": aligned_neuron_curve,
+            "isotropic_null_per_neuron_residual_fraction_by_rank": null_curve,
+            "aligned_per_neuron_excess_captured_fraction_over_null": {
+                rank: float(null_curve[rank] - aligned_neuron_curve[rank])
+                for rank in aligned_neuron_curve
+            },
             "fp8_basis_rate_bpw": {
                 str(rank): float(8 * rank / C.NUM_EXPERTS)
-                for rank in range(1, min(8, len(experts)) + 1)
+                for rank in range(1, maximum_rank + 1)
+            },
+            "int8_per_neuron_coefficient_rate_bpw": {
+                str(rank): float(
+                    8
+                    * rank
+                    * triplets[0].intermediate
+                    / sum(value.numel() for value in triplets[0].tensors())
+                )
+                for rank in range(1, maximum_rank + 1)
             },
             "sampling_warning": "basis curve is a deterministic coordinate sketch, not a full-weight factorization",
         },
@@ -1040,6 +1222,9 @@ def summarize(dest: Path) -> dict[str, Any]:
         return result
 
     signals = {
+        "normalized_gate_rms": values(("section_5_0_activation_geometry", "normalized_gate", "route_weighted_moments", "rms")),
+        "normalized_up_rms": values(("section_5_0_activation_geometry", "normalized_up", "route_weighted_moments", "rms")),
+        "up_derivative_fraction_ge_099": values(("section_5_0_activation_geometry", "up_factor_derivative", "route_weighted_fraction_at_least", "0.99")),
         "w1_w3_residual_cancellation": values(("section_5_1_pair_geometry", "candidate_residual", "joint_over_separate")),
         "metric_pair_codebook_improvement": values(("section_5_1_pair_geometry", "pair_codebook", "functional_improvement")),
         "post_rms_radial_fraction": values(("section_5_3_post_rms_geometry", "radial_fraction")),
@@ -1050,6 +1235,8 @@ def summarize(dest: Path) -> dict[str, Any]:
         "input_diagonal_2bit_improvement": values(("exact_transform_2bit_proxy", "common_input_diagonal_gauge", "post_projection_sse_improvement_vs_baseline")),
         "postactivation_down_2bit_improvement": values(("exact_transform_2bit_proxy", "exact_postactivation_equilibration", "down_only_expert_sse_improvement")),
         "temperature_2bit_improvement": values(("exact_transform_2bit_proxy", "temperature_equilibration", "post_projection_sse_improvement_vs_baseline")),
+        "approximate_w3_w2_scale_gauge_2bit_improvement": values(("exact_transform_2bit_proxy", "approximate_w3_w2_scale_gauge", "best", "post_projection_sse_improvement_vs_baseline")),
+        "approximate_w3_w2_scale_gauge_full_precision_relative_sse": values(("exact_transform_2bit_proxy", "approximate_w3_w2_scale_gauge", "best", "full_precision_expert_relative_sse")),
         "expert_local_hadamard_2bit_improvement": values(("exact_transform_2bit_proxy", "expert_local_two_sided_block_hadamard", "post_projection_sse_improvement_vs_baseline")),
     }
     medians = {
@@ -1065,6 +1252,7 @@ def summarize(dest: Path) -> dict[str, Any]:
         "input_diagonal_2bit_improvement",
         "postactivation_down_2bit_improvement",
         "temperature_2bit_improvement",
+        "approximate_w3_w2_scale_gauge_2bit_improvement",
         "expert_local_hadamard_2bit_improvement",
     ):
         median = medians[name]
