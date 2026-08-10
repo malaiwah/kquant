@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 
-from kquant.correctness import (
+from qsrt.correctness import (
     assert_gpus_idle,
     assert_port_free,
     git_state,
@@ -28,15 +28,15 @@ from kquant.correctness import (
     select_gpu_uuids,
     sha256_file,
 )
-from kquant.kernel_audit import KERNEL_PATHS, audit_kernel_path
-from kquant.kld_capture import (
+from qsrt.kernel_audit import KERNEL_PATHS, audit_kernel_path
+from qsrt.kld_capture import (
     atomic_write_json,
     load_json_object,
     prepare_suite_workspace,
     validate_finalized_manifest,
     validate_reference_root,
 )
-from kquant.kld_gate import (
+from qsrt.kld_gate import (
     CANONICAL_EVALUATION_TOOLS_COMMIT,
     CANONICAL_REFERENCE_DATASET,
     CANONICAL_REFERENCE_DATASET_REVISION,
@@ -134,9 +134,9 @@ def build_server_environment(
 ) -> dict[str, str]:
     env = os.environ.copy()
     for name in (
-        "K3_KQUANT_CAPTURE_DIR",
-        "VLLM_KQUANT_CAPTURE_DIR",
-        "VLLM_KQUANT_FINALIZE_FILE",
+        "K3_QSRT_CAPTURE_DIR",
+        "VLLM_QSRT_CAPTURE_DIR",
+        "VLLM_QSRT_FINALIZE_FILE",
     ):
         env.pop(name, None)
     env.update(
@@ -260,14 +260,14 @@ def main() -> int:
     comparison_path = output_dir / "kld-vs-full-mxfp4.json"
 
     repo_roots = {
-        "kquant": Path(__file__).resolve().parents[1],
+        "qsrt": Path(__file__).resolve().parents[1],
         "vllm": args.vllm_dir.resolve(),
         "b12x": args.b12x_dir.resolve(),
         "exllamav3": args.exllamav3_dir.resolve(),
     }
     runtime: dict[str, Any] = {
         "schema_version": 1,
-        "kind": "kquant_kimi_k3_kld_capture_runtime",
+        "kind": "qsrt_kimi_k3_kld_capture_runtime",
         "run_name": args.run_name,
         "started_at": datetime.now().astimezone().isoformat(),
         "tp_size": args.tp_size,
@@ -287,7 +287,7 @@ def main() -> int:
     }
     result: dict[str, Any] = {
         "schema_version": 1,
-        "kind": "kquant_kimi_k3_kld_capture",
+        "kind": "qsrt_kimi_k3_kld_capture",
         "run_name": args.run_name,
         "output_dir": str(output_dir),
         "status": "starting",
@@ -323,7 +323,7 @@ def main() -> int:
         "B12X_MOE_REPEAT_CHECK",
         "B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START",
         "B12X_MOE_REPEAT_CHECK_MAX_REPORTS",
-        "VLLM_KQUANT_TRELLIS_W4A8",
+        "VLLM_QSRT_TRELLIS_W4A8",
     )
     runtime["server_environment"] = {
         name: env[name] for name in recorded_env_names if name in env

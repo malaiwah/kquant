@@ -7,7 +7,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-CORPUS_KIND = "kquant_interim_calibration_corpus_run"
+CORPUS_KIND = "qsrt_interim_calibration_corpus_run"
 
 
 def _is_digest(value: object, *, bytes_: int = 16) -> bool:
@@ -179,7 +179,7 @@ def validate_reports(paths: list[Path]) -> dict:
                     }
                 )
     return {
-        "kind": "kquant_calibration_corpus_plan_validation",
+        "kind": "qsrt_calibration_corpus_plan_validation",
         "schema_version": 1,
         "status": "pass" if not all_issues else "fail",
         "reports": summaries,

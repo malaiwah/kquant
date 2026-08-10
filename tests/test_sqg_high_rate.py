@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kquant.sqg_high_rate import (
+from qsrt.sqg_high_rate import (
     SQG_FP16_D3L_DESCRIPTOR_BYTES,
     SQG_FP16_D3L_DESCRIPTOR_SHA256,
     decode_fp16_dyadic_linear_rank_law,
@@ -17,8 +17,8 @@ from kquant.sqg_high_rate import (
     sqg_normal_rank_fp16,
     sqg_normal_rank_fp16_d3l,
 )
-from kquant.qsrt_codec_pilot import tensor_sha256
-from kquant.sqg_e4m3 import sqg_xor_rank_permutation
+from qsrt.qsrt_codec_pilot import tensor_sha256
+from qsrt.sqg_e4m3 import sqg_xor_rank_permutation
 
 
 @pytest.mark.parametrize("bits", (5, 6))

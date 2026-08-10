@@ -7,7 +7,7 @@ import argparse
 import time
 from pathlib import Path
 
-from kquant.capture import build_layer_sample_cache
+from qsrt.capture import build_layer_sample_cache
 
 
 def main() -> None:

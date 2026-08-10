@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from kquant.trace_compare import (
+from qsrt.trace_compare import (
     TraceFormatError,
     compare_traces,
     load_trace,

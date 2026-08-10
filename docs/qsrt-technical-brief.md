@@ -52,16 +52,16 @@ entropy-coded hot streams remain outside the supported surface.
 
 ## Encoder ownership
 
-QSRT's offline implementation is owned by kquant. The mixed-rate dense-H
-BlockLDLQ backend is `kquant/exl3_encoder_backend.py`; SQG label generation,
+This repository owns QSRT's offline implementation. The mixed-rate dense-H
+BlockLDLQ backend is `qsrt/exl3_encoder_backend.py`; SQG label generation,
 packed traceback, tail-biting Viterbi, and its CUDA sources live under
-`kquant/sqg_e4m3.py`, `kquant/sqg_quantizer.py`, and `kquant/csrc`.
+`qsrt/sqg_e4m3.py`, `qsrt/sqg_quantizer.py`, and `qsrt/csrc`.
 
 The ExLlamaV3 checkout is an unmodified upstream dependency. It supplies only
 the established EXL packing, Hadamard, and tensor utilities used by the
 encoder. No QSRT format, rate-selection, SQG, LDLQ, or CUDA change may be
 carried as a local ExLlamaV3 patch. The exact upstream-derived source retained
-in kquant is covered by `THIRD_PARTY_NOTICES.md`.
+here is covered by `THIRD_PARTY_NOTICES.md`.
 
 ## QSRT-E4M3 reconstruction
 
@@ -206,9 +206,9 @@ $$
 $$
 
 The authoritative construction is implemented independently in
-`kquant/sqg_e4m3.py` and B12X. kquant generates the 4,096-byte staircase and
+`qsrt/sqg_e4m3.py` and B12X. QSRT generates the 4,096-byte staircase and
 complete K2/K3/K4 direct encoder labels and passes them through
-`kquant/sqg_quantizer.py`; B12X evaluates the same immutable construction at
+`qsrt/sqg_quantizer.py`; B12X evaluates the same immutable construction at
 runtime. Frozen SHA-256 checks over the T12 table and all three 65,536-byte
 direct tables make cross-repository drift fail in unit tests. A payload
 encoded under a different graph cannot be relabelled in place because
@@ -522,7 +522,7 @@ addressing and no coefficient-level rate branch. Rank-local prepared buffers
 are disposable caches and are never checkpoint files.
 
 The canonical implementation and byte-accounting reference are in
-`kquant/qsrt_storage.py`.
+`qsrt/qsrt_storage.py`.
 
 ### Fixed high-rate `atoms_v2` profile
 
@@ -564,7 +564,7 @@ intermediate channels. The canonical expert-layer container size is
 1,051,056,799,744 bytes across 92 layers, including safetensors headers and row
 padding. Load preparation removes the group layout into a disposable compact
 P33/P43 operand pool. The canonical layout and exact accounting are in
-`kquant/qsrt_atoms_v2.py`.
+`qsrt/qsrt_atoms_v2.py`.
 
 ### Uniform-K2 coupled `atoms_v2` profile
 
@@ -642,8 +642,8 @@ activation tensors, and it does not branch on a rate mode or tile-local
 codebook. Load preparation expands the deterministic intermediate signs for
 the local experts and converts the atom rows into the W4A16 operand layout.
 The canonical implementation and byte accounting are in
-`kquant/qsrt_coupled.py`, `kquant/qsrt_coupled_plan.py`, and
-`kquant/qsrt_atoms_v2.py`.
+`qsrt/qsrt_coupled.py`, `qsrt/qsrt_coupled_plan.py`, and
+`qsrt/qsrt_atoms_v2.py`.
 
 ## Dense-H encoding and statistical selection
 
@@ -730,8 +730,8 @@ groups. Equal divisors produce identical local shapes; other shard counts use
 the same bounded uneven partition and optional cache padding as the QSRT atom
 reader. The checkpoint never stores a rank count or rank-local X4T copy.
 
-The scalar scale codec remains `kquant/mxfp4_scale_codec.py`. The existing
-full-matrix `kquant/x4t.py` layer container is the canonical exact endpoint.
+The scalar scale codec remains `qsrt/mxfp4_scale_codec.py`. The existing
+full-matrix `qsrt/x4t.py` layer container is the canonical exact endpoint.
 
 ### X4T runtime refinement
 

@@ -3,8 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from kquant import constants as C
-from kquant.pack.qsrt_allocation import (
+from qsrt import constants as C
+from qsrt.pack.qsrt_allocation import (
     choose_qsrt_lagrangian,
     choose_qsrt_target,
     qsrt_total_container_bytes,

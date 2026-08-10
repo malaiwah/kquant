@@ -6,8 +6,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from kquant.exl3_reference import reconstruct_trellis_states
-from kquant.qsrt import (
+from qsrt.exl3_reference import reconstruct_trellis_states
+from qsrt.qsrt import (
     EXPERT_TRELLIS_BYTES,
     EXPERTS_PER_LAYER,
     FORMAT_SECTION_BYTES,
@@ -75,7 +75,7 @@ from kquant.qsrt import (
     unpack_trellis_edges,
     unpack_trellis_states,
 )
-from kquant.tp_simulator import situ
+from qsrt.tp_simulator import situ
 
 
 def test_mode_schedules_are_fixed_rate_pairs() -> None:

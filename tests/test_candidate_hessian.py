@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from kquant.candidate_hessian import (
+from qsrt.candidate_hessian import (
     adaptive_identity_shrinkage,
     covariance_comparison,
     partition_documents,

@@ -5,10 +5,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import kquant.pack.qsrt_candidates as packed_candidates
+import qsrt.pack.qsrt_candidates as packed_candidates
 
-from kquant.capture import LayerSamples
-from kquant.qsrt_candidates import (
+from qsrt.capture import LayerSamples
+from qsrt.qsrt_candidates import (
     activation_block_contexts,
     functional_sse_by_request,
     index_expert_rows,
@@ -20,8 +20,8 @@ from kquant.qsrt_candidates import (
     select_phase1_mode,
     select_phase1_rate_pair,
 )
-from kquant.qsrt import INTERMEDIATE_CHANNELS, RECORDS_PER_EXPERT
-from kquant.pack.qsrt_candidates import (
+from qsrt.qsrt import INTERMEDIATE_CHANNELS, RECORDS_PER_EXPERT
+from qsrt.pack.qsrt_candidates import (
     _candidate_middle_by_r13,
     _conditional_h2_by_r13,
     _defer_functional_row_sse,
@@ -85,7 +85,7 @@ def test_partition_requests_is_disjoint_and_complete() -> None:
 
 def test_request_documents_can_drop_repeated_capture_epochs() -> None:
     report = {
-        "kind": "kquant_interim_calibration_corpus_run",
+        "kind": "qsrt_interim_calibration_corpus_run",
         "finalized": True,
         "planned_requests": 3,
         "completed_requests": 3,

@@ -4,7 +4,7 @@ import pytest
 import torch
 from safetensors import safe_open
 
-from kquant.x4t import (
+from qsrt.x4t import (
     X4T_LAYER_FIXED_BYTES,
     X4T_MATRIX_ORDER,
     X4T_SAFETENSORS_SCHEMA,
@@ -22,7 +22,7 @@ from kquant.x4t import (
 def _production_matrix(
     matrix: str, *, packed_seed: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from kquant import constants as C
+    from qsrt import constants as C
 
     out_features, in_features = C.EXPERT_SHAPES[matrix]
     generator = torch.Generator().manual_seed(packed_seed)

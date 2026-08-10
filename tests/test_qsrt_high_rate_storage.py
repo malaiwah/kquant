@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from kquant.pack.qsrt_atoms_v2 import (
+from qsrt.pack.qsrt_atoms_v2 import (
     assemble_candidate_records,
     assemble_coupled_k2_atoms,
     assemble_record_pair_atoms,
@@ -12,7 +12,7 @@ from kquant.pack.qsrt_atoms_v2 import (
     unpack_local_scale_rate_records,
     unpack_matrix_rate_records,
 )
-from kquant.qsrt import (
+from qsrt.qsrt import (
     FIXED_HIGH_RATE_RECORD_BITS,
     H308,
     K2,
@@ -20,7 +20,7 @@ from kquant.qsrt import (
     PackedQSRTTrellis,
     QSRTTrellisDescriptor,
 )
-from kquant.qsrt_atoms_v2 import (
+from qsrt.qsrt_atoms_v2 import (
     BASE_PHYSICAL_TO_LOGICAL_RECORD,
     K3_RECORDS,
     K4_RECORDS,

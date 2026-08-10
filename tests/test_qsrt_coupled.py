@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import torch
 
-from kquant.coupled_expert_study import (
+from qsrt.coupled_expert_study import (
     CoupledTriplet,
     encode_coupled_block_hadamard,
     execute_coupled_block_hadamard,
 )
-from kquant.qsrt_coupled import (
+from qsrt.qsrt_coupled import (
     CoupledHadamardSpec,
     block_hadamard,
     coupled_execution,
@@ -15,7 +15,7 @@ from kquant.qsrt_coupled import (
     rotation_signs,
     signed_block_hadamard,
 )
-from kquant.tp_simulator import situ
+from qsrt.tp_simulator import situ
 
 
 def test_block_hadamard_preserves_empty_routed_batches() -> None:

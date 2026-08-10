@@ -9,8 +9,8 @@ import json
 import time
 from pathlib import Path
 
-from kquant import constants as C
-from kquant.pack.x4t_index import (
+from qsrt import constants as C
+from qsrt.pack.x4t_index import (
     X4T_COST_COMPLETION_FILENAME,
     build_x4t_cost_layer,
     finalize_x4t_cost_index,
@@ -18,7 +18,7 @@ from kquant.pack.x4t_index import (
     write_x4t_cost_layer,
     x4t_cost_layer_filename,
 )
-from kquant.source_weights import OfficialMXFP4Store
+from qsrt.source_weights import OfficialMXFP4Store
 
 
 def _parse_layers(value: str) -> tuple[int, ...]:

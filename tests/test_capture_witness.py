@@ -115,7 +115,7 @@ def test_capture_witness_matches_epochs_by_content(tmp_path: Path) -> None:
         [calls[call]["routed_latent_reduced"][token] for _, token, call in rows]
     )
     split = torch.zeros(len(rows), dtype=torch.int8)
-    from kquant.blockldlq_proof import capture_validation_split
+    from qsrt.blockldlq_proof import capture_validation_split
 
     split[:] = torch.tensor(
         [capture_validation_split(int(value), 16) for value in observations],

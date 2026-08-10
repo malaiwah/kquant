@@ -7,7 +7,7 @@ import argparse
 import time
 from pathlib import Path
 
-from kquant.capture import build_hessians
+from qsrt.capture import build_hessians
 
 
 def _parse_layers(value: str) -> list[int]:

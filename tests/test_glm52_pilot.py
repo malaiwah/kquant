@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from kquant.glm52_pilot import (
+from qsrt.glm52_pilot import (
     BASELINE_STORED_ERROR_ATOL,
     EXPERTS_PER_LAYER,
     K4_PANEL,

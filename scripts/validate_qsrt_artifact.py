@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-from kquant.pack.qsrt_validate import validate_qsrt_artifact
+from qsrt.pack.qsrt_validate import validate_qsrt_artifact
 
 
 def parse_args() -> argparse.Namespace:

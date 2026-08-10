@@ -7,8 +7,8 @@ import argparse
 import json
 from pathlib import Path
 
-from kquant.correctness import write_json
-from kquant.trace_compare import compare_traces, load_trace, select_trace_call
+from qsrt.correctness import write_json
+from qsrt.trace_compare import compare_traces, load_trace, select_trace_call
 
 
 def build_parser() -> argparse.ArgumentParser:

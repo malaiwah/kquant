@@ -8,10 +8,10 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from kquant import constants as C
-from kquant.io.safetensors_stream import TensorSpec
-from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3
-from kquant.qsrt import SCHEMA
+from qsrt import constants as C
+from qsrt.io.safetensors_stream import TensorSpec
+from qsrt.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3
+from qsrt.qsrt import SCHEMA
 import scripts.pack_qsrt_candidates as pack_script
 from scripts.pack_qsrt_candidates import (
     _ScheduleJob,
@@ -81,7 +81,7 @@ def test_candidate_manifest_embeds_rotation_plan_contents(tmp_path) -> None:
     args.rotation_plan.write_text(
         json.dumps(
             {
-                "kind": "kquant_qsrt_rotation_plan",
+                "kind": "qsrt_rotation_plan",
                 "schema_version": 1,
                 "layers": {
                     "12": {

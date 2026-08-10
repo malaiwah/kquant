@@ -7,7 +7,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from kquant.kimi_stream import (
+from qsrt.kimi_stream import (
     IndexedSafetensors,
     StreamState,
     assign_parameter,
@@ -17,7 +17,7 @@ from kquant.kimi_stream import (
     write_trace_manifest,
     write_trace_tensor,
 )
-from kquant.trace_compare import load_trace
+from qsrt.trace_compare import load_trace
 
 
 def _indexed_tensor(tmp_path: Path) -> tuple[IndexedSafetensors, torch.Tensor]:

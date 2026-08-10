@@ -9,8 +9,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from kquant.correctness import sha256_file
-from kquant.kld_gate import (
+from qsrt.correctness import sha256_file
+from qsrt.kld_gate import (
     CANONICAL_EVALUATION_TOOLS_COMMIT,
     CANONICAL_REFERENCE_DATASET,
     CANONICAL_REFERENCE_DATASET_REVISION,

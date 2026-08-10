@@ -11,7 +11,7 @@ def _report(path: Path, *, document_hash: str, prompt_hash: str) -> None:
     path.write_text(
         json.dumps(
             {
-                "kind": "kquant_interim_calibration_corpus_run",
+                "kind": "qsrt_interim_calibration_corpus_run",
                 "planned_requests": 1,
                 "planned_tokens": 64,
                 "target_tokens": 64,

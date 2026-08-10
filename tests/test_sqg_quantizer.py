@@ -4,11 +4,11 @@ from types import SimpleNamespace
 
 import torch
 
-import kquant.sqg_quantizer as sqg_quantizer
-from kquant.sqg_quantizer import install_sqg_quantizer
+import qsrt.sqg_quantizer as sqg_quantizer
+from qsrt.sqg_quantizer import install_sqg_quantizer
 
 
-def test_rate_specific_none_dispatches_to_kquant_mcg(monkeypatch) -> None:
+def test_rate_specific_none_dispatches_to_qsrt_mcg(monkeypatch) -> None:
     calls: list[tuple[torch.Tensor, dict]] = []
     procedural_calls: list[tuple] = []
 

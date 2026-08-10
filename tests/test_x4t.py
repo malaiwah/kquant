@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kquant.x4t import (
+from qsrt.x4t import (
     X4T_POSITION_BITS,
     effective_x4t_bpw,
     pack_x4t_scale_components,

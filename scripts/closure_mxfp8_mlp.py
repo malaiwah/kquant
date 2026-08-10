@@ -31,8 +31,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kquant.correctness import write_json
-from kquant.tp_simulator import comparison_metrics, situ
+from qsrt.correctness import write_json
+from qsrt.tp_simulator import comparison_metrics, situ
 
 MXFP8_BLOCK_SIZE = 32
 

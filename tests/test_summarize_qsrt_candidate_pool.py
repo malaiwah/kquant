@@ -7,7 +7,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from kquant.qsrt import (
+from qsrt.qsrt import (
     CODEBOOK_SQG_NORMAL_E4M3,
     INTERMEDIATE_CHANNELS,
     LATENT_CHANNELS,
@@ -15,7 +15,7 @@ from kquant.qsrt import (
     SCHEMA,
     QSRTTrellisDescriptor,
 )
-from kquant.pack.qsrt_candidates import (
+from qsrt.pack.qsrt_candidates import (
     CANDIDATE_POOL_KIND,
     CANDIDATE_POOL_SCHEMA_VERSION,
     OFFICIAL_SOURCE_DAMAGE_METRIC,

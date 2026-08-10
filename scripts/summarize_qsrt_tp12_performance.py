@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-from kquant.tp12_performance_gate import (
+from qsrt.tp12_performance_gate import (
     TP12PerformanceThresholds,
     summarize_tp12_performance,
 )

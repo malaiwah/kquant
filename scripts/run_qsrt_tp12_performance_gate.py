@@ -11,7 +11,7 @@ from pathlib import Path
 import shlex
 import subprocess
 
-from kquant.tp12_performance_gate import (
+from qsrt.tp12_performance_gate import (
     TP12PerformanceThresholds,
     select_tp12_performance_layers,
     summarize_tp12_performance,
@@ -20,7 +20,7 @@ from scripts.export_qsrt_tp12_benchmark_fixture import export_fixture
 from scripts.summarize_qsrt_tp12_runtime import summarize_runtime_mix
 
 
-KIND = "kquant_kimi_k3_qsrt_tp12_performance_run"
+KIND = "qsrt_kimi_k3_qsrt_tp12_performance_run"
 SCHEMA_VERSION = 1
 TP_SIZE = 12
 

@@ -9,7 +9,7 @@ import pytest
 from safetensors.torch import save_file
 import torch
 
-from kquant.tp12_performance_gate import (
+from qsrt.tp12_performance_gate import (
     BENCHMARK_KIND,
     BENCHMARK_SCHEMA_VERSION,
     FIXTURE_KIND,
@@ -73,7 +73,7 @@ def _write_fixture(
         "schema_version": FIXTURE_SCHEMA_VERSION,
         "candidate_pool": candidate_pool_value,
         "candidate_pool_sealed": sealed,
-        "candidate_logical_trellis_schema": "kquant_kimi_k3_qsrt_tp12_v0",
+        "candidate_logical_trellis_schema": "qsrt_kimi_k3_qsrt_tp12_v0",
         "candidate_manifest_sha256": candidate_digest,
         "capture": capture_value,
         "capture_manifest_sha256": capture_digest,
@@ -234,7 +234,7 @@ def test_performance_layer_selection_balances_depth_and_hotspots() -> None:
     scores = {layer: 0.0001 * layer for layer in range(1, 93)}
     scores.update({6: 0.9, 24: 0.8, 48: 0.7, 72: 0.6, 92: 0.5})
     runtime_mix = {
-        "kind": "kquant_kimi_k3_qsrt_tp12_runtime_mix",
+        "kind": "qsrt_kimi_k3_qsrt_tp12_runtime_mix",
         "schema_version": 1,
         "candidate_pool_sealed": True,
         "layers": list(range(1, 93)),
@@ -254,7 +254,7 @@ def test_performance_layer_selection_balances_depth_and_hotspots() -> None:
 
 def test_performance_layer_selection_requires_sealed_complete_p24_mix() -> None:
     runtime_mix = {
-        "kind": "kquant_kimi_k3_qsrt_tp12_runtime_mix",
+        "kind": "qsrt_kimi_k3_qsrt_tp12_runtime_mix",
         "schema_version": 1,
         "candidate_pool_sealed": False,
         "layers": [1, 24, 48, 72],

@@ -20,8 +20,8 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
-from kquant.capture import LayerSamples, index_cached_layer_samples, load_layer_hessians
-from kquant.coupled_expert_study import (
+from qsrt.capture import LayerSamples, index_cached_layer_samples, load_layer_hessians
+from qsrt.coupled_expert_study import (
     CoupledTriplet,
     apply_permutation_sign_gauge,
     block_hadamard,
@@ -30,18 +30,18 @@ from kquant.coupled_expert_study import (
     hadamard_rotation_signs,
     signed_block_hadamard,
 )
-from kquant.exl3_loader import load_qsrt_encoder
-from kquant.exl3_reference import (
+from qsrt.exl3_loader import load_qsrt_encoder
+from qsrt.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     _blockwise_hadamard_left,
     _blockwise_hadamard_right,
     decode_regularized_weight,
     decode_qsrt_regularized_weight,
 )
-from kquant.ldlq import SIGMA_REG, make_shared_h
-from kquant.pack.qsrt_encoder import plan_qsrt_matrix
-from kquant.qsrt import RATE_TRANSFER_MODES, expand_group_order
-from kquant.qsrt_candidates import (
+from qsrt.ldlq import SIGMA_REG, make_shared_h
+from qsrt.pack.qsrt_encoder import plan_qsrt_matrix
+from qsrt.qsrt import RATE_TRANSFER_MODES, expand_group_order
+from qsrt.qsrt_candidates import (
     PERMUTATION_POLICIES,
     PermutationPolicy,
     build_expert_hessians,
@@ -51,15 +51,15 @@ from kquant.qsrt_candidates import (
     request_documents,
     select_expert_rows,
 )
-from kquant.source_weights import OfficialMXFP4Store
-from kquant.sqg_e4m3 import (
+from qsrt.source_weights import OfficialMXFP4Store
+from qsrt.sqg_e4m3 import (
     sqg_cheb_normal_rank_e4m3_bytes,
     sqg_xor_cheb_t12_bytes,
     sqg_xor_cheb_t12_rank_lut_bytes,
     sqg_xor_rank_permutation,
 )
-from kquant.sqg_quantizer import install_sqg_quantizer
-from kquant.tp_simulator import situ
+from qsrt.sqg_quantizer import install_sqg_quantizer
+from qsrt.tp_simulator import situ
 
 
 MATRICES = ("w1", "w3", "w2")
@@ -5649,7 +5649,7 @@ def run(args: argparse.Namespace) -> dict:
         },
     }
     payload: dict[str, object] = {
-        "kind": "kquant_qsrt_k2_tile_allocation_experiment",
+        "kind": "qsrt_k2_tile_allocation_experiment",
         "schema_version": 2,
         "complete": False,
         "contract": {

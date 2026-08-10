@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 import torch
 
-import kquant.pack.qsrt_mode_validation as qsrt_mode_validation
-from kquant.pack.qsrt_mode_validation import (
+import qsrt.pack.qsrt_mode_validation as qsrt_mode_validation
+from qsrt.pack.qsrt_mode_validation import (
     load_qsrt_mode_validation_summary,
     mode_validation_summary_document,
     validate_mode_validation_layer_metrics,

@@ -152,7 +152,7 @@ def assemble(args: argparse.Namespace) -> dict[str, object]:
         raise
 
     manifest: dict[str, object] = {
-        "kind": "kquant_hf_calibration_text_shard",
+        "kind": "qsrt_hf_calibration_text_shard",
         "schema_version": 1,
         "dataset": args.dataset,
         "revision": args.revision,

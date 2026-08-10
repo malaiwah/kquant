@@ -4,14 +4,14 @@ import numpy as np
 import pytest
 import torch
 
-from kquant import constants as C
-from kquant.pack.qsrt_validation import (
+from qsrt import constants as C
+from qsrt.pack.qsrt_validation import (
     VALIDATION_DAMAGE_METRIC,
     official_expert_output,
     physical_expert_output,
     validate_validation_layer_metrics,
 )
-from kquant.tp_simulator import situ
+from qsrt.tp_simulator import situ
 
 
 def test_physical_expert_output_preserves_common_neuron_permutation() -> None:

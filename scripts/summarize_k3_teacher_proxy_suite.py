@@ -12,8 +12,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kquant.correctness import write_json
-from kquant.teacher_proxy_gate import (
+from qsrt.correctness import write_json
+from qsrt.teacher_proxy_gate import (
     TeacherProxyThresholds,
     compare_teacher_proxy_suite,
 )

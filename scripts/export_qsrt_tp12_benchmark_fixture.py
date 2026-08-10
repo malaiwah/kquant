@@ -5,7 +5,7 @@ The fixture contains no model weights or activations. It binds one completed
 candidate layer and logical TP12 rank to naturally captured top-k routes,
 applied gate weights, and the exact per-expert P24/P33 mode tables. B12X can
 then time identical route batches against a uniform-P33 control without
-depending on kquant's Python package or capture reader.
+depending on QSRT's Python package or capture reader.
 """
 
 from __future__ import annotations
@@ -19,13 +19,13 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file, save_file
 
-from kquant import constants as C
-from kquant.capture import load_layer_samples
-from kquant.qsrt import logical_pair_for_slot
+from qsrt import constants as C
+from qsrt.capture import load_layer_samples
+from qsrt.qsrt import logical_pair_for_slot
 from scripts.summarize_qsrt_candidate_pool import summarize_candidate_pool
 
 
-KIND = "kquant_kimi_k3_qsrt_tp12_benchmark_fixture"
+KIND = "qsrt_kimi_k3_qsrt_tp12_benchmark_fixture"
 TP_SIZE = 12
 SCHEMA_VERSION = 1
 

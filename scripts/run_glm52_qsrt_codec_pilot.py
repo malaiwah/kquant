@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from kquant.glm52_pilot import run_rate_shift_pilot
+from qsrt.glm52_pilot import run_rate_shift_pilot
 
 
 def build_parser() -> argparse.ArgumentParser:

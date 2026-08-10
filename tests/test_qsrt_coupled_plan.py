@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from kquant import constants as C
-from kquant.qsrt_coupled_plan import K2CoupledRotationPlan
-from kquant.qsrt_coupled_plan import select_k2_coupled_draw
+from qsrt import constants as C
+from qsrt.qsrt_coupled_plan import K2CoupledRotationPlan
+from qsrt.qsrt_coupled_plan import select_k2_coupled_draw
 
 
 def _plan() -> K2CoupledRotationPlan:

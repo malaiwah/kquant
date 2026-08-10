@@ -4,7 +4,7 @@ import pytest
 import torch
 from safetensors import safe_open
 
-from kquant.io.safetensors_stream import AtomicSafetensorsWriter, TensorSpec
+from qsrt.io.safetensors_stream import AtomicSafetensorsWriter, TensorSpec
 
 
 def test_streamed_safetensors_round_trip_without_combining_tensors(tmp_path) -> None:

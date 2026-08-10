@@ -133,7 +133,7 @@ def summarize(
     provenance: Mapping[str, object] | None = None
     for path in inputs:
         payload = _read(path)
-        if payload.get("kind") != "kquant_uniform_k_mxfp4_endpoint_study":
+        if payload.get("kind") != "qsrt_uniform_k_mxfp4_endpoint_study":
             raise ValueError(f"{path} is not a uniform-K endpoint study")
         if not payload.get("complete"):
             raise ValueError(f"{path} is incomplete")
@@ -323,7 +323,7 @@ def summarize(
     }
     return {
         "schema_version": 1,
-        "kind": "kquant_sqg_e4m3_validation_summary",
+        "kind": "qsrt_sqg_e4m3_validation_summary",
         "baseline": baseline,
         "candidate": candidate,
         "sources": sources,

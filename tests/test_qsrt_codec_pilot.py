@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kquant.qsrt_codec_pilot import (
+from qsrt.qsrt_codec_pilot import (
     CODEBOOK_MCG,
     UNIFORM_CODEBOOKS,
     FixedAverageRateGeometry,
@@ -16,9 +16,9 @@ from kquant.qsrt_codec_pilot import (
     summarize_mode_selections,
     unpack_uniform_trellis_states,
 )
-from kquant.qsrt import pack_trellis_edges
-from kquant.exl3_reference import reconstruct_trellis_states
-from kquant.exl3_reference import decode_exl3_weight
+from qsrt.qsrt import pack_trellis_edges
+from qsrt.exl3_reference import reconstruct_trellis_states
+from qsrt.exl3_reference import decode_exl3_weight
 
 
 def test_fixed_average_geometry_is_shape_generic_and_exact_3bpw() -> None:

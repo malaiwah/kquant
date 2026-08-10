@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run bounded, resumable CPU studies of coupled Kimi-K3 expert structure.
 
-The numerical machinery lives in :mod:`kquant.coupled_expert_study` and is
+The numerical machinery lives in :mod:`qsrt.coupled_expert_study` and is
 model independent.  This file is deliberately the thin adapter that knows the
 Kimi tensor names, source MXFP4 container, routed capture, and selected QSRT
 candidate layout.  It writes research reports only; it cannot materialize a
@@ -24,9 +24,9 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
 
-from kquant import constants as C
-from kquant.capture import LayerSamples, index_cached_layer_samples
-from kquant.coupled_expert_study import (
+from qsrt import constants as C
+from qsrt.capture import LayerSamples, index_cached_layer_samples
+from qsrt.coupled_expert_study import (
     CoupledTriplet,
     RoutedOutputMetric,
     conditional_entropy_bits,
@@ -55,14 +55,14 @@ from kquant.coupled_expert_study import (
     sparse_fingerprint_alignment,
     temperature_scaled_situ,
 )
-from kquant.io.mxfp4 import scale_factors, unpack_codes
-from kquant.io.stream import load_tensor
-from kquant.pack.qsrt_validation import decode_candidate_matrix
-from kquant.pack.qsrt_encoder import plan_qsrt_matrix
-from kquant.source_weights import OfficialMXFP4Store
+from qsrt.io.mxfp4 import scale_factors, unpack_codes
+from qsrt.io.stream import load_tensor
+from qsrt.pack.qsrt_validation import decode_candidate_matrix
+from qsrt.pack.qsrt_encoder import plan_qsrt_matrix
+from qsrt.source_weights import OfficialMXFP4Store
 
 
-KIND = "kquant_k3_coupled_expert_cpu_study"
+KIND = "qsrt_k3_coupled_expert_cpu_study"
 SCHEMA_VERSION = 1
 DEFAULT_POOL = Path("/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-CANDIDATES-v1")
 DEFAULT_FIT_CACHE = Path(

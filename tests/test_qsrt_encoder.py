@@ -3,12 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kquant.exl3_reference import (
+from qsrt.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
 )
-from kquant.qsrt import (
+from qsrt.qsrt import (
     CONTEXT_GROUP_CHANNELS,
     H308,
     K2,
@@ -17,8 +17,8 @@ from kquant.qsrt import (
     RECORDS_PER_EXPERT,
     record_bits,
 )
-from kquant.sqg_e4m3 import sqg_codebook_bytes
-from kquant.pack.qsrt_encoder import (
+from qsrt.sqg_e4m3 import sqg_codebook_bytes
+from qsrt.pack.qsrt_encoder import (
     QSRTTransformSeeds,
     _qsrt_quant_args,
     default_qsrt_transform_seeds,

@@ -5,12 +5,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from kquant.teacher_proxy import (
+from qsrt.teacher_proxy import (
     DEFAULT_FLOAT_STAGES,
     align_routed_post_situ,
     compare_teacher_proxy_traces,
 )
-from kquant.trace_compare import TraceFormatError, TraceKey, TraceRun
+from qsrt.trace_compare import TraceFormatError, TraceKey, TraceRun
 from scripts.stream_k3_pytorch import LayerCaptures
 
 

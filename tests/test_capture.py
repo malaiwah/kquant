@@ -7,8 +7,8 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-import kquant.capture as capture_module
-from kquant.capture import (
+import qsrt.capture as capture_module
+from qsrt.capture import (
     build_layer_sample_cache,
     build_hessians,
     index_cached_layer_samples,

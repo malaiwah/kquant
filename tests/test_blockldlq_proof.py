@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kquant.blockldlq_proof import (
+from qsrt.blockldlq_proof import (
     block_feedback_targets,
     block_ldl_reference,
     block_objective_from_feedback,

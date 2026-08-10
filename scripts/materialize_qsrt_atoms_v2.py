@@ -9,25 +9,25 @@ import json
 import os
 from pathlib import Path
 
-from kquant import constants as C
-from kquant.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
-from kquant.pack.qsrt_atoms_v2 import (
+from qsrt import constants as C
+from qsrt.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
+from qsrt.pack.qsrt_atoms_v2 import (
     QSRTAtomsV2Reader,
     layer_filename,
     materialize_atoms_v2_layer,
 )
-from kquant.pack.qsrt_pool import (
+from qsrt.pack.qsrt_pool import (
     CANDIDATE_POOL_COMPLETION_FILENAME,
     load_qsrt_candidate_pool,
 )
-from kquant.qsrt import H308, K2, record_bits
-from kquant.qsrt_atoms_v2 import (
+from qsrt.qsrt import H308, K2, record_bits
+from qsrt.qsrt_atoms_v2 import (
     PROFILE,
     PURE_K2_PROFILE,
     QSRTAtomsV2Layout,
     SCHEMA,
 )
-from kquant.qsrt_coupled_plan import K2CoupledRotationPlan
+from qsrt.qsrt_coupled_plan import K2CoupledRotationPlan
 
 
 MANIFEST_FILENAME = "qsrt-manifest.json"
@@ -115,7 +115,7 @@ def main() -> None:
     destination.mkdir(parents=True, exist_ok=True)
     manifest_path = destination / MANIFEST_FILENAME
     manifest = {
-        "kind": "kquant_kimi_k3_qsrt_artifact",
+        "kind": "qsrt_kimi_k3_qsrt_artifact",
         "schema_version": 2,
         "codec": "QSRT",
         "complete": False,
@@ -216,7 +216,7 @@ def main() -> None:
     )
     _atomic_json(manifest_path, manifest)
     completion = {
-        "kind": "kquant_kimi_k3_qsrt_completion",
+        "kind": "qsrt_kimi_k3_qsrt_completion",
         "schema_version": 2,
         "complete": True,
         "manifest": MANIFEST_FILENAME,

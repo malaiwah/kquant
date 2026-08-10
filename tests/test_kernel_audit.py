@@ -1,6 +1,6 @@
 import pytest
 
-from kquant.kernel_audit import audit_kernel_path
+from qsrt.kernel_audit import audit_kernel_path
 
 
 def test_stock_w4a16_audit_requires_ordinary_packed_kernel() -> None:
@@ -27,7 +27,7 @@ def test_stock_w4a16_audit_rejects_hybrid_trellis() -> None:
             "target=some.module.W4A16FusedMoeKernel",
             "attrs={'weight_layout': 'packed'}",
             "repeat implementation=w4a16",
-            "quantization=kquant_hybrid",
+            "quantization=qsrt_hybrid",
             "weight_layout=trellis3_t256",
         )
     )
@@ -44,7 +44,7 @@ def test_stock_w4a16_audit_rejects_hybrid_trellis() -> None:
 def test_hybrid_audit_requires_exl3_trellis_evidence() -> None:
     log = "\n".join(
         (
-            "quantization=kquant_hybrid",
+            "quantization=qsrt_hybrid",
             "allocated w13_exl3_trellis",
             "target=some.module.W4A16FusedMoeKernel",
             "weight_layout=trellis3_t256",
@@ -58,7 +58,7 @@ def test_hybrid_audit_requires_exl3_trellis_evidence() -> None:
 def test_qsrt_audit_requires_canonical_atom_reader() -> None:
     log = "\n".join(
         (
-            "quantization=kquant_hybrid",
+            "quantization=qsrt_hybrid",
             "Loaded QSRT layer 1 shard 0/12: 800 compressed, 96 X4T experts",
             "B12X MoE repeat check: finite=True max_abs=0 "
             "quant_mode=w4a16 implementation=w4a16",
@@ -71,7 +71,7 @@ def test_qsrt_audit_requires_canonical_atom_reader() -> None:
 def test_qsrt_audit_rejects_loader_only_evidence() -> None:
     log = "\n".join(
         (
-            "quantization=kquant_hybrid",
+            "quantization=qsrt_hybrid",
             "Loaded QSRT layer 1 shard 0/12: 800 compressed, 96 X4T experts",
         )
     )

@@ -3,12 +3,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from kquant.pack.x4t_index import (
+from qsrt.pack.x4t_index import (
     X4T_COST_INDEX_SCHEMA_VERSION,
     X4T_COST_LAYER_KIND,
     validate_x4t_cost_layer,
 )
-from kquant.x4t import (
+from qsrt.x4t import (
     X4T_EXPERTS_PER_LAYER,
     X4T_LAYER_FIXED_BYTES,
     X4T_MATRIX_ORDER,

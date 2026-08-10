@@ -295,7 +295,7 @@ def test_excluded_report_inventory_is_authenticated(tmp_path: Path) -> None:
     report.write_text(
         json.dumps(
             {
-                "kind": "kquant_interim_calibration_corpus_run",
+                "kind": "qsrt_interim_calibration_corpus_run",
                 "documents": [
                     {"document_hash": "11" * 16},
                     {"document_hash": "22" * 16},
@@ -316,7 +316,7 @@ def test_excluded_report_inventory_is_authenticated(tmp_path: Path) -> None:
 def test_resume_report_requires_identical_document_plan(tmp_path: Path) -> None:
     report_path = tmp_path / "report.json"
     planned = {
-        "kind": "kquant_interim_calibration_corpus_run",
+        "kind": "qsrt_interim_calibration_corpus_run",
         "schema_version": 1,
         "constraint": "interim only",
         "model_dir": "/models/interim",
@@ -351,7 +351,7 @@ def test_live_capture_requires_explicit_source_and_exact_teacher(
     teacher.mkdir()
     capture.mkdir()
     manifest = {
-        "kind": "kquant_vllm_b12x_capture",
+        "kind": "qsrt_vllm_b12x_capture",
         "source": "pure_qsrt_sqg_xor_cheb_t12",
         "teacher_checkpoint": str(teacher.resolve()),
         "complete": False,

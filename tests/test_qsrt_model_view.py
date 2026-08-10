@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from kquant import constants as C
-from kquant.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
-from kquant.pack.qsrt_allocation import (
+from qsrt import constants as C
+from qsrt.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
+from qsrt.pack.qsrt_allocation import (
     QSRT_ALLOCATION_KIND,
     QSRT_ALLOCATION_SCHEMA_VERSION,
 )
-from kquant.pack.qsrt_model_view import (
+from qsrt.pack.qsrt_model_view import (
     qsrt_atoms_v2_quantization_config,
     qsrt_hybrid_bit_map,
     qsrt_quantization_config,
 )
-from kquant.qsrt import FORMAT_X4T, PHASE1_MODE_IDS
+from qsrt.qsrt import FORMAT_X4T, PHASE1_MODE_IDS
 
 
 def _allocation() -> dict:
@@ -65,7 +65,7 @@ def test_qsrt_atoms_v2_model_view_is_all_qsrt_and_tp_independent() -> None:
         for bits in config["hybrid_bit_map"].values()
     )
     assert config["qsrt"] == {
-        "schema": "kquant_kimi_k3_qsrt_atoms_v2",
+        "schema": "qsrt_kimi_k3_qsrt_atoms_v2",
         "storage_format": "qsrt_atoms_v2",
         "encoding": "qsrt_sqg_e4m3",
         "codebook": "sqg_xor_cheb_t12",

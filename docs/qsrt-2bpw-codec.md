@@ -462,9 +462,9 @@ bases, or refinement bit planes.
 
 The codec is defined by:
 
-- `kquant/sqg_e4m3.py`: edge ranks and the shared E4M3 table;
-- `kquant/sqg_quantizer.py` and `kquant/csrc`: closed-path Viterbi encoding;
-- `kquant/qsrt_coupled.py`: exact coupled Hadamard coordinates;
-- `kquant/qsrt_coupled_plan.py`: expert transform selection;
-- `kquant/exl3_encoder_backend.py`: covariance-aware BlockLDLQ encoding; and
-- `kquant/qsrt_atoms_v2.py`: canonical payload and byte accounting.
+- `qsrt/sqg_e4m3.py`: edge ranks and the shared E4M3 table;
+- `qsrt/sqg_quantizer.py` and `qsrt/csrc`: closed-path Viterbi encoding;
+- `qsrt/qsrt_coupled.py`: exact coupled Hadamard coordinates;
+- `qsrt/qsrt_coupled_plan.py`: expert transform selection;
+- `qsrt/exl3_encoder_backend.py`: covariance-aware BlockLDLQ encoding; and
+- `qsrt/qsrt_atoms_v2.py`: canonical payload and byte accounting.

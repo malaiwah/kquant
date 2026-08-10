@@ -4,7 +4,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from kquant.qsrt import (
+from qsrt.qsrt import (
     EXPERT_TRELLIS_BYTES,
     INTERMEDIATE_CHANNELS,
     LOCAL_SCALE_VECTORS,
@@ -17,14 +17,14 @@ from kquant.qsrt import (
     SCALE_BYTES,
     STORAGE_ALIGNMENT,
 )
-from kquant.pack.qsrt_atoms import (
+from qsrt.pack.qsrt_atoms import (
     QSRTAtomLayerReader,
     QSRTAtomLayerSpec,
     assemble_candidate_atoms,
     materialize_atom_layer,
 )
-from kquant.pack.qsrt_candidates import candidate_tensor_name
-from kquant.qsrt_storage import (
+from qsrt.pack.qsrt_candidates import candidate_tensor_name
+from qsrt.qsrt_storage import (
     ATOMS_PER_EXPERT,
     ATOMS_PER_RECORD_PAIR,
     ATOM_BUNDLE_BYTES,

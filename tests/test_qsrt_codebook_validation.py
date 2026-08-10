@@ -80,7 +80,7 @@ def test_corpus_contract_accepts_validation_fold_nested_in_training_exclusion(
         validation_report=tmp_path / "validation.json",
     )
     common = {
-        "kind": "kquant_interim_calibration_corpus_run",
+        "kind": "qsrt_interim_calibration_corpus_run",
         "finalized": True,
         "model_dir": str(checkpoint),
     }

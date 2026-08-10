@@ -24,8 +24,8 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from kquant import constants as C
-from kquant.capture import (
+from qsrt import constants as C
+from qsrt.capture import (
     LayerSampleIndex,
     LayerSampleCacheIndex,
     index_cached_layer_samples,
@@ -34,13 +34,13 @@ from kquant.capture import (
     load_layer_hessians,
     load_layer_samples,
 )
-from kquant.io.safetensors_stream import AtomicSafetensorsWriter, TensorSpec
-from kquant.exl3_reference import (
+from qsrt.io.safetensors_stream import AtomicSafetensorsWriter, TensorSpec
+from qsrt.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     QSRT_CODEBOOKS,
 )
-from kquant.sqg_quantizer import install_sqg_quantizer
-from kquant.qsrt_candidates import (
+from qsrt.sqg_quantizer import install_sqg_quantizer
+from qsrt.qsrt_candidates import (
     PERMUTATION_POLICIES,
     PHASE1_BOOTSTRAP_REPLICATES,
     PHASE1_MIN_CONFIRMATION_DOCUMENTS,
@@ -50,19 +50,19 @@ from kquant.qsrt_candidates import (
     partition_requests,
     request_documents,
 )
-from kquant.qsrt_rotations import (
+from qsrt.qsrt_rotations import (
     QSRTRotationPlan,
     QSRTLayerRotationPlan,
     load_qsrt_rotation_plan,
 )
-from kquant.qsrt_coupled_plan import (
+from qsrt.qsrt_coupled_plan import (
     K2CoupledDrawSelection,
     K2CoupledRotationPlan,
     PRODUCTION_SELECTION,
     load_k2_coupled_rotation_plan,
     select_k2_coupled_draw,
 )
-from kquant.qsrt import (
+from qsrt.qsrt import (
     FIXED_HIGH_RATE_TRELLIS_BYTES,
     H308,
     K2,
@@ -78,7 +78,7 @@ from kquant.qsrt import (
     SCHEMA as QSRT_SCHEMA,
     resolve_mode,
 )
-from kquant.pack.qsrt_candidates import (
+from qsrt.pack.qsrt_candidates import (
     CANDIDATE_POOL_KIND,
     CANDIDATE_POOL_SCHEMA_VERSION,
     HESSIAN_POLICIES,
@@ -87,12 +87,12 @@ from kquant.pack.qsrt_candidates import (
     encode_phase1_expert_batch,
     selected_candidate_tensors,
 )
-from kquant.pack.qsrt_encoder import (
+from qsrt.pack.qsrt_encoder import (
     MATRICES,
     MIXED_SEARCH_LAYOUTS,
     qsrt_transform_seed_draw,
 )
-from kquant.source_weights import OfficialMXFP4Store
+from qsrt.source_weights import OfficialMXFP4Store
 
 
 DEFAULT_PARALLEL_WORKERS = 12
@@ -858,7 +858,7 @@ def _validate_training_contract(
 
 def _validate_sample_cache_contract(sample_cache: Path, capture: Path) -> None:
     manifest = _read_json(sample_cache / "manifest.json")
-    if manifest.get("kind") != "kquant_layer_sample_cache":
+    if manifest.get("kind") != "qsrt_layer_sample_cache":
         raise ValueError(f"{sample_cache} is not a layer sample cache")
     source = Path(str(manifest.get("source_capture", ""))).resolve()
     if source != capture.resolve():
@@ -868,7 +868,7 @@ def _validate_sample_cache_contract(sample_cache: Path, capture: Path) -> None:
 def _load_quantizer_module(root: Path, codebook: str = CODEBOOK_SQG_XOR_CHEB_T12):
     # Import only the encoder namespace.  The full exllamav3 package pulls in
     # serving/tokenizer dependencies that are intentionally absent here.
-    from kquant.exl3_loader import load_qsrt_encoder
+    from qsrt.exl3_loader import load_qsrt_encoder
 
     module = load_qsrt_encoder(root)
     if codebook in QSRT_CODEBOOKS:

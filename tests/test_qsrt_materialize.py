@@ -6,21 +6,21 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from kquant import constants as C
-from kquant.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
-from kquant.qsrt import PHASE1_MODE_IDS
-from kquant.pack.qsrt_pool import QSRTCandidatePool
-from kquant.pack.qsrt_allocation import (
+from qsrt import constants as C
+from qsrt.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
+from qsrt.qsrt import PHASE1_MODE_IDS
+from qsrt.pack.qsrt_pool import QSRTCandidatePool
+from qsrt.pack.qsrt_allocation import (
     choose_qsrt_lagrangian,
     make_qsrt_fixed_allocation,
     qsrt_allocation_document,
 )
-from kquant.pack.qsrt_materialize import (
+from qsrt.pack.qsrt_materialize import (
     qsrt_materialization_build_document,
     qsrt_structural_layer_closure,
     validate_qsrt_materialization_allocation,
 )
-from kquant.pack.x4t_index import (
+from qsrt.pack.x4t_index import (
     X4T_COST_COMPLETION_FILENAME,
     X4T_COST_MANIFEST_FILENAME,
     X4TCostIndex,

@@ -12,19 +12,19 @@ from pathlib import Path
 import numpy as np
 from safetensors.numpy import load_file
 
-from kquant import constants as C
-from kquant.pack.qsrt_allocation import (
+from qsrt import constants as C
+from qsrt.pack.qsrt_allocation import (
     make_qsrt_fixed_allocation,
     qsrt_allocation_document,
     write_qsrt_allocation,
 )
-from kquant.pack.qsrt_pool import load_qsrt_candidate_pool
-from kquant.pack.qsrt_validation import (
+from qsrt.pack.qsrt_pool import load_qsrt_candidate_pool
+from qsrt.pack.qsrt_validation import (
     VALIDATION_DAMAGE_METRIC,
     VALIDATION_DAMAGE_WEIGHTING,
     load_qsrt_validation_scores,
 )
-from kquant.pack.x4t_index import load_x4t_cost_index
+from qsrt.pack.x4t_index import load_x4t_cost_index
 
 
 def _sha256(path: Path) -> str:

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import kquant.kld_capture as capture
-from kquant.correctness import sha256_file
+import qsrt.kld_capture as capture
+from qsrt.correctness import sha256_file
 from scripts.run_k3_kld_capture import build_server_environment
 
 
@@ -126,10 +126,10 @@ def test_atomic_write_json_replaces_complete_document(tmp_path: Path) -> None:
 def test_kld_server_environment_is_capture_only_and_sets_tp_size(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("K3_KQUANT_CAPTURE_DIR", "/bad/calibration")
-    monkeypatch.setenv("VLLM_KQUANT_CAPTURE_DIR", "/bad/calibration")
+    monkeypatch.setenv("K3_QSRT_CAPTURE_DIR", "/bad/calibration")
+    monkeypatch.setenv("VLLM_QSRT_CAPTURE_DIR", "/bad/calibration")
     monkeypatch.setenv("B12X_MOE_FORCE_A16", "0")
-    monkeypatch.setenv("VLLM_KQUANT_TRELLIS_W4A8", "1")
+    monkeypatch.setenv("VLLM_QSRT_TRELLIS_W4A8", "1")
     gpus = [f"GPU-{index}" for index in range(8)]
 
     env = build_server_environment(
@@ -155,6 +155,6 @@ def test_kld_server_environment_is_capture_only_and_sets_tp_size(
     assert env["B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START"] == "1"
     assert env["B12X_MOE_REPEAT_CHECK_MAX_REPORTS"] == "1"
     assert env["B12X_MOE_FORCE_A16"] == "0"
-    assert env["VLLM_KQUANT_TRELLIS_W4A8"] == "1"
-    assert "K3_KQUANT_CAPTURE_DIR" not in env
-    assert "VLLM_KQUANT_CAPTURE_DIR" not in env
+    assert env["VLLM_QSRT_TRELLIS_W4A8"] == "1"
+    assert "K3_QSRT_CAPTURE_DIR" not in env
+    assert "VLLM_QSRT_CAPTURE_DIR" not in env

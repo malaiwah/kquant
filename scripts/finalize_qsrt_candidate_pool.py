@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from kquant.pack.qsrt_pool import (
+from qsrt.pack.qsrt_pool import (
     CANDIDATE_POOL_COMPLETION_FILENAME,
     candidate_pool_completion_document,
     load_qsrt_candidate_pool,

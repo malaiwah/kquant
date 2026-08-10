@@ -8,8 +8,8 @@ import json
 import os
 from pathlib import Path
 
-from kquant.pack.qsrt_pool import load_qsrt_candidate_pool
-from kquant.pack.qsrt_mode_validation import (
+from qsrt.pack.qsrt_pool import load_qsrt_candidate_pool
+from qsrt.pack.qsrt_mode_validation import (
     MODE_VALIDATION_SUMMARY_KIND,
     MODE_VALIDATION_SUMMARY_SCHEMA_VERSION,
     load_qsrt_mode_validation_scores,
@@ -17,7 +17,7 @@ from kquant.pack.qsrt_mode_validation import (
     paired_document_bootstrap,
     summarize_mode_validation_arrays,
 )
-from kquant.pack.qsrt_validation import load_qsrt_validation_scores
+from qsrt.pack.qsrt_validation import load_qsrt_validation_scores
 
 
 # Preserve the original public helper name used by experiment code and tests.

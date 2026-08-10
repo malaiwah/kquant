@@ -2,8 +2,8 @@
 
 ## ExLlamaV3 quantization code
 
-`kquant/exl3_encoder_backend.py` and
-`kquant/csrc/qsrt_quantize_tiles_kernel.cuh` contain code derived from
+`qsrt/exl3_encoder_backend.py` and
+`qsrt/csrc/qsrt_quantize_tiles_kernel.cuh` contain code derived from
 [ExLlamaV3](https://github.com/turboderp-org/exllamav3).
 
 Copyright (c) 2025 Turboderp

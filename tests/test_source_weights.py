@@ -2,9 +2,9 @@ import torch
 import pytest
 from safetensors.torch import save_file
 
-from kquant import constants as C
-from kquant.io.hf_cache import CheckpointCache
-from kquant.source_weights import OfficialMXFP4Store, weight_name
+from qsrt import constants as C
+from qsrt.io.hf_cache import CheckpointCache
+from qsrt.source_weights import OfficialMXFP4Store, weight_name
 
 
 def test_official_store_streams_one_packed_matrix(tmp_path):

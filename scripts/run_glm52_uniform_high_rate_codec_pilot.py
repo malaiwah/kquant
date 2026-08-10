@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from kquant.glm52_pilot import UNIFORM_HIGH_RATE_BITS, run_uniform_high_rate_pilot
+from qsrt.glm52_pilot import UNIFORM_HIGH_RATE_BITS, run_uniform_high_rate_pilot
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -29,9 +29,9 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from kquant import constants as C
-from kquant.capture import index_cached_layer_samples, load_layer_hessians
-from kquant.qsrt_candidates import (
+from qsrt import constants as C
+from qsrt.capture import index_cached_layer_samples, load_layer_hessians
+from qsrt.qsrt_candidates import (
     RequestPartition,
     functional_sse_by_request,
     index_expert_rows,
@@ -39,15 +39,15 @@ from kquant.qsrt_candidates import (
     partition_requests,
     request_documents,
 )
-from kquant.pack.qsrt_pool import load_qsrt_candidate_pool
-from kquant.pack.qsrt_candidates import (
+from qsrt.pack.qsrt_pool import load_qsrt_candidate_pool
+from qsrt.pack.qsrt_candidates import (
     CANDIDATE_POOL_KIND,
     OFFICIAL_SOURCE_DAMAGE_METRIC,
     QSRTCandidateEncoding,
     candidate_tensor_name,
     encode_phase1_expert,
 )
-from kquant.pack.qsrt_mode_validation import (
+from qsrt.pack.qsrt_mode_validation import (
     COMPLETION_FILENAME,
     MANIFEST_FILENAME,
     MODE_VALIDATION_KIND,
@@ -55,13 +55,13 @@ from kquant.pack.qsrt_mode_validation import (
     MODE_VALIDATION_SCHEMA_VERSION,
     load_qsrt_mode_validation_scores,
 )
-from kquant.pack.qsrt_validation import (
+from qsrt.pack.qsrt_validation import (
     QSRTValidationScores,
     load_qsrt_validation_scores,
     official_expert_output,
 )
-from kquant.source_weights import OfficialMXFP4Store
-from kquant.tp_simulator import situ
+from qsrt.source_weights import OfficialMXFP4Store
+from qsrt.tp_simulator import situ
 
 
 @dataclass
@@ -93,7 +93,7 @@ def _sha256_files(paths: tuple[Path, ...]) -> str:
     """Bind the validation run to every source file defining the codec."""
 
     digest = hashlib.sha256()
-    digest.update(b"kquant-qsrt-encoder-sources-v2\0")
+    digest.update(b"qsrt-qsrt-encoder-sources-v2\0")
     for path in paths:
         encoded = path.as_posix().encode("utf-8")
         digest.update(len(encoded).to_bytes(4, "little"))
@@ -177,7 +177,7 @@ def _selected_validation_metrics_path(root: Path, layer: int) -> Path:
 
 def _load_quantizer_module(root: Path):
     # Match the all-expert encoder without importing exllamav3's serving stack.
-    from kquant.exl3_loader import load_qsrt_encoder
+    from qsrt.exl3_loader import load_qsrt_encoder
 
     return load_qsrt_encoder(root)
 
@@ -192,7 +192,7 @@ def _validate_report_contract(manifest: dict) -> tuple[dict, dict, RequestPartit
         ("validation", validation_report),
     ):
         if (
-            report.get("kind") != "kquant_interim_calibration_corpus_run"
+            report.get("kind") != "qsrt_interim_calibration_corpus_run"
             or not report.get("finalized")
         ):
             raise ValueError(f"{name} corpus report is not a finalized calibration run")
@@ -237,18 +237,18 @@ def _manifest(
     source_index = source_store.root / C.INDEX_FILE
     project = Path(__file__).resolve().parents[1]
     quantizer_sources = (
-        project / "kquant/exl3_encoder_backend.py",
-        project / "kquant/exl3_loader.py",
-        project / "kquant/ldlq.py",
-        project / "kquant/sqg_quantizer.py",
-        project / "kquant/sqg_e4m3.py",
-        project / "kquant/pack/qsrt_encoder.py",
-        project / "kquant/csrc/sqg_quantize.cpp",
-        project / "kquant/csrc/sqg_quantize.cu",
-        project / "kquant/csrc/qsrt_quantize_tiles_kernel.cuh",
-        project / "kquant/csrc/exl3_compat/util.h",
-        project / "kquant/csrc/exl3_compat/util.cuh",
-        project / "kquant/csrc/exl3_compat/quant/codebook.cuh",
+        project / "qsrt/exl3_encoder_backend.py",
+        project / "qsrt/exl3_loader.py",
+        project / "qsrt/ldlq.py",
+        project / "qsrt/sqg_quantizer.py",
+        project / "qsrt/sqg_e4m3.py",
+        project / "qsrt/pack/qsrt_encoder.py",
+        project / "qsrt/csrc/sqg_quantize.cpp",
+        project / "qsrt/csrc/sqg_quantize.cu",
+        project / "qsrt/csrc/qsrt_quantize_tiles_kernel.cuh",
+        project / "qsrt/csrc/exl3_compat/util.h",
+        project / "qsrt/csrc/exl3_compat/util.cuh",
+        project / "qsrt/csrc/exl3_compat/quant/codebook.cuh",
         exllamav3_root / "exllamav3/util/hadamard.py",
         exllamav3_root / "exllamav3/util/tensor.py",
     )
@@ -343,7 +343,7 @@ def _manifest(
     ):
         cache_manifest = _read_json(cache / "manifest.json")
         if (
-            cache_manifest.get("kind") != "kquant_layer_sample_cache"
+            cache_manifest.get("kind") != "qsrt_layer_sample_cache"
             or Path(str(cache_manifest.get("source_capture", ""))).resolve()
             != capture
         ):
@@ -491,7 +491,7 @@ def _verify_training_r0(
 
 def _payload_digest(candidate: QSRTCandidateEncoding) -> str:
     digest = hashlib.sha256()
-    digest.update(b"kquant-matched-r0-payload-v1\0")
+    digest.update(b"qsrt-matched-r0-payload-v1\0")
     for matrix in C.EXPERT_MATRICES:
         encoding = candidate.expert.matrices[matrix]
         for part in ("trellis", "suh", "svh"):

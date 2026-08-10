@@ -12,8 +12,8 @@ from typing import Any
 
 import torch
 
-from kquant.fp4_roundtrip import mxfp4_roundtrip, nvfp4_roundtrip
-from kquant.glm52_pilot import (
+from qsrt.fp4_roundtrip import mxfp4_roundtrip, nvfp4_roundtrip
+from qsrt.glm52_pilot import (
     K4_PANEL,
     PROJECTIONS,
     SOURCE_INDEX_SHA256,
@@ -26,7 +26,7 @@ from kquant.glm52_pilot import (
 )
 
 
-PILOT_KIND = "kquant_glm52_fp4_roundtrip_pilot_v1"
+PILOT_KIND = "qsrt_glm52_fp4_roundtrip_pilot_v1"
 FORMATS = {
     "mxfp4": {"nominal_bpw": 4.25, "roundtrip": mxfp4_roundtrip},
     "nvfp4": {"nominal_bpw": 4.5, "roundtrip": nvfp4_roundtrip},

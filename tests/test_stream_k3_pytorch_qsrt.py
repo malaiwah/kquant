@@ -8,8 +8,8 @@ import pytest
 import torch
 
 import scripts.stream_k3_pytorch as stream
-from kquant import constants as C
-from kquant.qsrt import (
+from qsrt import constants as C
+from qsrt.qsrt import (
     FORMAT_SECTION_BYTES,
     LAYER_HEADER_BYTES,
     SHARED_SCALE_SECTION_BYTES,
@@ -17,14 +17,14 @@ from kquant.qsrt import (
     QSRTTrellisDescriptor,
     matrix_rate_axis,
 )
-from kquant.pack.qsrt_materialize import (
+from qsrt.pack.qsrt_materialize import (
     QSRT_ARTIFACT_KIND,
     QSRT_ARTIFACT_SCHEMA_VERSION,
     QSRT_MANIFEST_FILENAME,
 )
-from kquant.pack.qsrt_atoms import layer_filename
-from kquant.source_weights import PackedMXFP4Matrix
-from kquant.x4t import X4T_LAYER_FIXED_BYTES, x4t_layer_path
+from qsrt.pack.qsrt_atoms import layer_filename
+from qsrt.source_weights import PackedMXFP4Matrix
+from qsrt.x4t import X4T_LAYER_FIXED_BYTES, x4t_layer_path
 
 
 def _artifact_tree(root: Path) -> None:

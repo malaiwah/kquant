@@ -12,8 +12,8 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-from kquant import constants as C
-from kquant.qsrt_rotations import (
+from qsrt import constants as C
+from qsrt.qsrt_rotations import (
     QSRTRotationPlan,
     QSRTLayerRotationPlan,
     load_qsrt_rotation_plan,
@@ -244,7 +244,7 @@ def main() -> None:
     _atomic_json(
         args.report,
         {
-            "kind": "kquant_qsrt_rotation_selection",
+            "kind": "qsrt_rotation_selection",
             "schema_version": 1,
             "layer": args.layer,
             "selection_fold": "confirmation_documents",

@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from kquant.correctness import (
+from qsrt.correctness import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_PROMPT,
     assert_gpus_idle,
@@ -32,7 +32,7 @@ from kquant.correctness import (
     select_gpu_uuids,
     write_json,
 )
-from kquant.kernel_audit import KERNEL_PATHS, audit_kernel_path
+from qsrt.kernel_audit import KERNEL_PATHS, audit_kernel_path
 
 DEFAULT_ENV = {
     "CUTE_DSL_ARCH": "sm_120a",
@@ -224,7 +224,7 @@ def run_server(args: argparse.Namespace) -> int:
 
     command = _server_command(args, python)
     repo_roots = {
-        "kquant": Path(__file__).resolve().parents[1],
+        "qsrt": Path(__file__).resolve().parents[1],
         "vllm": vllm_dir,
         "b12x": args.b12x_dir.resolve(),
         "exllamav3": args.exllamav3_dir.resolve(),

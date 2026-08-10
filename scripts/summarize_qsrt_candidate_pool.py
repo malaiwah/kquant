@@ -25,24 +25,24 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 
-from kquant import constants as C
-from kquant.exl3_reference import QSRT_CODEBOOKS
-from kquant.qsrt import LOGICAL_CANDIDATE_SCHEMAS
-from kquant.pack.qsrt_pool import (
+from qsrt import constants as C
+from qsrt.exl3_reference import QSRT_CODEBOOKS
+from qsrt.qsrt import LOGICAL_CANDIDATE_SCHEMAS
+from qsrt.pack.qsrt_pool import (
     CANDIDATE_POOL_COMPLETION_FILENAME,
     _validate_payload_header,
     validate_candidate_pool_completion,
     validate_layer_metrics,
     validate_selection_ledger_evidence,
 )
-from kquant.pack.qsrt_candidates import (
+from qsrt.pack.qsrt_candidates import (
     CANDIDATE_POOL_KIND,
     CANDIDATE_POOL_SCHEMA_VERSION,
     OFFICIAL_SOURCE_DAMAGE_METRIC,
 )
 
 
-SUMMARY_KIND = "kquant_kimi_k3_qsrt_candidate_pool_summary"
+SUMMARY_KIND = "qsrt_kimi_k3_qsrt_candidate_pool_summary"
 SUMMARY_SCHEMA_VERSION = 1
 
 

@@ -169,7 +169,7 @@ def summarize(
         }
 
     return {
-        "kind": "kquant_qsrt_permutation_sweep_summary",
+        "kind": "qsrt_permutation_sweep_summary",
         "schema_version": 1,
         "comparison": "absolute_fit_selected_serial_reencode_sse",
         "selection_partition": "fit",

@@ -14,8 +14,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-import kquant.constants as C
-from kquant.io import mxfp4
+import qsrt.constants as C
+from qsrt.io import mxfp4
 
 MINI = dict(layers=(1, 2), experts=4, latent=64, inter=96)
 
@@ -76,6 +76,6 @@ def mini_cache(mini_ckpt, monkeypatch):
     """CheckpointCache over the mini checkpoint, with geometry monkeypatched
     so [92, 896] accumulators still index correctly (mini layers/experts are a
     subset of the real ranges)."""
-    from kquant.io.hf_cache import resolve
+    from qsrt.io.hf_cache import resolve
 
     return resolve(mini_ckpt, C.REVISION)

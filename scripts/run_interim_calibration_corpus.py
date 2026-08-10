@@ -111,7 +111,7 @@ def _load_excluded_documents(
     for raw_path in reports:
         path = raw_path.resolve()
         report = json.loads(path.read_text())
-        if report.get("kind") != "kquant_interim_calibration_corpus_run":
+        if report.get("kind") != "qsrt_interim_calibration_corpus_run":
             raise ValueError(f"{path} is not a calibration corpus report")
         documents = report.get("documents")
         if not isinstance(documents, list):
@@ -369,7 +369,7 @@ def _validate_resident_directory(
     if len(artifact_roots) != 1:
         raise ValueError(f"{root} mixes EXL3 shards from multiple artifacts")
     artifact_root = artifact_roots.pop()
-    artifact_required = ("kquant_exl3_manifest.json", "allocation-exl3.json")
+    artifact_required = ("qsrt_exl3_manifest.json", "allocation-exl3.json")
     artifact_missing = [
         name for name in artifact_required if not (artifact_root / name).is_file()
     ]
@@ -377,8 +377,8 @@ def _validate_resident_directory(
         raise ValueError(
             f"EXL3 artifact {artifact_root} is missing metadata: {artifact_missing}"
         )
-    manifest = json.loads((artifact_root / "kquant_exl3_manifest.json").read_text())
-    if manifest.get("kind") != "kquant_exl3_artifact":
+    manifest = json.loads((artifact_root / "qsrt_exl3_manifest.json").read_text())
+    if manifest.get("kind") != "qsrt_exl3_artifact":
         raise ValueError(f"{artifact_root} has an unsupported EXL3 manifest")
     return root
 
@@ -424,8 +424,8 @@ def _validate_live_capture(
     allow_complete: bool = False,
 ) -> dict:
     manifest = _wait_for_capture_manifest(capture_dir, timeout)
-    if manifest.get("kind") != "kquant_vllm_b12x_capture":
-        raise ValueError("live server does not expose a KQuant capture manifest")
+    if manifest.get("kind") != "qsrt_vllm_b12x_capture":
+        raise ValueError("live server does not expose a QSRT capture manifest")
     if manifest.get("source") != expected_source:
         raise ValueError(
             f"capture source is {manifest.get('source')!r}, "
@@ -485,7 +485,7 @@ def _plan_report(
     excluded_prompt_hashes: set[str],
 ) -> dict:
     return {
-        "kind": "kquant_interim_calibration_corpus_run",
+        "kind": "qsrt_interim_calibration_corpus_run",
         "schema_version": 1,
         "constraint": "resident teacher only; official MXFP4 source not loaded",
         "expected_capture_source": args.expected_capture_source,

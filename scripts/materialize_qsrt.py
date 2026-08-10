@@ -14,14 +14,14 @@ import json
 import time
 from pathlib import Path
 
-from kquant import constants as C
-from kquant.pack.qsrt_pool import load_qsrt_candidate_pool
-from kquant.pack.qsrt_atoms import (
+from qsrt import constants as C
+from qsrt.pack.qsrt_pool import load_qsrt_candidate_pool
+from qsrt.pack.qsrt_atoms import (
     QSRTAtomLayerReader,
     layer_filename,
     materialize_atom_layer,
 )
-from kquant.pack.qsrt_materialize import (
+from qsrt.pack.qsrt_materialize import (
     QSRT_MANIFEST_FILENAME,
     load_qsrt_layer_closure_receipt,
     prepare_qsrt_destination,
@@ -35,9 +35,9 @@ from kquant.pack.qsrt_materialize import (
     write_qsrt_artifact_manifest,
     write_qsrt_layer_closure_receipt,
 )
-from kquant.pack.x4t_index import load_x4t_cost_index
-from kquant.source_weights import OfficialMXFP4Store
-from kquant.x4t import (
+from qsrt.pack.x4t_index import load_x4t_cost_index
+from qsrt.source_weights import OfficialMXFP4Store
+from qsrt.x4t import (
     X4T_MATRIX_ORDER,
     X4TLayerReader,
     X4TLayerWriter,

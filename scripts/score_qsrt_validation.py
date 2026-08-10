@@ -24,25 +24,25 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from kquant import constants as C
-from kquant.capture import index_layer_samples, load_capture
-from kquant.exl3_reference import QSRT_CODEBOOKS
-from kquant.qsrt_candidates import index_expert_rows, request_documents
-from kquant.pack.qsrt_pool import (
+from qsrt import constants as C
+from qsrt.capture import index_layer_samples, load_capture
+from qsrt.exl3_reference import QSRT_CODEBOOKS
+from qsrt.qsrt_candidates import index_expert_rows, request_documents
+from qsrt.pack.qsrt_pool import (
     load_qsrt_candidate_pool,
     validate_candidate_pool_completion,
 )
-from kquant.pack.qsrt_candidates import (
+from qsrt.pack.qsrt_candidates import (
     CANDIDATE_POOL_SCHEMA_VERSION,
     OFFICIAL_SOURCE_DAMAGE_METRIC,
 )
-from kquant.pack.qsrt_validation import (
+from qsrt.pack.qsrt_validation import (
     VALIDATION_DAMAGE_METRIC,
     VALIDATION_SCORE_KIND,
     VALIDATION_SCORE_SCHEMA_VERSION,
     score_selected_expert,
 )
-from kquant.source_weights import OfficialMXFP4Store
+from qsrt.source_weights import OfficialMXFP4Store
 
 
 MANIFEST_NAME = "qsrt-validation-manifest.json"
@@ -135,7 +135,7 @@ def _validate_corpus_contract(
         ("training", training_report),
         ("validation", validation_report),
     ):
-        if report.get("kind") != "kquant_interim_calibration_corpus_run":
+        if report.get("kind") != "qsrt_interim_calibration_corpus_run":
             raise ValueError(f"{name} corpus report has the wrong kind")
         if not bool(report.get("finalized")):
             raise ValueError(f"{name} corpus report is not finalized")

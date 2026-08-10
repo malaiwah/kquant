@@ -2,13 +2,13 @@
 # Plan, launch, inspect, or stop the source-pinned 4M pure-QSRT capture.
 set -euo pipefail
 
-KQUANT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+QSRT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 VLLM_ROOT="${VLLM_ROOT:-/home/luke/projects/vllm}"
 CORPUS_PYTHON="${QSRT_4M_CORPUS_PYTHON:-${VLLM_ROOT}/.venv/bin/python}"
 TEACHER="${QSRT_4M_TEACHER:-/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-PURE-v1-model}"
 CAPTURE="${QSRT_4M_CAPTURE:-/data/kquant/captures/k3-denseh-broad-v7-4m-train.kqcapture}"
-REPORT="${QSRT_4M_REPORT:-${KQUANT_ROOT}/out/k3-denseh-broad-v7-4m-train-corpus.json}"
-INTEGRITY="${QSRT_4M_INTEGRITY:-${KQUANT_ROOT}/out/k3-denseh-broad-v7-4m-integrity.json}"
+REPORT="${QSRT_4M_REPORT:-${QSRT_ROOT}/out/k3-denseh-broad-v7-4m-train-corpus.json}"
+INTEGRITY="${QSRT_4M_INTEGRITY:-${QSRT_ROOT}/out/k3-denseh-broad-v7-4m-integrity.json}"
 FINALIZE="${QSRT_4M_FINALIZE:-/data/kquant/captures/k3-denseh-broad-v7-4m-train.finalize}"
 SERVER_LOG="${QSRT_4M_SERVER_LOG:-/data/kquant/captures/k3-denseh-broad-v7-4m-train.server.log}"
 CORPUS_LOG="${QSRT_4M_CORPUS_LOG:-/data/kquant/captures/k3-denseh-broad-v7-4m-train.corpus.log}"
@@ -34,11 +34,11 @@ corpus_args=(
   --fold-index 0
   --fold-mode exclude
   --seed 20260808
-  --exclude-report "${KQUANT_ROOT}/out/k3-denseh-broad-v6-1m-train-corpus.json"
-  --exclude-report "${KQUANT_ROOT}/out/k3-denseh-broad-v5-selection-corpus.json"
-  --exclude-report "${KQUANT_ROOT}/out/k3-denseh-broad-v5-final-validation-corpus.json"
-  --exclude-report "${KQUANT_ROOT}/out/k3-denseh-broad-v3-selection-corpus.json"
-  --exclude-report "${KQUANT_ROOT}/out/k3-denseh-broad-v3-final-validation-corpus.json"
+  --exclude-report "${QSRT_ROOT}/out/k3-denseh-broad-v6-1m-train-corpus.json"
+  --exclude-report "${QSRT_ROOT}/out/k3-denseh-broad-v5-selection-corpus.json"
+  --exclude-report "${QSRT_ROOT}/out/k3-denseh-broad-v5-final-validation-corpus.json"
+  --exclude-report "${QSRT_ROOT}/out/k3-denseh-broad-v3-selection-corpus.json"
+  --exclude-report "${QSRT_ROOT}/out/k3-denseh-broad-v3-final-validation-corpus.json"
   --model-dir "${TEACHER}"
   --expected-capture-source pure_qsrt_sqg_xor_cheb_t12
   --capture-dir "${CAPTURE}"
@@ -89,23 +89,23 @@ start() {
   setsid env \
     K3_MODEL_DIR="${TEACHER}" \
     K3_SERVED_MODEL_NAME=kimi-k3-qsrt \
-    K3_KQUANT_CAPTURE_DIR="${CAPTURE}" \
-    K3_KQUANT_CORPUS="${REPORT}" \
-    VLLM_KQUANT_SOURCE=pure_qsrt_sqg_xor_cheb_t12 \
-    VLLM_KQUANT_CAPTURE_RUN_ID=k3-denseh-broad-v7-4m-train \
-    VLLM_KQUANT_MOMENT_SAMPLE_RATE=16 \
-    VLLM_KQUANT_INPUT_HESSIAN_SAMPLE_RATE=64 \
-    VLLM_KQUANT_MID_HESSIAN_SAMPLE_RATE=32 \
-    VLLM_KQUANT_SAMPLE_CAPACITY=1024 \
-    VLLM_KQUANT_SAMPLE_SAVE_EVERY=32 \
-    VLLM_KQUANT_SAMPLE_FLUSH_BYTES=268435456 \
-    VLLM_KQUANT_FINALIZE_FILE="${FINALIZE}" \
+    K3_QSRT_CAPTURE_DIR="${CAPTURE}" \
+    K3_QSRT_CORPUS="${REPORT}" \
+    VLLM_QSRT_SOURCE=pure_qsrt_sqg_xor_cheb_t12 \
+    VLLM_QSRT_CAPTURE_RUN_ID=k3-denseh-broad-v7-4m-train \
+    VLLM_QSRT_MOMENT_SAMPLE_RATE=16 \
+    VLLM_QSRT_INPUT_HESSIAN_SAMPLE_RATE=64 \
+    VLLM_QSRT_MID_HESSIAN_SAMPLE_RATE=32 \
+    VLLM_QSRT_SAMPLE_CAPACITY=1024 \
+    VLLM_QSRT_SAMPLE_SAVE_EVERY=32 \
+    VLLM_QSRT_SAMPLE_FLUSH_BYTES=268435456 \
+    VLLM_QSRT_FINALIZE_FILE="${FINALIZE}" \
     "${VLLM_ROOT}/serve-kimi-k3-exl3-3p09-tp12.sh" \
     >"${SERVER_LOG}" 2>&1 &
   echo "$!" >"${SERVER_PID_FILE}"
 
   setsid "${CORPUS_PYTHON}" \
-    "${KQUANT_ROOT}/scripts/run_interim_calibration_corpus.py" \
+    "${QSRT_ROOT}/scripts/run_interim_calibration_corpus.py" \
     "${corpus_args[@]}" --model kimi-k3-qsrt --resume \
     >"${CORPUS_LOG}" 2>&1 &
   echo "$!" >"${CORPUS_PID_FILE}"

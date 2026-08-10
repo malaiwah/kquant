@@ -1,7 +1,7 @@
 import torch
 
-from kquant import constants as C
-from kquant.io import mxfp4
+from qsrt import constants as C
+from qsrt.io import mxfp4
 
 
 def test_pack_unpack_roundtrip():

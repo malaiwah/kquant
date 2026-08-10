@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kquant import constants as C
+from qsrt import constants as C
 from scripts.summarize_qsrt_tp12_runtime import _layer_runtime_summary
 
 

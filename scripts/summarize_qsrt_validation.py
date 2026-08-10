@@ -10,8 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from kquant import constants as C
-from kquant.pack.qsrt_pool import (
+from qsrt import constants as C
+from qsrt.pack.qsrt_pool import (
     CERTIFIED_ALLOCATION_OPTIMALITY,
     raw_keep_allocation_optimality,
     choose_qsrt_raw_keep_allocation,
@@ -19,10 +19,10 @@ from kquant.pack.qsrt_pool import (
     load_qsrt_candidate_pool,
     raw_keep_container_bytes,
 )
-from kquant.pack.qsrt_validation import load_qsrt_validation_scores
+from qsrt.pack.qsrt_validation import load_qsrt_validation_scores
 
 
-SUMMARY_KIND = "kquant_kimi_k3_qsrt_validation_summary"
+SUMMARY_KIND = "qsrt_kimi_k3_qsrt_validation_summary"
 SUMMARY_SCHEMA_VERSION = 1
 
 

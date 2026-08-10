@@ -19,7 +19,7 @@ from typing import Any
 import torch
 from safetensors.torch import load_file
 
-from kquant.blockldlq_proof import (
+from qsrt.blockldlq_proof import (
     capture_sample_selected,
     capture_validation_split,
 )

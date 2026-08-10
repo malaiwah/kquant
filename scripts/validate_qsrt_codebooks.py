@@ -25,20 +25,20 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from kquant import constants as C
-from kquant.capture import (
+from qsrt import constants as C
+from qsrt.capture import (
     LayerSamples,
     index_cached_layer_samples,
     load_layer_hessians,
     load_layer_samples,
 )
-from kquant.exl3_loader import load_qsrt_encoder
-from kquant.exl3_reference import (
+from qsrt.exl3_loader import load_qsrt_encoder
+from qsrt.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     decode_exl3_weight,
     decode_qsrt_weight,
 )
-from kquant.sqg_e4m3 import (
+from qsrt.sqg_e4m3 import (
     SQG_CHEB_NORMAL_E4M3,
     SQG_NORMAL_E4M3,
     sqg_e4m3_bytes,
@@ -46,8 +46,8 @@ from kquant.sqg_e4m3 import (
     sqg_e4m3_codebook,
     sqg_xor_cheb_t12_bytes,
 )
-from kquant.sqg_quantizer import install_sqg_quantizer
-from kquant.qsrt_candidates import (
+from qsrt.sqg_quantizer import install_sqg_quantizer
+from qsrt.qsrt_candidates import (
     RequestPartition,
     activation_block_contexts,
     build_expert_hessians,
@@ -55,17 +55,17 @@ from kquant.qsrt_candidates import (
     request_documents,
     select_expert_rows,
 )
-from kquant.qsrt import (
+from qsrt.qsrt import (
     RATE_TRANSFER_MODES,
     RECORDS_PER_EXPERT,
     TILES_PER_RECORD_AXIS,
     matrix_rate_axis,
     unpack_trellis_states,
 )
-from kquant.ldlq import SIGMA_REG, make_shared_h
-from kquant.pack.qsrt_encoder import plan_qsrt_matrix
-from kquant.source_weights import OfficialMXFP4Store
-from kquant.tp_simulator import comparison_metrics, situ
+from qsrt.ldlq import SIGMA_REG, make_shared_h
+from qsrt.pack.qsrt_encoder import plan_qsrt_matrix
+from qsrt.source_weights import OfficialMXFP4Store
+from qsrt.tp_simulator import comparison_metrics, situ
 
 
 MATRICES = C.EXPERT_MATRICES
@@ -764,7 +764,7 @@ def _validate_corpus_contract(
         ("training", training_report, args.capture),
         ("validation", validation_report, args.validation_capture),
     ):
-        if report.get("kind") != "kquant_interim_calibration_corpus_run":
+        if report.get("kind") != "qsrt_interim_calibration_corpus_run":
             raise ValueError(f"{name} corpus report has the wrong kind")
         if not bool(report.get("finalized")):
             raise ValueError(f"{name} corpus report is not finalized")
@@ -931,9 +931,9 @@ def run(args: argparse.Namespace) -> dict:
             raise FileExistsError(args.output)
         payload = {
             "kind": (
-                "kquant_k3_k4_record_frontier_study"
+                "qsrt_k3_k4_record_frontier_study"
                 if args.k4_record_counts is not None
-                else "kquant_uniform_k_mxfp4_endpoint_study"
+                else "qsrt_uniform_k_mxfp4_endpoint_study"
             ),
             "schema_version": 1,
             "signature": signature,

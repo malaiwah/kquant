@@ -3,9 +3,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from kquant import constants as C
-from kquant.pack.qsrt_pool import RAW_KEEP_PROMOTION_BYTES
-from kquant.qsrt_storage import QSRTLayerLayout
+from qsrt import constants as C
+from qsrt.pack.qsrt_pool import RAW_KEEP_PROMOTION_BYTES
+from qsrt.qsrt_storage import QSRTLayerLayout
 from scripts.summarize_qsrt_validation import (
     _average_ranks,
     _spearman,

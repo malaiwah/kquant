@@ -1,6 +1,6 @@
 import pytest
 
-from kquant.correctness import (
+from qsrt.correctness import (
     compare_probe_responses,
     parse_env_assignments,
     probe_payload,

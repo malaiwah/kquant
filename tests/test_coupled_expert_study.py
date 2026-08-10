@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from kquant.coupled_expert_study import (
+from qsrt.coupled_expert_study import (
     CoupledTriplet,
     RateComponent,
     RoutedOutputMetric,

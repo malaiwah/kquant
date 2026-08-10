@@ -5,14 +5,14 @@ import hashlib
 import pytest
 import torch
 
-from kquant.exl3_reference import (
+from qsrt.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
     decode_qsrt_regularized_weight,
     decode_regularized_weight,
 )
-from kquant.sqg_e4m3 import (
+from qsrt.sqg_e4m3 import (
     sqg_xor_cheb_t12_bytes,
     sqg_xor_cheb_t12_rank_lut_bytes,
     sqg_xor_rank_permutation,

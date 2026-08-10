@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from kquant.qsrt_rotations import (
+from qsrt.qsrt_rotations import (
     QSRTRotationPlan,
     QSRTLayerRotationPlan,
     load_qsrt_rotation_plan,
@@ -47,7 +47,7 @@ def test_rotation_plan_round_trips_sparse_private_overrides(tmp_path) -> None:
         ({"kind": "wrong", "schema_version": 1, "layers": {}}, "kind"),
         (
             {
-                "kind": "kquant_qsrt_rotation_plan",
+                "kind": "qsrt_rotation_plan",
                 "schema_version": 1,
                 "layers": {"0": {}},
             },
@@ -55,7 +55,7 @@ def test_rotation_plan_round_trips_sparse_private_overrides(tmp_path) -> None:
         ),
         (
             {
-                "kind": "kquant_qsrt_rotation_plan",
+                "kind": "qsrt_rotation_plan",
                 "schema_version": 1,
                 "layers": {"12": {"intermediate_overrides": {"896": 1}}},
             },

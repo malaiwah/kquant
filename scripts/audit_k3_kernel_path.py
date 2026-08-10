@@ -7,8 +7,8 @@ import argparse
 import json
 from pathlib import Path
 
-from kquant.correctness import write_json
-from kquant.kernel_audit import KERNEL_PATHS, audit_kernel_path
+from qsrt.correctness import write_json
+from qsrt.kernel_audit import KERNEL_PATHS, audit_kernel_path
 
 
 def main() -> int:

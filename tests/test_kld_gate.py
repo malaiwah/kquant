@@ -4,7 +4,7 @@ import hashlib
 
 import pytest
 
-from kquant.kld_gate import (
+from qsrt.kld_gate import (
     ComparisonWindow,
     summarize_paired_kld,
     validate_comparison_report,

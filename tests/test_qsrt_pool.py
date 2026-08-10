@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 import torch
 
-import kquant.pack.qsrt_pool as raw_keep_allocation
-from kquant import constants as C
-from kquant.qsrt import (
+import qsrt.pack.qsrt_pool as raw_keep_allocation
+from qsrt import constants as C
+from qsrt.qsrt import (
     FIXED_HIGH_RATE_TRELLIS_BYTES,
     H308,
     INTERMEDIATE_CHANNELS,
@@ -18,8 +18,8 @@ from kquant.qsrt import (
     PHASE1_MODE_IDS,
     SCHEMA,
 )
-from kquant.qsrt_storage import QSRTLayerLayout
-from kquant.pack.qsrt_pool import (
+from qsrt.qsrt_storage import QSRTLayerLayout
+from qsrt.pack.qsrt_pool import (
     CERTIFIED_ALLOCATION_OPTIMALITY,
     CANDIDATE_POOL_COMPLETION_FILENAME,
     RAW_KEEP_PROMOTION_BYTES,
@@ -39,8 +39,8 @@ from kquant.pack.qsrt_pool import (
     validate_selection_ledger_evidence,
     write_candidate_pool_completion,
 )
-from kquant.qsrt_coupled_plan import PRODUCTION_SELECTION, select_k2_coupled_draw
-from kquant.pack.qsrt_candidates import (
+from qsrt.qsrt_coupled_plan import PRODUCTION_SELECTION, select_k2_coupled_draw
+from qsrt.pack.qsrt_candidates import (
     CANDIDATE_POOL_SCHEMA_VERSION,
     OFFICIAL_SOURCE_DAMAGE_METRIC,
 )
@@ -115,7 +115,7 @@ def test_payload_metadata_binds_tailbite_context_when_declared() -> None:
         codebook="sqg-normal-e4m3",
         tailbite_context=128,
     ) == {
-        "kind": "kquant_kimi_k3_qsrt_candidate_pool",
+        "kind": "qsrt_kimi_k3_qsrt_candidate_pool",
         "schema_version": str(CANDIDATE_POOL_SCHEMA_VERSION),
         "layer": "7",
         "codebook": "sqg-normal-e4m3",

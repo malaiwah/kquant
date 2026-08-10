@@ -7,8 +7,8 @@ import argparse
 import json
 from pathlib import Path
 
-from kquant.pack.package_helpers import DEFAULT_NONEXPERT
-from kquant.pack.qsrt_model_view import publish_qsrt_model_view
+from qsrt.pack.package_helpers import DEFAULT_NONEXPERT
+from qsrt.pack.qsrt_model_view import publish_qsrt_model_view
 
 
 def main() -> None:

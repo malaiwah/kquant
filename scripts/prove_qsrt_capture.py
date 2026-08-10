@@ -20,14 +20,14 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
 
-from kquant.blockldlq_proof import (
+from qsrt.blockldlq_proof import (
     capture_sample_selected,
     capture_validation_split,
     explicit_weighted_output_error,
     quadratic_error,
     relative_error,
 )
-from kquant.capture import load_capture
+from qsrt.capture import load_capture
 
 
 DEFAULT_CAPTURE = Path(

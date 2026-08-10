@@ -5,7 +5,7 @@ import struct
 import pytest
 import torch
 
-from kquant.mxfp4_scale_codec import (
+from qsrt.mxfp4_scale_codec import (
     compact_scale_plane_stats,
     effective_mxfp4_bpw,
     pack_scale_plane,

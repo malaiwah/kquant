@@ -8,19 +8,19 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from kquant.pack.qsrt_pool import load_qsrt_candidate_pool
-from kquant.pack.qsrt_validation import (
+from qsrt.pack.qsrt_pool import load_qsrt_candidate_pool
+from qsrt.pack.qsrt_validation import (
     VALIDATION_DAMAGE_METRIC,
     VALIDATION_DAMAGE_WEIGHTING,
     load_qsrt_validation_scores,
 )
-from kquant.pack.qsrt_allocation import (
+from qsrt.pack.qsrt_allocation import (
     choose_qsrt_lagrangian,
     choose_qsrt_target,
     qsrt_allocation_document,
     write_qsrt_allocation,
 )
-from kquant.pack.x4t_index import load_x4t_cost_index
+from qsrt.pack.x4t_index import load_x4t_cost_index
 
 
 def parse_args() -> argparse.Namespace:

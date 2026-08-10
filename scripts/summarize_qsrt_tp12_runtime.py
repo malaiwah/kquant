@@ -21,13 +21,13 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-from kquant import constants as C
-from kquant.capture import index_layer_samples, load_capture
-from kquant.qsrt import logical_pair_for_slot
+from qsrt import constants as C
+from qsrt.capture import index_layer_samples, load_capture
+from qsrt.qsrt import logical_pair_for_slot
 from scripts.summarize_qsrt_candidate_pool import summarize_candidate_pool
 
 
-KIND = "kquant_kimi_k3_qsrt_tp12_runtime_mix"
+KIND = "qsrt_kimi_k3_qsrt_tp12_runtime_mix"
 TP_SIZE = 12
 SCHEMA_VERSION = 1
 

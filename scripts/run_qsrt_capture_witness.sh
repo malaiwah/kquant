@@ -2,7 +2,7 @@
 # Run the small eager-only witness that authenticates QSRT capture hook values.
 set -euo pipefail
 
-KQUANT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+QSRT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 VLLM_ROOT="${VLLM_ROOT:-/home/luke/projects/vllm}"
 CORPUS_PYTHON="${QSRT_CAPTURE_WITNESS_CORPUS_PYTHON:-${VLLM_ROOT}/.venv/bin/python}"
 PROOF_ROOT="${QSRT_CAPTURE_WITNESS_ROOT:-/data/kquant/proofs/k3-capture-eager-witness-v3}"
@@ -11,8 +11,8 @@ CACHE="${PROOF_ROOT}.kqsamples"
 TRACE="${PROOF_ROOT}.trace"
 FINALIZE="${PROOF_ROOT}.finalize"
 SERVER_LOG="${PROOF_ROOT}.server.log"
-REPORT="${QSRT_CAPTURE_WITNESS_REPORT:-${KQUANT_ROOT}/out/k3-capture-eager-witness-v3-corpus.json}"
-RECEIPT="${QSRT_CAPTURE_WITNESS_RECEIPT:-${KQUANT_ROOT}/out/k3-capture-eager-witness-v3.json}"
+REPORT="${QSRT_CAPTURE_WITNESS_REPORT:-${QSRT_ROOT}/out/k3-capture-eager-witness-v3-corpus.json}"
+RECEIPT="${QSRT_CAPTURE_WITNESS_RECEIPT:-${QSRT_ROOT}/out/k3-capture-eager-witness-v3.json}"
 SOURCE="${QSRT_CAPTURE_WITNESS_SOURCE:-/home/luke/projects/quantization/data/text/diverse_calib.jsonl}"
 TEACHER="${QSRT_CAPTURE_WITNESS_TEACHER:-/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-PURE-v1-model}"
 
@@ -53,16 +53,16 @@ trap stop_server EXIT INT TERM
 echo "Starting eager pure-QSRT teacher for the capture witness; log: ${SERVER_LOG}" >&2
 setsid env \
   K3_MODEL_DIR="${TEACHER}" \
-  K3_KQUANT_CAPTURE_DIR="${CAPTURE}" \
-  K3_KQUANT_CORPUS="${REPORT}" \
-  VLLM_KQUANT_SOURCE="pure_qsrt_sqg_xor_cheb_t12" \
-  VLLM_KQUANT_CAPTURE_RUN_ID="k3-capture-eager-witness-v3" \
-  VLLM_KQUANT_INPUT_HESSIAN_SAMPLE_RATE=1 \
-  VLLM_KQUANT_MID_HESSIAN_SAMPLE_RATE=1073741824 \
-  VLLM_KQUANT_MOMENT_SAMPLE_RATE=1073741824 \
-  VLLM_KQUANT_SAMPLE_CAPACITY=512 \
-  VLLM_KQUANT_SAMPLE_SAVE_EVERY=1 \
-  VLLM_KQUANT_FINALIZE_FILE="${FINALIZE}" \
+  K3_QSRT_CAPTURE_DIR="${CAPTURE}" \
+  K3_QSRT_CORPUS="${REPORT}" \
+  VLLM_QSRT_SOURCE="pure_qsrt_sqg_xor_cheb_t12" \
+  VLLM_QSRT_CAPTURE_RUN_ID="k3-capture-eager-witness-v3" \
+  VLLM_QSRT_INPUT_HESSIAN_SAMPLE_RATE=1 \
+  VLLM_QSRT_MID_HESSIAN_SAMPLE_RATE=1073741824 \
+  VLLM_QSRT_MOMENT_SAMPLE_RATE=1073741824 \
+  VLLM_QSRT_SAMPLE_CAPACITY=512 \
+  VLLM_QSRT_SAMPLE_SAVE_EVERY=1 \
+  VLLM_QSRT_FINALIZE_FILE="${FINALIZE}" \
   KIMI_CORRECTNESS_TRACE_DIR="${TRACE}" \
   KIMI_CORRECTNESS_TRACE_LAYERS="1,24,92" \
   KIMI_CORRECTNESS_TRACE_RANKS=0 \
@@ -74,7 +74,7 @@ setsid env \
   --enforce-eager >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
-cd "${KQUANT_ROOT}"
+cd "${QSRT_ROOT}"
 "${CORPUS_PYTHON}" scripts/run_interim_calibration_corpus.py \
   --source "${SOURCE}" \
   --target-tokens 256 \
@@ -94,9 +94,9 @@ cd "${KQUANT_ROOT}"
 stop_server
 SERVER_PID=""
 
-"${KQUANT_ROOT}/.venv/bin/python" scripts/build_qsrt_sample_cache.py \
+"${QSRT_ROOT}/.venv/bin/python" scripts/build_qsrt_sample_cache.py \
   "${CAPTURE}" "${CACHE}"
-"${KQUANT_ROOT}/.venv/bin/python" scripts/validate_qsrt_capture_witness.py \
+"${QSRT_ROOT}/.venv/bin/python" scripts/validate_qsrt_capture_witness.py \
   --capture "${CAPTURE}" \
   --sample-cache "${CACHE}" \
   --trace-dir "${TRACE}" \

@@ -7,10 +7,10 @@ import argparse
 import json
 from pathlib import Path
 
-from kquant.constants import NUM_EXPERTS
-from kquant.correctness import write_json
-from kquant.teacher_proxy import compare_teacher_proxy_traces
-from kquant.trace_compare import load_trace
+from qsrt.constants import NUM_EXPERTS
+from qsrt.correctness import write_json
+from qsrt.teacher_proxy import compare_teacher_proxy_traces
+from qsrt.trace_compare import load_trace
 
 
 def parse_args() -> argparse.Namespace:

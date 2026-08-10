@@ -20,9 +20,9 @@ from typing import Any
 
 import torch
 
-from kquant import constants as C
-from kquant.capture import index_cached_layer_samples
-from kquant.coupled_expert_study import (
+from qsrt import constants as C
+from qsrt.capture import index_cached_layer_samples
+from qsrt.coupled_expert_study import (
     CoupledTriplet,
     RoutedOutputMetric,
     apply_w3_w2_scale_gauge,
@@ -31,16 +31,16 @@ from kquant.coupled_expert_study import (
     execute_coupled_block_hadamard,
     expert_hidden,
 )
-from kquant.exl3_loader import load_qsrt_encoder
-from kquant.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
-from kquant.io.stream import load_tensor
-from kquant.qsrt import matrix_rate_axis
-from kquant.qsrt_codec_pilot import CODEBOOK_MCG, encode_uniform_candidate
-from kquant.source_weights import OfficialMXFP4Store
-from kquant.sqg_quantizer import install_sqg_quantizer
+from qsrt.exl3_loader import load_qsrt_encoder
+from qsrt.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
+from qsrt.io.stream import load_tensor
+from qsrt.qsrt import matrix_rate_axis
+from qsrt.qsrt_codec_pilot import CODEBOOK_MCG, encode_uniform_candidate
+from qsrt.source_weights import OfficialMXFP4Store
+from qsrt.sqg_quantizer import install_sqg_quantizer
 
 
-KIND = "kquant_k3_coupled_uniform_codec_confirmation"
+KIND = "qsrt_k3_coupled_uniform_codec_confirmation"
 SCHEMA_VERSION = 2
 DEFAULT_CACHE = Path(
     "/data/kquant/captures/k3-codec-diverse-validation-v3-128k-input-v1.kqsamples"

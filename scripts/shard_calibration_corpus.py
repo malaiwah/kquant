@@ -95,7 +95,7 @@ def shard_corpus(
         raise
 
     manifest: dict[str, object] = {
-        "kind": "kquant_calibration_source_shards",
+        "kind": "qsrt_calibration_source_shards",
         "schema_version": 1,
         "input": str(input_path),
         "input_sha256": input_hash.hexdigest(),

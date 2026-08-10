@@ -1,4 +1,4 @@
-# kquant agent guide
+# QSRT agent guide
 
 This repository builds and validates `Kimi-K3-QSRT`, a TP-independent hybrid
 checkpoint whose first qualified serving target is TP12.
@@ -33,7 +33,7 @@ or external EXL encoder APIs.
   with the 4,096-byte modal T12 approximation
   to the Chebyshev-derived finite-E4M3 staircase. K2/K3/K4 use one graph
   construction and one scalar law; rate changes only the history/branch split.
-  kquant generates the complete direct encoder labels internally and freezes
+  QSRT generates the complete direct encoder labels internally and freezes
   SHA-256 identities for the T12 table and all three rate tables against B12X.
   `sqg-normal-e4m3` and the exact profile-5 mappings remain offline controls
   only; they are not valid materialized runtime profiles.
@@ -229,12 +229,12 @@ adapter and explicit format version, not weaken Kimi-K3's frozen codec contract.
   live here.
 - Production serving changes live in `/home/luke/projects/vllm`.
 - B12X kernels live in `/home/luke/projects/b12x`.
-- The QSRT offline encoder lives in `kquant/exl3_encoder_backend.py`; its
-  tail-biting SQG CUDA code lives under `kquant/csrc`. The checkout at
+- The QSRT offline encoder lives in `qsrt/exl3_encoder_backend.py`; its
+  tail-biting SQG CUDA code lives under `qsrt/csrc`. The checkout at
   `/home/luke/projects/exllamav3` must remain an unmodified upstream dependency
   and supplies only its extension plus Hadamard/tensor utilities. Put every
   QSRT-specific encoder change in this repository.
-- Never stage sibling-repository changes in a kquant commit.
+- Never stage sibling-repository changes in a QSRT commit.
 - Use `.venv/bin/python` and `.venv/bin/pytest`.
 - Never commit checkpoint payloads, captures, generated traces, `out/`,
   `__pycache__`, or `*.pyc`.
@@ -253,11 +253,11 @@ The official checkpoint is an offline weight source; it is never loaded as the
 resident calibration model.
 
 ```bash
-cd /home/luke/projects/kquant
+cd /home/luke/projects/qsrt
 uv sync --dev
 
 .venv/bin/python - <<'PY'
-from kquant.io.hf_cache import resolve
+from qsrt.io.hf_cache import resolve
 
 checkpoint = resolve()
 assert not checkpoint.missing_shards, checkpoint.missing_shards
@@ -280,7 +280,7 @@ The immediate training target is 1,000,000 prompt tokens.
   --output out/qsrt-corpus-integrity.json
 ```
 
-The vLLM launcher must set `K3_KQUANT_CAPTURE_DIR` and use the interim EXL3
+The vLLM launcher must set `K3_QSRT_CAPTURE_DIR` and use the interim EXL3
 teacher. Finalize the capture exactly once and reject any dropped sample rows,
 TP join mismatch, epoch-zero probe contamination, or document overlap.
 

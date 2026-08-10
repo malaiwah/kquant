@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from kquant.tp_simulator import (
+from qsrt.tp_simulator import (
     column_parallel,
     kimi_topk,
     padded_size,

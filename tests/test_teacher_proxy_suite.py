@@ -7,13 +7,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from kquant.kimi_stream import write_trace_manifest, write_trace_tensor
-from kquant.teacher_proxy import DEFAULT_FLOAT_STAGES
-from kquant.teacher_proxy_gate import (
+from qsrt.kimi_stream import write_trace_manifest, write_trace_tensor
+from qsrt.teacher_proxy import DEFAULT_FLOAT_STAGES
+from qsrt.teacher_proxy_gate import (
     compare_teacher_proxy_suite,
     validate_teacher_proxy_gate_report,
 )
-from kquant.teacher_proxy_suite import (
+from qsrt.teacher_proxy_suite import (
     TEACHER_PROXY_SUITE_KIND,
     build_teacher_proxy_suite,
     file_sha256,
@@ -72,7 +72,7 @@ def _write_corpus(tmp_path: Path) -> tuple[Path, Path]:
         source.write_text("\n".join(rows) + "\n")
         source_specs.append({"path": str(source.resolve()), "weight": weight})
     report = {
-        "kind": "kquant_interim_calibration_corpus_run",
+        "kind": "qsrt_interim_calibration_corpus_run",
         "schema_version": 1,
         "sources": source_specs,
         "documents": documents,
@@ -180,7 +180,7 @@ def _write_run(
         "expert_checkpoint": str(expert_checkpoint),
         "nonexpert_checkpoint": str(expert_checkpoint),
         "exl3_manifest": (
-            str(expert_checkpoint / "kquant_exl3_manifest.json")
+            str(expert_checkpoint / "qsrt_exl3_manifest.json")
             if interim
             else None
         ),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kquant import constants as C
+from qsrt import constants as C
 from scripts.export_qsrt_tp12_benchmark_fixture import (
     _selected_rows,
     build_fixture_tensors,

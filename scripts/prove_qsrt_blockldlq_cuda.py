@@ -16,7 +16,7 @@ from pathlib import Path
 
 import torch
 
-from kquant.exl3_loader import load_qsrt_encoder
+from qsrt.exl3_loader import load_qsrt_encoder
 
 
 def parse_args() -> argparse.Namespace:

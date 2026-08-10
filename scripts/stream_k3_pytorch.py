@@ -32,10 +32,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kquant import constants as KQ_C
-from kquant.correctness import DEFAULT_PROMPT, write_json
-from kquant.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12, QSRT_CODEBOOKS
-from kquant.kimi_stream import (
+from qsrt import constants as KQ_C
+from qsrt.correctness import DEFAULT_PROMPT, write_json
+from qsrt.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12, QSRT_CODEBOOKS
+from qsrt.kimi_stream import (
     MODEL_TENSOR_PREFIX,
     IndexedSafetensors,
     StreamState,
@@ -47,19 +47,19 @@ from kquant.kimi_stream import (
     write_trace_manifest,
     write_trace_tensor,
 )
-from kquant.qsrt import (
+from qsrt.qsrt import (
     SCHEMA as QSRT_SCHEMA,
     PackedQSRTTrellis,
     QSRTTrellisDescriptor,
     decode_qsrt_exl3_weight,
     matrix_rate_axis,
 )
-from kquant.pack.qsrt_materialize import (
+from qsrt.pack.qsrt_materialize import (
     QSRT_ARTIFACT_KIND,
     QSRT_ARTIFACT_SCHEMA_VERSION,
     QSRT_MANIFEST_FILENAME,
 )
-from kquant.pack.qsrt_atoms import (
+from qsrt.pack.qsrt_atoms import (
     FORMAT_SECTION_BYTES,
     LAYER_HEADER_BYTES,
     LAYER_PREFIX,
@@ -67,13 +67,13 @@ from kquant.pack.qsrt_atoms import (
     QSRTAtomLayerReader,
     layer_filename as qsrt_layer_filename,
 )
-from kquant.teacher_proxy import align_routed_post_situ
-from kquant.teacher_proxy_suite import (
+from qsrt.teacher_proxy import align_routed_post_situ
+from qsrt.teacher_proxy_suite import (
     LoadedTeacherProxySuite,
     load_teacher_proxy_suite,
     parse_layer_list,
 )
-from kquant.x4t import X4T_LAYER_FIXED_BYTES, X4TLayerReader, x4t_layer_path
+from qsrt.x4t import X4T_LAYER_FIXED_BYTES, X4TLayerReader, x4t_layer_path
 
 DEFAULT_CHECKPOINT = Path(
     "/home/luke/.cache/huggingface/hub/"
@@ -1251,23 +1251,23 @@ def _load_exl3_mcg_mult(
     candidates: list[Path] = []
     if manifest_path is not None:
         candidates.append(manifest_path.expanduser())
-    candidates.append(expert_checkpoint / "kquant_exl3_manifest.json")
+    candidates.append(expert_checkpoint / "qsrt_exl3_manifest.json")
     if expert_checkpoint.name.endswith("-serve"):
         candidates.append(
             expert_checkpoint.with_name(
                 expert_checkpoint.name.removesuffix("-serve")
             )
-            / "kquant_exl3_manifest.json"
+            / "qsrt_exl3_manifest.json"
         )
     resolved = next((path.resolve() for path in candidates if path.is_file()), None)
     if resolved is None:
         raise FileNotFoundError(
-            "EXL3 tensors require kquant_exl3_manifest.json; checked "
+            "EXL3 tensors require qsrt_exl3_manifest.json; checked "
             + ", ".join(str(path) for path in candidates)
         )
     document = json.loads(resolved.read_text())
-    if document.get("kind") != "kquant_exl3_artifact":
-        raise ValueError(f"{resolved}: not a kquant EXL3 artifact manifest")
+    if document.get("kind") != "qsrt_exl3_artifact":
+        raise ValueError(f"{resolved}: not a qsrt EXL3 artifact manifest")
     mcg_mult = int(document["mcg_mult"])
     return mcg_mult, resolved
 
@@ -1476,7 +1476,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "compressed_tensors MXFP4PackedCompressor"
             ),
             "exl3_reconstruction": (
-                "kquant QSRT balanced-atom unpack plus independent PyTorch "
+                "QSRT balanced-atom unpack plus independent PyTorch "
                 f"{qsrt_artifact.codebook}/Hadamard decode"
                 if qsrt_artifact is not None
                 else (
@@ -1809,7 +1809,7 @@ def parse_args() -> argparse.Namespace:
         "--exl3-manifest",
         type=Path,
         help=(
-            "kquant_exl3_manifest.json; inferred from an artifact or its "
+            "qsrt_exl3_manifest.json; inferred from an artifact or its "
             "*-serve sibling when omitted"
         ),
     )
@@ -1837,7 +1837,7 @@ def parse_args() -> argparse.Namespace:
         "--input-ids-file",
         type=Path,
         help=(
-            "validated kquant teacher-proxy suite JSON; provides a rectangular "
+            "validated QSRT teacher-proxy suite JSON; provides a rectangular "
             "batch and overrides --prompt"
         ),
     )

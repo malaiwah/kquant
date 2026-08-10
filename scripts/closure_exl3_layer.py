@@ -37,11 +37,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kquant.correctness import write_json
-from kquant.io.hf_cache import CheckpointCache, resolve
-from kquant.io.mxfp4 import dequant
-from kquant.io.stream import load_tensor
-from kquant.tp_simulator import comparison_metrics, reduce_partials, situ
+from qsrt.correctness import write_json
+from qsrt.io.hf_cache import CheckpointCache, resolve
+from qsrt.io.mxfp4 import dequant
+from qsrt.io.stream import load_tensor
+from qsrt.tp_simulator import comparison_metrics, reduce_partials, situ
 
 MATRICES = ("w1", "w3", "w2")
 SOURCE_W4A16 = "source-w4a16"
@@ -646,7 +646,7 @@ def closure(args: argparse.Namespace) -> dict:
     allocation = allocation_document["layers"][str(args.layer)]
     exl3_experts = [int(value) for value in allocation["exl3"]]
     manifest = json.loads(
-        (artifact_dir / "kquant_exl3_manifest.json").read_text()
+        (artifact_dir / "qsrt_exl3_manifest.json").read_text()
     )
     mcg_mult = int(manifest["mcg_mult"])
     scenarios = _scenario_set(
